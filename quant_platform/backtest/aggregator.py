@@ -25,7 +25,7 @@ def get_bucket() -> oss2.Bucket:
     return oss2.Bucket(
         auth,
         os.environ["OSS_ENDPOINT"],
-        os.environ.get("OSS_RESULT_BUCKET", "quant-backtest-results"),
+        os.environ.get("OSS_RESULT_BUCKET", "stock-mdl-data-result"),
     )
 
 

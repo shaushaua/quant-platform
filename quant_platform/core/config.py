@@ -44,7 +44,7 @@ class Config:
 
         # OSS 分布式回测配置
         self.oss_data_bucket: str = os.getenv("OSS_DATA_BUCKET", "quant-historical-data")
-        self.oss_result_bucket: str = os.getenv("OSS_RESULT_BUCKET", "quant-backtest-results")
+        self.oss_result_bucket: str = os.getenv("OSS_RESULT_BUCKET", "stock-mdl-data-result")
 
         # 阿里云 ECS 配置
         self.aliyun_access_key_id: str = os.getenv("ALIYUN_ACCESS_KEY_ID", "")
