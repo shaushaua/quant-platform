@@ -1,4 +1,4 @@
-FROM 172.24.99.176:5000/library/python:3.11-slim
+FROM hub-mirror.c.163.com/library/python:3.11-slim
 
 WORKDIR /app
 
