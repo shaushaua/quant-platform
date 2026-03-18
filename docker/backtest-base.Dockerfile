@@ -1,4 +1,4 @@
-FROM hub-mirror.c.163.com/library/python:3.11-slim
+FROM 172.24.99.176:5000/quant-platform-base:latest
 
 WORKDIR /app
 
