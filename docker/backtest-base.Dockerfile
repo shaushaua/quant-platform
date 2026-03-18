@@ -7,4 +7,4 @@ COPY pyproject.toml ./
 COPY quant_platform/ ./quant_platform/
 
 # 安装 quant_platform 包（依赖已在基础镜像中）
-RUN pip install --no-cache-dir -e . --no-deps
+RUN pip install --no-cache-dir . --no-deps
