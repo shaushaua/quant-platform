@@ -2,165 +2,250 @@
 """
 因子计算引擎
 
-支持两种模式：
-- 历史模式：按日期范围批量计算，从 OSS 加载历史数据，结果写 OSS parquet
-- 实盘模式：单日计算，从 MemoryStore 读取当日实时数据
+核心接口：calc_factors_by_date_range
+
+使用方式：
+    from quant_platform.factor.engine import calc_factors_by_date_range
+
+    factor_info = {
+        "market_count": 21,      # 需要几日 daily_basic 历史
+        "need_l2_order": True,   # 是否需要 L2 逐笔委托
+        "need_l2_deal": True,    # 是否需要 L2 逐笔成交
+        "need_l1_tick": False,   # 是否需要 L1 tick
+    }
+
+    def factor_calculation(data, code, date, end_time):
+        ...  # 返回 dict，如 {"code": code, "fac1": 0.1}
+
+    def outfun(date, end_time, test):
+        ...  # test 是 pd.DataFrame，包含当日所有股票的因子结果
+
+    calc_factors_by_date_range(
+        factor_info=factor_info,
+        start_date="20240101",
+        end_date="20241231",
+        end_times=["093000", "150000"],
+        securities=["000001.SZ", "600000.SH"],
+        processes=4,
+        factor_data_handler=factor_calculation,
+        outfun=outfun,
+    )
 """
 
 import logging
-import os
-from typing import Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
-from .base import BaseFactor, FactorData
+from .base import StockData
 from ..data.api import DataAPI
-from ..core.config import get_config
 
 logger = logging.getLogger(__name__)
 
 
-def _trading_dates(start_date: str, end_date: str) -> list[str]:
-    """生成 [start_date, end_date] 之间的自然日列表（粗略，不过滤非交易日）。
-    生产环境建议替换为从 OSS 或接口获取真实交易日历。
+# ---------------------------------------------------------------------------
+# 公开接口
+# ---------------------------------------------------------------------------
+
+def calc_factors_by_date_range(
+    factor_info: Dict,
+    start_date: str,
+    end_date: str,
+    end_times: List[str],
+    securities: List[str],
+    processes: int = 1,
+    factor_data_handler: Optional[Callable] = None,
+    outfun: Optional[Callable] = None,
+    oss_base_path: Optional[str] = None,
+) -> None:
     """
-    fmt = "%Y-%m-%d"
+    按日期范围批量计算因子。
+
+    引擎内部执行顺序：
+        for date in trading_days:
+            for end_time in end_times:
+                for code in securities:
+                    data  = _build_stock_data(date, end_time, code, factor_info)
+                    res   = factor_data_handler(data, code, date, end_time)
+                test = merge(all_res)          # → pd.DataFrame
+                outfun(date, end_time, test)
+
+    Args:
+        factor_info:          数据需求配置，见模块说明。
+        start_date:           开始日期，格式 YYYYMMDD。
+        end_date:             结束日期，格式 YYYYMMDD。
+        end_times:            时间切片列表，如 ["093000", "150000"]；
+                              传空列表时用 [""] 占位（全天一次）。
+        securities:           股票代码列表。
+        processes:            并行进程数（暂保留参数，当前单进程实现）。
+        factor_data_handler:  单票因子计算函数，签名见上。
+        outfun:               批次结果处理函数，签名 outfun(date, end_time, test)。
+        oss_base_path:        OSS 数据根路径，None 时读环境变量。
+    """
+    api = DataAPI(mode="backtest", oss_base_path=oss_base_path)
+    _calc_fn = factor_data_handler
+    _out_fn = outfun
+
+    # 交易日列表
+    try:
+        trading_days = api.get_trading_days(start_date, end_date)
+    except Exception:
+        trading_days = _fallback_trading_days(start_date, end_date)
+
+    if not trading_days:
+        logger.warning("交易日列表为空，start=%s end=%s", start_date, end_date)
+        return
+
+    _end_times = end_times if end_times else [""]
+
+    logger.info(
+        "开始因子计算：%d 个交易日 × %d 个时间切片 × %d 只股票",
+        len(trading_days), len(_end_times), len(securities),
+    )
+
+    for date in trading_days:
+        # 每日加载一次原始数据（四分数据），跨 code/end_time 复用
+        bundle = _load_day_bundle(date, factor_info, api)
+
+        for end_time in _end_times:
+            all_res: list = []
+
+            for code in securities:
+                try:
+                    stock_data = _build_stock_data(bundle, code, date, end_time)
+                    if _calc_fn is not None:
+                        res = _calc_fn(stock_data, code, date, end_time)
+                        if res is not None:
+                            all_res.append(res)
+                except Exception as e:
+                    logger.warning(
+                        "因子计算异常 date=%s end_time=%s code=%s: %s",
+                        date, end_time, code, e,
+                    )
+
+            test = _merge_results(all_res)
+
+            if _out_fn is not None:
+                try:
+                    _out_fn(date, end_time, test)
+                except Exception as e:
+                    logger.error(
+                        "outfun 异常 date=%s end_time=%s: %s", date, end_time, e
+                    )
+
+    logger.info("因子计算完成")
+
+
+# ---------------------------------------------------------------------------
+# 内部辅助
+# ---------------------------------------------------------------------------
+
+class _DayBundle:
+    """
+    单日全市场原始数据包。
+    每个字段是该日全市场的 DataFrame，按 code 过滤后注入给单只股票。
+    """
+    def __init__(
+        self,
+        date: str,
+        l2_order: pd.DataFrame,
+        l2_deal: pd.DataFrame,
+        l1_tick: pd.DataFrame,
+        market: pd.DataFrame,
+    ):
+        self.date = date
+        self.l2_order = l2_order
+        self.l2_deal = l2_deal
+        self.l1_tick = l1_tick
+        self.market = market
+
+
+def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI) -> _DayBundle:
+    """
+    按 factor_info 加载当日全市场四分数据。
+    只加载 factor_info 中声明需要的数据类型，减少不必要 IO。
+    """
+    def _safe_load(data_type: str) -> pd.DataFrame:
+        try:
+            return api.get_daily_data(date, data_type)
+        except Exception as e:
+            logger.warning("加载 %s %s 失败: %s", date, data_type, e)
+            return pd.DataFrame()
+
+    l2_order = _safe_load("order") if factor_info.get("need_l2_order") else pd.DataFrame()
+    l2_deal  = _safe_load("deal")  if factor_info.get("need_l2_deal")  else pd.DataFrame()
+    l1_tick  = _safe_load("tick")  if factor_info.get("need_l1_tick")  else pd.DataFrame()
+    market   = _safe_load("daily_basic")
+
+    # 若需要多日 market 历史（market_count > 1），尝试追加历史
+    market_count = int(factor_info.get("market_count", 1))
+    if market_count > 1:
+        try:
+            hist = api.get_history_days(market_count, "daily_basic")
+            if not hist.empty:
+                market = hist
+        except Exception as e:
+            logger.warning("加载 daily_basic 历史 %d 日失败: %s", market_count, e)
+
+    return _DayBundle(
+        date=date,
+        l2_order=l2_order,
+        l2_deal=l2_deal,
+        l1_tick=l1_tick,
+        market=market,
+    )
+
+
+def _build_stock_data(
+    bundle: _DayBundle,
+    code: str,
+    date: str,
+    end_time: str,
+) -> StockData:
+    """
+    从全市场数据包中过滤出单只股票的数据，组装成 StockData。
+    过滤列优先尝试 "Code"，其次 "stock_code"。
+    """
+    def _filter(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        for col in ("Code", "stock_code", "code"):
+            if col in df.columns:
+                return df[df[col] == code].reset_index(drop=True)
+        return df  # 无 code 列时原样返回（如已是单股数据）
+
+    return StockData(
+        code=code,
+        date=date,
+        end_time=end_time,
+        l2_order=_filter(bundle.l2_order),
+        l2_deal=_filter(bundle.l2_deal),
+        l1_tick=_filter(bundle.l1_tick),
+        market=_filter(bundle.market),
+        daily_basic=_filter(bundle.market),  # 别名，与 market 相同
+    )
+
+
+def _merge_results(all_res: list) -> pd.DataFrame:
+    """
+    将所有股票的结果 dict 合并成 DataFrame。
+    若列表为空，返回空 DataFrame。
+    """
+    if not all_res:
+        return pd.DataFrame()
+    return pd.DataFrame(all_res)
+
+
+def _fallback_trading_days(start_date: str, end_date: str) -> List[str]:
+    """无法从 OSS 获取交易日时的降级实现（剔除周末）。"""
+    fmt = "%Y%m%d"
     cur = datetime.strptime(start_date, fmt)
     end = datetime.strptime(end_date, fmt)
     dates = []
     while cur <= end:
-        if cur.weekday() < 5:  # 剔除周末
+        if cur.weekday() < 5:
             dates.append(cur.strftime(fmt))
         cur += timedelta(days=1)
     return dates
-
-
-class FactorEngine:
-    """
-    因子计算引擎。
-
-    历史模式用法:
-        engine = FactorEngine(data_api, oss_result_prefix="factors/my-task")
-        engine.run_history(factor, start_date, end_date, task_id, shard_index)
-
-    实盘模式用法:
-        engine = FactorEngine(data_api)
-        result = engine.run_live(factor, date)
-    """
-
-    def __init__(self, data_api: DataAPI, oss_result_prefix: str = ""):
-        self.data_api = data_api
-        self.oss_result_prefix = oss_result_prefix
-
-    # ── 历史批量计算 ────────────────────────────────────────────────────────
-
-    def run_history(
-        self,
-        factor: BaseFactor,
-        start_date: str,
-        end_date: str,
-        task_id: str,
-        shard_index: int,
-    ) -> str:
-        """
-        批量计算 [start_date, end_date] 内每个交易日的因子值，
-        结果写入 OSS：{oss_result_prefix}/{task_id}/shard-{shard_index}.parquet
-
-        Returns:
-            OSS 结果路径
-        """
-        factor.on_init()
-        dates = _trading_dates(start_date, end_date)
-        logger.info("shard %d: 计算 %d 个交易日 [%s, %s]", shard_index, len(dates), start_date, end_date)
-
-        frames = []
-        for date in dates:
-            try:
-                data = self._load_history_data(date, factor.required_data)
-                series = factor.compute(date, data)
-                if not isinstance(series, pd.Series):
-                    raise TypeError(f"compute() 必须返回 pd.Series，实际返回 {type(series)}")
-                series.name = date
-                frames.append(series)
-            except Exception:
-                logger.exception("日期 %s 计算失败，跳过", date)
-
-        if not frames:
-            raise RuntimeError(f"shard {shard_index} 无有效计算结果")
-
-        # 结果矩阵：行=stock_code，列=date
-        result_df = pd.concat(frames, axis=1).sort_index(axis=1)
-        result_path = self._save_shard(result_df, task_id, shard_index)
-        logger.info("shard %d 完成，结果写入 %s", shard_index, result_path)
-        return result_path
-
-    # ── 实盘单日计算 ────────────────────────────────────────────────────────
-
-    def run_live(self, factor: BaseFactor, date: str) -> pd.Series:
-        """
-        实盘模式：从 MemoryStore 读取当日数据，返回因子值 Series。
-        不写 OSS，结果由调用方处理。
-        """
-        factor.on_init()
-        data = self._load_live_data(date, factor.required_data)
-        result = factor.compute(date, data)
-        if not isinstance(result, pd.Series):
-            raise TypeError(f"compute() 必须返回 pd.Series，实际返回 {type(result)}")
-        return result
-
-    # ── 内部方法 ────────────────────────────────────────────────────────────
-
-    def _load_history_data(self, date: str, required: tuple) -> FactorData:
-        """从 OSS 加载指定日期的历史数据。"""
-        kwargs = dict(date=date)
-
-        def _safe_load(data_type: str) -> pd.DataFrame:
-            if data_type not in required:
-                return pd.DataFrame()
-            try:
-                return self.data_api.get_history(date, date, data_type)
-            except Exception:
-                logger.warning("%s %s 数据加载失败，返回空 DataFrame", date, data_type)
-                return pd.DataFrame()
-
-        return FactorData(
-            date=date,
-            daily_basic=_safe_load("daily_basic"),
-            tick=_safe_load("tick"),
-            order=_safe_load("order"),
-            deal=_safe_load("deal"),
-        )
-
-    def _load_live_data(self, date: str, required: tuple) -> FactorData:
-        """从 MemoryStore 加载当日实时数据。"""
-        def _safe(fn):
-            try:
-                return fn()
-            except Exception:
-                return pd.DataFrame()
-
-        return FactorData(
-            date=date,
-            daily_basic=_safe(self.data_api.get_all_stocks_daily) if "daily_basic" in required else pd.DataFrame(),
-            tick=_safe(lambda: self.data_api.get_tick("all")) if "tick" in required else pd.DataFrame(),
-            order=pd.DataFrame(),
-            deal=pd.DataFrame(),
-        )
-
-    def _save_shard(self, df: pd.DataFrame, task_id: str, shard_index: int) -> str:
-        """将结果 DataFrame 写入 OSS，返回 OSS key。"""
-        cfg = get_config()
-        key = f"{self.oss_result_prefix}/{task_id}/shard-{shard_index}.parquet".lstrip("/")
-
-        import io
-        import oss2
-
-        buf = io.BytesIO()
-        df.to_parquet(buf, engine="pyarrow", compression="snappy")
-        buf.seek(0)
-
-        auth = oss2.Auth(cfg.oss_access_key, cfg.oss_secret_key)
-        bucket = oss2.Bucket(auth, cfg.oss_endpoint, cfg.oss_bucket)
-        bucket.put_object(key, buf.read())
-        return f"oss://{cfg.oss_bucket}/{key}"

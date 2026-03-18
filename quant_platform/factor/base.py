@@ -2,74 +2,128 @@
 """
 因子基类
 
-交易员继承 BaseFactor，实现 compute() 方法。
-历史批量计算和实盘计算使用相同接口。
+交易员有两种使用方式：
 
-示例:
-    from quant_platform.factor.base import BaseFactor, FactorData
-    import pandas as pd
+方式一（函数式，推荐）：
+    直接写 factor_calculation 函数 + outfun 函数，配合
+    calc_factors_by_date_range 使用，无需继承 BaseFactor。
+
+    示例见 engine.py 顶部注释。
+
+方式二（面向对象）：
+    继承 BaseFactor，实现 compute() 方法。
+    compute() 返回 float（单只股票单时点的因子值）。
 
     class MomentumFactor(BaseFactor):
         name = "momentum_20d"
+        market_count = 21
 
-        def compute(self, date: str, data: FactorData) -> pd.Series:
-            df = data.daily_basic
-            # index=stock_code, value=因子值
-            return df["close"] / df["close"].shift(20) - 1
+        def compute(self, data, code, date, end_time):
+            df = data["market"]
+            if len(df) < 21:
+                return float("nan")
+            return float(df["close"].iloc[-1] / df["close"].iloc[-21] - 1)
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
 import pandas as pd
 
 
 @dataclass
-class FactorData:
+class StockData:
     """
-    单个交易日的四份数据。
-    字段均为 DataFrame，index 为 stock_code。
-    未订阅或当日无数据时为空 DataFrame。
+    单只股票、单个时间切片的全量数据。
+    由引擎在每次调用 factor_calculation / compute() 前填充。
+
+    支持字典式访问：data["l2_order"]，也支持属性访问：data.l2_order。
     """
+    code: str
     date: str
+    end_time: str
+
+    # L2 逐笔委托
+    l2_order: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # L2 逐笔成交
+    l2_deal: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # L1 Tick 快照
+    l1_tick: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # 历史日频行情（用于 market_count 日回溯窗口）
+    market: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # 当日日频基础数据（daily_basic：close / turnover / volume 等）
     daily_basic: pd.DataFrame = field(default_factory=pd.DataFrame)
-    tick: pd.DataFrame = field(default_factory=pd.DataFrame)
-    order: pd.DataFrame = field(default_factory=pd.DataFrame)
-    deal: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    def __getitem__(self, key: str) -> pd.DataFrame:
+        """
+        支持 data["l2_order"] 写法，与函数式接口兼容。
+        """
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        """类似 dict.get，键不存在时返回 default。"""
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            return default
 
 
 class BaseFactor:
     """
-    因子基类。
+    面向对象因子基类（可选）。
 
-    子类必须：
-    - 设置类属性 name（唯一标识，用于 OSS 路径）
-    - 实现 compute() 方法
-
-    子类可选：
-    - 覆盖 on_init() 做初始化（如加载外部参数）
-    - 设置 required_data 声明需要哪几份数据（减少加载开销）
+    类属性（在子类中覆盖）：
+        name            因子唯一名称
+        market_count    需要几日历史日频数据（0 = 不需要）
+        l2_order_count  是否需要 L2 委托数据（0/1）
+        l2_deal_count   是否需要 L2 成交数据（0/1）
+        l2_tick_count   是否需要 L1 Tick 数据（0/1）
     """
 
-    # 因子唯一名称，写入 OSS 路径，必须设置
     name: str = ""
+    market_count: int = 0
+    l2_order_count: int = 0
+    l2_deal_count: int = 0
+    l2_tick_count: int = 0
 
-    # 声明需要哪些数据源，减少不必要的 IO
-    # 可选值: "daily_basic", "tick", "order", "deal"
-    required_data: tuple = ("daily_basic",)
+    @property
+    def factor_info(self) -> dict:
+        """生成可直接传入 calc_factors_by_date_range 的 factor_info 字典。"""
+        return {
+            "func": self.compute,
+            "market_count": self.market_count,
+            "l2_order_count": self.l2_order_count,
+            "l2_deal_count": self.l2_deal_count,
+            "l2_tick_count": self.l2_tick_count,
+        }
 
     def on_init(self) -> None:
-        """可选：因子初始化，在第一次 compute 前调用一次。"""
+        """可选钩子：引擎启动时调用一次，用于加载模型等初始化操作。"""
 
-    def compute(self, date: str, data: FactorData) -> pd.Series:
+    def compute(self, data: StockData, code: str, date: str, end_time: str) -> float:
         """
-        计算单个交易日的因子值。
+        计算单只股票、单个时间切片的因子值。
 
         Args:
-            date: 交易日，格式 YYYY-MM-DD
-            data: 当日四份数据
+            data:     StockData，包含 l2_order / l2_deal / l1_tick / market / daily_basic
+            code:     股票代码，如 "000001.SZ"
+            date:     交易日，如 "20240105"
+            end_time: 时间切片，如 "0925-0925"
 
         Returns:
-            pd.Series，index 为 stock_code（如 "000001.XSHE"），
-            value 为因子值（float）。缺失用 NaN 填充。
+            float，因子值；无法计算时返回 float("nan"）。
+            也可以返回 dict，此时该股票贡献多个因子列。
         """
         raise NotImplementedError(f"{self.__class__.__name__} 必须实现 compute()")
+
+    def handle_output(self, date: str, end_time: str, results: pd.DataFrame) -> None:
+        """
+        可选钩子：每个 date × end_time 批次结束后调用。
+        默认空实现；子类可覆盖以自定义持久化或推送。
+
+        Args:
+            date:     交易日
+            end_time: 时间切片
+            results:  该批次所有股票结果合并的 DataFrame
+        """
