@@ -1,0 +1,62 @@
+# This is a template — actual Jobs are created dynamically by the backtest operator/scheduler.
+# Values in {braces} are replaced at runtime.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backtest-{taskId}-{shardIndex}
+  namespace: quant
+  labels:
+    app: backtest-worker
+    task-id: "{taskId}"
+    shard-index: "{shardIndex}"
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        app: backtest-worker
+        task-id: "{taskId}"
+    spec:
+      restartPolicy: OnFailure
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: backtest
+        effect: NoSchedule
+      nodeSelector:
+        node-role: backtest
+      # Graceful Spot interruption handling
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: backtest
+        image: registry-vpc.cn-shanghai.aliyuncs.com/quant-platform/backtest:{imageTag}
+        command:
+        - python
+        - -m
+        - quant_platform.backtest.engine
+        env:
+        - name: TASK_ID
+          value: "{taskId}"
+        - name: SHARD_INDEX
+          value: "{shardIndex}"
+        - name: START_DATE
+          value: "{startDate}"
+        - name: END_DATE
+          value: "{endDate}"
+        - name: STRATEGY_NAME
+          value: "{strategyName}"
+        - name: RESULT_OSS_PREFIX
+          value: "backtest-results/{taskId}/shard-{shardIndex}/"
+        - name: INITIAL_CAPITAL
+          value: "{initialCapital}"
+        envFrom:
+        - secretRef:
+            name: quant-secrets
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "8"

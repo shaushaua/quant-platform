@@ -1,0 +1,61 @@
+# -*- coding: utf-8 -*-
+"""
+Docker 忽略文件
+"""
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 数据和缓存
+data/*
+!data/.gitkeep
+cache/*
+!cache/.gitkeep
+.qlib/*
+!.qlib/.gitkeep
+
+# 日志
+*.log
+logs/
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 文档
+docs/
+*.md
+!README.md
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker-compose.override.yml
+Dockerfile*
+!docker/*.Dockerfile
+
+# 测试
+tests/
+.pytest_cache/

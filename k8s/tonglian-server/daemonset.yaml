@@ -1,0 +1,66 @@
+# tonglian-server DaemonSet
+# 运行通联客户端程序，将实时行情写入 hostPath CSV。
+# collector.py 通过 inotify 监听同一 hostPath 目录读取数据。
+#
+# 节点要求：部署在 market-data 节点池（固定 ECS，hostNetwork 访问通联专线）
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tonglian-server
+  namespace: quant
+  labels:
+    app: tonglian-server
+spec:
+  selector:
+    matchLabels:
+      app: tonglian-server
+  template:
+    metadata:
+      labels:
+        app: tonglian-server
+    spec:
+      # 使用宿主机网络访问通联专线
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role: market-data
+      tolerations:
+        - key: node-role
+          operator: Equal
+          value: market-data
+          effect: NoSchedule
+      volumes:
+        - name: tonglian-data
+          hostPath:
+            path: /data/tonglian
+            type: DirectoryOrCreate
+        - name: tonglian-secret
+          secret:
+            secretName: quant-secrets
+      containers:
+        - name: tonglian-server
+          image: registry.cn-shanghai.aliyuncs.com/quant-platform/tonglian-server:latest
+          imagePullPolicy: Always
+          env:
+            - name: TONGLIAN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: quant-secrets
+                  key: TONGLIAN_USERNAME
+            - name: TONGLIAN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: quant-secrets
+                  key: TONGLIAN_PASSWORD
+            - name: CSV_OUTPUT_DIR
+              value: /data/tonglian
+          volumeMounts:
+            - name: tonglian-data
+              mountPath: /data/tonglian
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi

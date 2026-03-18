@@ -1,0 +1,41 @@
+# KEDA ScaledJob — 根据 BacktestTask 创建的待运行 Job 数量弹性伸缩回测 worker 节点
+# 要求集群已安装 KEDA: helm install keda kedacore/keda -n keda
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: backtest-scaler
+  namespace: quant
+spec:
+  jobTargetRef:
+    template:
+      spec:
+        restartPolicy: OnFailure
+        tolerations:
+        - key: dedicated
+          operator: Equal
+          value: backtest
+          effect: NoSchedule
+        nodeSelector:
+          node-role: backtest
+        terminationGracePeriodSeconds: 30
+        containers:
+        - name: backtest
+          image: registry-vpc.cn-shanghai.aliyuncs.com/quant-platform/backtest:latest
+          command: ["python", "-m", "quant_platform.backtest.engine"]
+          envFrom:
+          - secretRef:
+              name: quant-secrets
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "4"
+            limits:
+              memory: "16Gi"
+              cpu: "8"
+  pollingInterval: 15
+  maxReplicaCount: 50
+  triggers:
+  - type: kubernetes-workload
+    metadata:
+      podSelector: app=backtest-worker
+      value: "1"

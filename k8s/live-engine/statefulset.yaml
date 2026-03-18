@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: live-engine
+  namespace: quant
+spec:
+  replicas: 1
+  serviceName: live-engine
+  selector:
+    matchLabels:
+      app: live-engine
+  template:
+    metadata:
+      labels:
+        app: live-engine
+    spec:
+      nodeSelector:
+        node-role: market-data
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role
+                operator: In
+                values: [market-data]
+      volumes:
+      - name: shm-store
+        emptyDir:
+          medium: Memory
+          sizeLimit: 35Gi
+      containers:
+      - name: collector
+        image: registry-vpc.cn-shanghai.aliyuncs.com/quant-platform/collector:latest
+        command: ["python", "-m", "quant_platform.realtime.collector"]
+        env:
+        - name: SHM_STORE_PATH
+          value: /dev/shm/store
+        - name: USE_SHM_STORE
+          value: "true"
+        - name: TONGLIANG_QUOTE_TTL
+          value: "1"
+        - name: TONGLIANG_KLINE_TTL
+          value: "60"
+        - name: TONGLIANG_TICK_FLUSH_INTERVAL
+          value: "10"
+        envFrom:
+        - secretRef:
+            name: quant-secrets
+        volumeMounts:
+        - name: shm-store
+          mountPath: /dev/shm/store
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        livenessProbe:
+          exec:
+            command: ["python", "-c", "import sys; sys.exit(0)"]
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      - name: live-engine
+        image: registry-vpc.cn-shanghai.aliyuncs.com/quant-platform/live-engine:latest
+        command: ["python", "-m", "quant_platform.realtime.live_engine"]
+        env:
+        - name: SHM_STORE_PATH
+          value: /dev/shm/store
+        - name: USE_SHM_STORE
+          value: "true"
+        envFrom:
+        - secretRef:
+            name: quant-secrets
+        volumeMounts:
+        - name: shm-store
+          mountPath: /dev/shm/store
+        ports:
+        - containerPort: 8001
+          name: health
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-engine
+  namespace: quant
+spec:
+  selector:
+    app: live-engine
+  ports:
+  - name: health
+    port: 8001
+    targetPort: 8001
+  clusterIP: None

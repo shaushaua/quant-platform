@@ -1,0 +1,34 @@
+# ServiceAccount for backtest-operator
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backtest-operator
+  namespace: quant
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: backtest-operator
+rules:
+- apiGroups: ["quant.lianghua.io"]
+  resources: ["backteststasks", "backteststasks/status"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "events"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backtest-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: backtest-operator
+subjects:
+- kind: ServiceAccount
+  name: backtest-operator
+  namespace: quant

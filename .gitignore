@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+qlib_factor_platform.egg-info/
+cache/
+CLAUDE.md
+
+# Data and test files
+oss_data/
+test_*.py
+*.parquet
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

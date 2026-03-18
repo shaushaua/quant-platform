@@ -1,0 +1,32 @@
+# Requires prometheus-operator CRDs
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: quant-api
+  namespace: quant
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: api
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: quant-live-engine
+  namespace: quant
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: live-engine
+  endpoints:
+  - port: health
+    path: /metrics
+    interval: 30s

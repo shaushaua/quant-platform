@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: quant-api
+  namespace: quant
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.quant.lianghua.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: quant-api
+            port:
+              number: 8000
+  # TLS: 使用 cert-manager 自动签发，或手动创建 secret
+  # tls:
+  # - hosts:
+  #   - api.quant.lianghua.io
+  #   secretName: quant-api-tls
