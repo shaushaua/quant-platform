@@ -1,3 +1,4 @@
+# collector：持续运行，监听通联 CSV 文件，写入 /dev/shm/store（hostPath）
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,7 +16,7 @@ spec:
       labels:
         app: collector
     spec:
-      # 固定调度到 live-trading 节点（绑定通联License的固定ECS）
+      # 固定调度到绑定通联 License 的节点
       nodeSelector:
         role: live-trading
       tolerations:
@@ -24,74 +25,6 @@ spec:
           value: live-trading
           effect: NoSchedule
       containers:
-        - name: collector
-          image: 172.24.99.176:5000/quant-platform:latest
-          command: ["python", "-m", "quant_platform.collector.collector"]
-          env:
-            - name: MSG_BACKUP_DIR
-              value: /root/mdl/msg_backup   # 通联客户端写入路径，hostPath挂载进来
-            - name: SHM_STORE_PATH
-              value: /dev/shm/store
-            - name: COLLECTOR_POLL_INTERVAL
-              value: "0.5"
-            - name: COLLECTOR_SKIP_HISTORY
-              value: "true"                 # 启动时跳过历史数据，只处理新增
-            - name: LOG_LEVEL
-              value: INFO
-          envFrom:
-            - secretRef:
-                name: quant-secrets
-          volumeMounts:
-            - name: mdl-data
-              mountPath: /root/mdl/msg_backup
-              readOnly: true
-            - name: shm-store
-              mountPath: /dev/shm/store
-          resources:
-            requests:
-              cpu: "1"
-              memory: 2Gi
-            limits:
-              cpu: "2"
-              memory: 4Gi
-      volumes:
-        - name: mdl-data
-          hostPath:
-            path: /root/mdl/msg_backup   # 与通联客户端共享宿主机目录
-            type: DirectoryOrCreate
-        - name: shm-store
-          emptyDir:
-            medium: Memory
-            sizeLimit: 8Gi
----
-# live-engine 与 collector 共享 shm-store 需要在同一 Pod 或通过别的方式
-# 推荐方案：collector + live-engine 合并为同一 Pod 的两个容器，共享 emptyDir volume
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: live-trading
-  namespace: quant
-  labels:
-    app: live-trading
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: live-trading
-  template:
-    metadata:
-      labels:
-        app: live-trading
-    spec:
-      nodeSelector:
-        role: live-trading
-      tolerations:
-        - key: role
-          operator: Equal
-          value: live-trading
-          effect: NoSchedule
-      containers:
-        # --- collector 容器：监听CSV，写入共享内存 ---
         - name: collector
           image: 172.24.99.176:5000/quant-platform:latest
           command: ["python", "-m", "quant_platform.collector.collector"]
@@ -99,13 +32,16 @@ spec:
             - name: MSG_BACKUP_DIR
               value: /root/mdl/msg_backup
             - name: SHM_STORE_PATH
-              value: /dev/shm/store
+              value: /dev/shm/quant-store
             - name: COLLECTOR_POLL_INTERVAL
               value: "0.5"
             - name: COLLECTOR_SKIP_HISTORY
               value: "true"
             - name: LOG_LEVEL
               value: INFO
+            # 每只股票 order/deal 最多保留多少行（防止 90GB 数据撑爆内存）
+            - name: SHM_MAX_ROWS_PER_SYMBOL
+              value: "10000"
           envFrom:
             - secretRef:
                 name: quant-secrets
@@ -122,37 +58,14 @@ spec:
             limits:
               cpu: "2"
               memory: 4Gi
-
-        # --- live-engine 容器：读取共享内存，执行实盘策略 ---
-        - name: live-engine
-          image: 172.24.99.176:5000/quant-platform:latest
-          command: ["python", "-m", "quant_platform.live.engine"]
-          env:
-            - name: SHM_STORE_PATH
-              value: /dev/shm/store
-            - name: LOG_LEVEL
-              value: INFO
-          envFrom:
-            - secretRef:
-                name: quant-secrets
-          volumeMounts:
-            - name: shm-store
-              mountPath: /dev/shm/store
-          resources:
-            requests:
-              cpu: "2"
-              memory: 4Gi
-            limits:
-              cpu: "4"
-              memory: 8Gi
-
       volumes:
         - name: mdl-data
           hostPath:
             path: /root/mdl/msg_backup
             type: DirectoryOrCreate
+        # hostPath 替代 emptyDir：允许 collector 和 live-engine CronJob
+        # 作为独立 Pod 运行，同时共享宿主机 /dev/shm 内的同一目录
         - name: shm-store
-          # 同一Pod内两个容器共享此volume，实现零拷贝内存共享
-          emptyDir:
-            medium: Memory
-            sizeLimit: 8Gi
+          hostPath:
+            path: /dev/shm/quant-store
+            type: DirectoryOrCreate

@@ -18,6 +18,9 @@ import pyarrow.ipc as ipc
 
 SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
 
+# order/deal 每只股票最多保留行数，防止 90GB/day 数据撑爆共享内存
+MAX_ROWS_PER_SYMBOL = int(os.environ.get("SHM_MAX_ROWS_PER_SYMBOL", "10000"))
+
 
 class ShmStore:
     """
@@ -62,11 +65,13 @@ class ShmStore:
         except Exception:
             return None
 
-    def _append_arrow(self, path: Path, df: pd.DataFrame) -> None:
-        """追加写：读取已有数据，concat 后原子替换。"""
+    def _append_arrow(self, path: Path, df: pd.DataFrame, max_rows: Optional[int] = None) -> None:
+        """追加写：读取已有数据，concat 后原子替换；max_rows 限制保留最新 N 行防止 OOM。"""
         with self._lock:
             existing = self._read_arrow(path)
             merged = pd.concat([existing, df], ignore_index=True) if existing is not None else df
+            if max_rows and len(merged) > max_rows:
+                merged = merged.iloc[-max_rows:].reset_index(drop=True)
             self._write_arrow(path, merged)
 
     # ------------------------------------------------------------------ #
@@ -74,13 +79,13 @@ class ShmStore:
     # ------------------------------------------------------------------ #
 
     def update_tick(self, code: str, df: pd.DataFrame) -> None:
-        self._append_arrow(SHM_BASE / "tick" / f"{code}.arrow", df)
+        self._append_arrow(SHM_BASE / "tick" / f"{code}.arrow", df, max_rows=MAX_ROWS_PER_SYMBOL)
 
     def update_order(self, code: str, df: pd.DataFrame) -> None:
-        self._append_arrow(SHM_BASE / "order" / f"{code}.arrow", df)
+        self._append_arrow(SHM_BASE / "order" / f"{code}.arrow", df, max_rows=MAX_ROWS_PER_SYMBOL)
 
     def update_deal(self, code: str, df: pd.DataFrame) -> None:
-        self._append_arrow(SHM_BASE / "deal" / f"{code}.arrow", df)
+        self._append_arrow(SHM_BASE / "deal" / f"{code}.arrow", df, max_rows=MAX_ROWS_PER_SYMBOL)
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         """整体替换某周期全市场 K 线（聚合后写入）。"""
