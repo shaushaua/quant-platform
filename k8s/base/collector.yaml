@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collector
+  namespace: quant
+  labels:
+    app: collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: collector
+  template:
+    metadata:
+      labels:
+        app: collector
+    spec:
+      # 固定调度到 live-trading 节点
+      nodeSelector:
+        role: live-trading
+      tolerations:
+        - key: role
+          operator: Equal
+          value: live-trading
+          effect: NoSchedule
+      containers:
+        - name: collector
+          image: 172.24.99.176:5000/quant-platform:latest
+          command: ["python", "-m", "quant_platform.collector.collector"]
+          env:
+            - name: WATCH_DIR
+              value: /data/tonglian
+            - name: SHM_STORE_PATH
+              value: /dev/shm/store
+            - name: LOG_LEVEL
+              value: INFO
+          envFrom:
+            - secretRef:
+                name: quant-secrets
+          volumeMounts:
+            - name: tonglian-data
+              mountPath: /data/tonglian
+              readOnly: true
+            - name: shm-store
+              mountPath: /dev/shm/store
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2
+              memory: 4Gi
+      volumes:
+        - name: tonglian-data
+          hostPath:
+            path: /data/tonglian   # 通联客户端写入目录，与宿主机共享
+            type: DirectoryOrCreate
+        - name: shm-store
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
