@@ -342,6 +342,26 @@ class OSSDataLoader:
             cur -= timedelta(days=1)
         return result
 
+    def load_prev_days(
+        self,
+        from_date: str,
+        n_days: int,
+        data_type: str,
+        codes: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """加载 from_date 之前（含当天）n_days 个交易日的数据，结果带 _date 列。"""
+        days = self._get_prev_trading_days(from_date.replace("-", ""), n_days)
+        if not days:
+            return pd.DataFrame()
+        dfs = []
+        for day in days:
+            df = self.load(day, data_type, codes)
+            if not df.empty:
+                df = df.copy()
+                df["_date"] = day
+                dfs.append(df)
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
     def clear_cache(self):
         self._cache.clear()
         self._grouped_cache.clear()

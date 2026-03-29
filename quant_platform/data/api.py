@@ -420,7 +420,8 @@ class DataAPI:
         self,
         n_days: int,
         data_type: str = "tick",
-        codes: Optional[List[str]] = None
+        codes: Optional[List[str]] = None,
+        from_date: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         获取前N个交易日的历史数据
@@ -429,6 +430,7 @@ class DataAPI:
             n_days: 交易日数量
             data_type: 数据类型
             codes: 股票代码列表
+            from_date: 基准日期 YYYYMMDD，默认今天
 
         Returns:
             历史数据DataFrame
@@ -438,7 +440,9 @@ class DataAPI:
                         请改用 get_daily_data() 在每日循环中逐天加载。
         """
         _check_heavy_data_range(data_type, n_days)
-        return self._oss.load_prev_days(n_days, data_type, codes=codes)
+        if from_date is None:
+            from_date = datetime.now().strftime("%Y%m%d")
+        return self._oss.load_prev_days(from_date, n_days, data_type, codes=codes)
 
     def get_daily_basic_history(
         self,

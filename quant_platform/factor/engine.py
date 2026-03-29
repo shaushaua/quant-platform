@@ -183,7 +183,7 @@ def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI) -> _DayBundle:
     market_count = int(factor_info.get("market_count", 1))
     if market_count > 1:
         try:
-            hist = api.get_history_days(market_count, "daily_basic")
+            hist = api.get_history_days(market_count, "daily_basic", from_date=date)
             if not hist.empty:
                 market = hist
         except Exception as e:
