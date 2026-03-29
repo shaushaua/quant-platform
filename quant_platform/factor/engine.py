@@ -107,7 +107,7 @@ def calc_factors_by_date_range(
 
     for date in trading_days:
         # 每日加载一次原始数据（四分数据），跨 code/end_time 复用
-        bundle = _load_day_bundle(date, factor_info, api)
+        bundle = _load_day_bundle(date, factor_info, api, securities)
 
         for end_time in _end_times:
             all_res: list = []
@@ -162,21 +162,23 @@ class _DayBundle:
         self.market = market
 
 
-def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI) -> _DayBundle:
+def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: List[str] = None) -> _DayBundle:
     """
     按 factor_info 加载当日全市场四分数据。
     只加载 factor_info 中声明需要的数据类型，减少不必要 IO。
+    大文件类型（tick/order/deal）传 codes 过滤，避免 OOM。
     """
-    def _safe_load(data_type: str) -> pd.DataFrame:
+    def _safe_load(data_type: str, codes=None) -> pd.DataFrame:
         try:
-            return api.get_daily_data(date, data_type)
+            return api.get_daily_data(date, data_type, codes=codes)
         except Exception as e:
             logger.warning("加载 %s %s 失败: %s", date, data_type, e)
             return pd.DataFrame()
 
-    l2_order = _safe_load("order") if factor_info.get("need_l2_order") else pd.DataFrame()
-    l2_deal  = _safe_load("deal")  if factor_info.get("need_l2_deal")  else pd.DataFrame()
-    l1_tick  = _safe_load("tick")  if factor_info.get("need_l1_tick")  else pd.DataFrame()
+    codes = securities if securities else None
+    l2_order = _safe_load("order", codes=codes) if factor_info.get("need_l2_order") else pd.DataFrame()
+    l2_deal  = _safe_load("deal",  codes=codes) if factor_info.get("need_l2_deal")  else pd.DataFrame()
+    l1_tick  = _safe_load("tick",  codes=codes) if factor_info.get("need_l1_tick")  else pd.DataFrame()
     market   = _safe_load("daily_basic")
 
     # 若需要多日 market 历史（market_count > 1），尝试追加历史
