@@ -20,7 +20,7 @@ class Config:
         self.tonglance_sz_port: int = int(os.getenv("TONGLANCE_SZ_PORT", "19011"))
 
         # 数据路径配置
-        self.oss_data_path: str = os.getenv("OSS_DATA_PATH", "/2025")
+        self.oss_data_path: str = os.getenv("OSS_DATA_PATH", "2025")
 
         # 内存配置
         self.max_memory_gb: float = float(os.getenv("MAX_MEMORY_GB", "16.0"))

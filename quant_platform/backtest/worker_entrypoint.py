@@ -195,6 +195,7 @@ def main():
         processes=PROCESSES,
         factor_data_handler=strategy.factor_calculation,
         outfun=collecting_outfun,
+        oss_base_path=DATA_PATH,
     )
 
     shard_result = _build_shard_result(_all_results)
