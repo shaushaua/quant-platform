@@ -11,6 +11,9 @@ RUN mkdir -p /app/strategy
 # 把包路径加入 PYTHONPATH，无需构建
 ENV PYTHONPATH=/app
 
+# 安装 SLS Python SDK
+RUN pip install aliyun-log-python-sdk --no-cache-dir
+
 # 预装 DuckDB httpfs 扩展，避免运行时从公网下载
 RUN python3 -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpfs'); con.execute('LOAD httpfs'); con.close()"
 

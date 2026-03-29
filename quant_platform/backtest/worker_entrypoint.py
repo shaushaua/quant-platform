@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from typing import Optional
 
 import oss2
@@ -52,6 +53,69 @@ RESULT_BUCKET = os.environ.get("RESULT_BUCKET", "stock-mdl-data-result")
 PROCESSES    = int(os.environ.get("WORKERS", "1"))
 
 STRATEGY_PATH = "/app/strategy/strategy.py"
+
+SLS_ENDPOINT  = os.environ.get("SLS_ENDPOINT", "")
+SLS_PROJECT   = os.environ.get("SLS_PROJECT", "")
+SLS_LOGSTORE  = os.environ.get("SLS_LOGSTORE", "")
+SLS_AK_ID     = os.environ.get("SLS_AK_ID", "")
+SLS_AK_SECRET = os.environ.get("SLS_AK_SECRET", "")
+
+
+# ---------------------------------------------------------------------------
+# SLS 日志工具
+# ---------------------------------------------------------------------------
+
+class _SlsLogger:
+    """
+    向阿里云 SLS 写结构化日志。
+    若 SLS 配置缺失则自动降级为 stdout print，不影响正常运行。
+    """
+
+    def __init__(self):
+        self._client = None
+        if all([SLS_ENDPOINT, SLS_PROJECT, SLS_LOGSTORE, SLS_AK_ID, SLS_AK_SECRET]):
+            try:
+                from aliyun.log import LogClient
+                self._client = LogClient(SLS_ENDPOINT, SLS_AK_ID, SLS_AK_SECRET)
+                print(f"[worker] SLS 日志已启用: {SLS_PROJECT}/{SLS_LOGSTORE}")
+            except Exception as e:
+                print(f"[worker] WARNING: SLS 初始化失败，降级为 stdout: {e}")
+        else:
+            print("[worker] SLS 环境变量未配置，日志仅输出到 stdout")
+
+    def info(self, message: str, **kwargs):
+        self._emit("INFO", message, **kwargs)
+
+    def error(self, message: str, **kwargs):
+        self._emit("ERROR", message, **kwargs)
+
+    def warning(self, message: str, **kwargs):
+        self._emit("WARNING", message, **kwargs)
+
+    def _emit(self, level: str, message: str, **kwargs):
+        contents = {
+            "level": level,
+            "message": message,
+            "task_id": TASK_ID,
+            "shard_index": str(SHARD_INDEX),
+            **{k: str(v) for k, v in kwargs.items()},
+        }
+        # 始终打印到 stdout（kubectl logs 可见）
+        extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
+        print(f"[worker][{level}] {message}" + (f" | {extra}" if extra else ""))
+
+        if self._client is None:
+            return
+        try:
+            from aliyun.log import LogItem, PutLogsRequest
+            log_item = LogItem(contents=list(contents.items()))
+            req = PutLogsRequest(SLS_PROJECT, SLS_LOGSTORE, "", "", [log_item])
+            self._client.put_logs(req)
+        except Exception as e:
+            print(f"[worker] WARNING: SLS 写入失败: {e}")
+
+
+_logger = _SlsLogger()
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +174,10 @@ def _make_collecting_outfun(user_outfun=None):
             try:
                 user_outfun(date, end_time, test)
             except Exception as e:
-                print(f"[worker] WARNING: 用户 outfun 异常: {e}")
+                _logger.warning("用户 outfun 异常", date=date, error=str(e))
+
+        records = len(test) if not test.empty else 0
+        _logger.info("日期计算完成", date=date, end_time=end_time, records=records)
 
         if test.empty:
             return
@@ -167,16 +234,17 @@ def _build_shard_result(all_results: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    print(f"[worker] task={TASK_ID} shard={SHARD_INDEX} {START_DATE}~{END_DATE}")
+    _logger.info("worker started",
+                 start_date=START_DATE, end_date=END_DATE)
 
     strategy = _load_strategy()
 
     # 必须提供 factor_info 和 factor_calculation
     if not hasattr(strategy, "factor_info"):
-        print("[worker] ERROR: strategy.py 必须定义 factor_info = {...}", file=sys.stderr)
+        _logger.error("strategy.py 缺少 factor_info")
         sys.exit(1)
     if not hasattr(strategy, "factor_calculation"):
-        print("[worker] ERROR: strategy.py 必须定义 factor_calculation(data, code, date, end_time)", file=sys.stderr)
+        _logger.error("strategy.py 缺少 factor_calculation")
         sys.exit(1)
 
     factor_info = strategy.factor_info
@@ -184,25 +252,48 @@ def main():
     end_times = getattr(strategy, "end_times", [""])     # 默认每日收盘后一次
     user_outfun = getattr(strategy, "outfun", None)
 
+    _logger.info("strategy loaded",
+                 securities_count=len(securities) if securities else "all",
+                 market_count=factor_info.get("market_count", 1),
+                 need_tick=factor_info.get("need_l1_tick", False),
+                 need_order=factor_info.get("need_l2_order", False),
+                 need_deal=factor_info.get("need_l2_deal", False))
+
     collecting_outfun = _make_collecting_outfun(user_outfun)
 
-    calc_factors_by_date_range(
-        factor_info=factor_info,
-        start_date=START_DATE,
-        end_date=END_DATE,
-        end_times=end_times,
-        securities=securities or [],
-        processes=PROCESSES,
-        factor_data_handler=strategy.factor_calculation,
-        outfun=collecting_outfun,
-        oss_base_path=DATA_PATH,
-    )
+    t0 = time.time()
+    try:
+        calc_factors_by_date_range(
+            factor_info=factor_info,
+            start_date=START_DATE,
+            end_date=END_DATE,
+            end_times=end_times,
+            securities=securities or [],
+            processes=PROCESSES,
+            factor_data_handler=strategy.factor_calculation,
+            outfun=collecting_outfun,
+            oss_base_path=DATA_PATH,
+        )
+    except Exception as e:
+        _logger.error("calc_factors_by_date_range 异常", error=str(e))
+        raise
 
+    elapsed = round(time.time() - t0, 1)
     shard_result = _build_shard_result(_all_results)
-    print(f"[worker] 计算完成，共 {shard_result['total_records']} 条记录")
+    _logger.info("计算完成",
+                 total_records=shard_result["total_records"],
+                 elapsed_seconds=elapsed)
 
-    _write_shard_result(shard_result)
-    print("[worker] done")
+    try:
+        _write_shard_result(shard_result)
+        _logger.info("结果已写入 OSS",
+                     bucket=RESULT_BUCKET,
+                     key=f"{TASK_ID}/{SHARD_INDEX}.json")
+    except Exception as e:
+        _logger.error("写入 OSS 失败", error=str(e))
+        raise
+
+    _logger.info("worker done", elapsed_seconds=elapsed)
 
 
 if __name__ == "__main__":
