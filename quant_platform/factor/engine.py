@@ -209,12 +209,25 @@ def _build_stock_data(
     """
     从全市场数据包中过滤出单只股票的数据，组装成 StockData。
     过滤列优先尝试 "Code"，其次 "stock_code"。
+    大文件（tick/order/deal）的 Code 列是 SECURITY_ID 整数，
+    需从 market(daily_basic) 的 ID_QI/SECURITY_ID 映射转换。
     """
+    # 从 market 数据推导 security_id（整数）
+    security_id: Optional[int] = None
+    if not bundle.market.empty and "ID_QI" in bundle.market.columns and "SECURITY_ID" in bundle.market.columns:
+        id_qi = code.split(".")[0].zfill(6)
+        rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
+        if not rows.empty:
+            security_id = int(rows.iloc[0]["SECURITY_ID"])
+
     def _filter(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
         for col in ("Code", "stock_code", "code"):
             if col in df.columns:
+                # 整数列用 security_id 匹配，字符串列用 code 匹配
+                if pd.api.types.is_integer_dtype(df[col]) and security_id is not None:
+                    return df[df[col] == security_id].reset_index(drop=True)
                 return df[df[col] == code].reset_index(drop=True)
         return df  # 无 code 列时原样返回（如已是单股数据）
 
