@@ -111,7 +111,10 @@ class OSSDataLoader:
             con = _duckdb.connect()
             con.execute("INSTALL httpfs; LOAD httpfs;")
             con.execute(f"SET s3_region='{self._region}';")
-            con.execute(f"SET s3_endpoint='{self._endpoint}';")
+            # DuckDB s3_endpoint 只需 hostname，去掉 https:// 或 http:// 前缀
+            _s3_endpoint = self._endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+            con.execute(f"SET s3_endpoint='{_s3_endpoint}';")  # noqa: E501
+            con.execute("SET s3_use_ssl=true;")
             con.execute(f"SET s3_access_key_id='{self._ak}';")
             con.execute(f"SET s3_secret_access_key='{self._sk}';")
             con.execute("SET s3_url_style='path';")
