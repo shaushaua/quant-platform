@@ -32,8 +32,9 @@ EOF
 
 echo "[4/5] 安装 CRD 并部署 operator..."
 if [ -d "$OPERATOR_DIR" ]; then
-  kubectl apply -f "$OPERATOR_DIR/config/crd/bases/"
-  kubectl apply -f "$OPERATOR_DIR/config/deploy/"
+  kubectl apply -f "$OPERATOR_DIR/config/crd/"
+  kubectl apply -f "$OPERATOR_DIR/config/rbac/"
+  kubectl apply -f "$OPERATOR_DIR/config/manager/"
 else
   echo "backtest-operator 目录不存在: $OPERATOR_DIR"
   echo "请先 git clone gitee.com/zhangyang555/backtest-operator 到 $OPERATOR_DIR"
