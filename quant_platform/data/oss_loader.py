@@ -153,19 +153,41 @@ class OSSDataLoader:
             logger.error(f"读取 OSS 小文件失败 {key}: {e}")
             return pd.DataFrame()
 
+    def _resolve_security_ids(self, date_str: str, codes: List[str]) -> List[int]:
+        """将 000001.SZ 格式的 codes 转成 SECURITY_ID 整数列表。"""
+        key = self._object_key(date_str, "daily_basic")
+        df = self._read_small_file(key)
+        if df.empty or "ID_QI" not in df.columns or "SECURITY_ID" not in df.columns:
+            return []
+        # ID_QI 是6位纯数字字符串，codes 可能带交易所后缀如 000001.SZ
+        id_map = dict(zip(df["ID_QI"].astype(str), df["SECURITY_ID"].astype(int)))
+        result = []
+        for code in codes:
+            id_qi = code.split(".")[0].zfill(6)  # 000001.SZ -> 000001
+            if id_qi in id_map:
+                result.append(id_map[id_qi])
+        return result
+
     def _read_large_file_by_codes(self, key: str, data_type: str, codes: List[str]) -> pd.DataFrame:
         """用 DuckDB S3 谓词下推读取大文件中指定股票的数据。"""
         if not _DUCKDB_AVAILABLE or OSSDataLoader._duckdb_con is None:
             logger.error("DuckDB 不可用，无法读取大文件")
             return pd.DataFrame()
-        code_col = self._CODE_COL.get(data_type, self._DEFAULT_CODE_COL)
-        codes_str = ", ".join(f"'{c}'" for c in codes)
+        # 从 key 中提取日期 YYYYMMDD
+        import re
+        m = re.search(r'(\d{8})', key)
+        date_str = m.group(1) if m else ""
+        security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
+        if not security_ids:
+            logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
+            return pd.DataFrame()
+        ids_str = ", ".join(str(i) for i in security_ids)
         url = self._s3_url(key)
         try:
             df = OSSDataLoader._duckdb_con.execute(
-                f"SELECT * FROM read_parquet('{url}') WHERE {code_col} IN ({codes_str})"
+                f"SELECT * FROM read_parquet('{url}') WHERE Code IN ({ids_str})"
             ).df()
-            logger.info(f"DuckDB 读取 {key}: {len(df)} 条记录 codes={codes}")
+            logger.info(f"DuckDB 读取 {key}: {len(df)} 条记录 security_ids={security_ids}")
             return df
         except Exception as e:
             logger.error(f"DuckDB 读取失败 {key}: {e}")
