@@ -120,8 +120,10 @@ class OSSDataLoader:
             con.execute("SET s3_url_style='vhost';")
             OSSDataLoader._duckdb_con = con
             logger.info("DuckDB S3 连接初始化完成")
+            print(f"[duckdb] init ok endpoint={_s3_endpoint} region={self._region}")
         except Exception as e:
             logger.error(f"DuckDB 初始化失败: {e}")
+            print(f"[duckdb] init failed: {e}")
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -184,13 +186,15 @@ class OSSDataLoader:
         ids_str = ", ".join(str(i) for i in security_ids)
         url = self._s3_url(key)
         try:
-            df = OSSDataLoader._duckdb_con.execute(
-                f"SELECT * FROM read_parquet('{url}') WHERE Code IN ({ids_str})"
-            ).df()
+            sql = f"SELECT * FROM read_parquet('{url}') WHERE Code IN ({ids_str})"
+            print(f"[duckdb] exec: {sql}")
+            df = OSSDataLoader._duckdb_con.execute(sql).df()
+            print(f"[duckdb] result: {len(df)} rows, columns={list(df.columns)[:5]}")
             logger.info(f"DuckDB 读取 {key}: {len(df)} 条记录 security_ids={security_ids}")
             return df
         except Exception as e:
             logger.error(f"DuckDB 读取失败 {key}: {e}")
+            print(f"[duckdb] error: {e}")
             return pd.DataFrame()
 
     def _list_keys_with_prefix(self, prefix: str) -> List[str]:
