@@ -117,7 +117,7 @@ class OSSDataLoader:
             con.execute("SET s3_use_ssl=true;")
             con.execute(f"SET s3_access_key_id='{self._ak}';")
             con.execute(f"SET s3_secret_access_key='{self._sk}';")
-            con.execute("SET s3_url_style='path';")
+            con.execute("SET s3_url_style='vhost';")
             OSSDataLoader._duckdb_con = con
             logger.info("DuckDB S3 连接初始化完成")
         except Exception as e:
