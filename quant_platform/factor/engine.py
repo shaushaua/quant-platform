@@ -213,9 +213,9 @@ def _build_stock_data(
     需从 market(daily_basic) 的 ID_QI/SECURITY_ID 映射转换。
     """
     # 从 market 数据推导 security_id（整数）
+    id_qi = code.split(".")[0].zfill(6)  # "000001.SZ" -> "000001"
     security_id: Optional[int] = None
     if not bundle.market.empty and "ID_QI" in bundle.market.columns and "SECURITY_ID" in bundle.market.columns:
-        id_qi = code.split(".")[0].zfill(6)
         rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
         if not rows.empty:
             security_id = int(rows.iloc[0]["SECURITY_ID"])
@@ -223,13 +223,18 @@ def _build_stock_data(
     def _filter(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
+        # 1) 大文件列: Code (整数 SECURITY_ID)
         for col in ("Code", "stock_code", "code"):
             if col in df.columns:
-                # 整数列用 security_id 匹配，字符串列用 code 匹配
                 if pd.api.types.is_integer_dtype(df[col]) and security_id is not None:
                     return df[df[col] == security_id].reset_index(drop=True)
                 return df[df[col] == code].reset_index(drop=True)
-        return df  # 无 code 列时原样返回（如已是单股数据）
+        # 2) daily_basic 列: SECURITY_ID (整数) 或 ID_QI (6位字符串)
+        if "SECURITY_ID" in df.columns and security_id is not None:
+            return df[df["SECURITY_ID"] == security_id].reset_index(drop=True)
+        if "ID_QI" in df.columns:
+            return df[df["ID_QI"].astype(str) == id_qi].reset_index(drop=True)
+        return df  # 无可识别的 code 列时原样返回
 
     return StockData(
         code=code,
