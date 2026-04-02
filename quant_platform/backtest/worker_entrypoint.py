@@ -197,36 +197,45 @@ def _make_collecting_outfun(user_outfun=None):
 
 def _build_shard_result(all_results: list[dict]) -> dict:
     """
-    将多个 date×end_time 批次的结果合并为 shard 级别的汇总。
-    数值列取均值，保留元信息。
+    将多个 date×end_time 批次的结果按股票分组汇总。
+    每只股票一条记录，数值列取跨日期均值。
     """
-    if not all_results:
-        return {
-            "shard_index": SHARD_INDEX,
-            "start_date": START_DATE,
-            "end_date": END_DATE,
-            "task_id": TASK_ID,
-            "total_records": 0,
-        }
-
-    df = pd.DataFrame(all_results)
-    meta_cols = {"_date", "_end_time", "code"}
-    numeric_cols = [c for c in df.columns if c not in meta_cols and pd.api.types.is_numeric_dtype(df[c])]
-
-    summary = {
+    meta = {
         "shard_index": SHARD_INDEX,
         "start_date": START_DATE,
         "end_date": END_DATE,
         "task_id": TASK_ID,
-        "total_records": len(df),
-        "trading_days": int(df["_date"].nunique()) if "_date" in df.columns else 0,
     }
 
-    # 数值因子取均值（跨日期、股票）
-    for col in numeric_cols:
-        summary[f"avg_{col}"] = float(df[col].mean())
+    if not all_results:
+        meta["total_records"] = 0
+        meta["stocks"] = []
+        return meta
 
-    return summary
+    df = pd.DataFrame(all_results)
+    skip_cols = {"_date", "_end_time", "code"}
+    numeric_cols = [c for c in df.columns if c not in skip_cols and pd.api.types.is_numeric_dtype(df[c])]
+
+    code_col = "code" if "code" in df.columns else None
+
+    if code_col:
+        stocks = []
+        for code, group in df.groupby(code_col):
+            record = {"code": code, "trading_days": int(group["_date"].nunique()) if "_date" in group.columns else 0}
+            for col in numeric_cols:
+                record[col] = round(float(group[col].mean()), 6)
+            stocks.append(record)
+        meta["total_records"] = len(df)
+        meta["stock_count"] = len(stocks)
+        meta["stocks"] = stocks
+    else:
+        # 无 code 列时退化为全局汇总
+        meta["total_records"] = len(df)
+        meta["stocks"] = []
+        for col in numeric_cols:
+            meta[f"avg_{col}"] = round(float(df[col].mean()), 6)
+
+    return meta
 
 
 # ---------------------------------------------------------------------------
