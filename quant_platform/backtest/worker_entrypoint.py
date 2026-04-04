@@ -6,11 +6,9 @@ Worker Entrypoint - 基础镜像提供，策略代码无需关心 OSS 写入
   1. 从环境变量读取任务参数（START_DATE / END_DATE / TASK_ID / SHARD_INDEX 等）
   2. 动态 import /app/strategy/strategy.py，获取 factor_info / securities /
      factor_calculation / outfun（后两者可选）
-  3. 用内置 outfun 替换或包装用户 outfun，将每个 date×end_time 批次结果
-     累积在内存中
-  4. 全部计算完成后，将汇总结果序列化为 JSON 写入
-     OSS: {RESULT_BUCKET}/{TASK_ID}/{SHARD_INDEX}.json
-     格式与 aggregator.py 期望的 shard 格式一致
+  3. 每日计算完成后立即将该日所有股票结果写入 OSS
+     路径: {RESULT_BUCKET}/{TASK_ID}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
+     每个文件是当日所有股票的因子结果列表（不做跨日聚合）
 
 策略代码只需提供：
   - factor_info: dict
@@ -122,23 +120,37 @@ _logger = _SlsLogger()
 # OSS 工具
 # ---------------------------------------------------------------------------
 
+_oss_bucket: Optional[oss2.Bucket] = None
+
+
 def _get_bucket() -> oss2.Bucket:
-    auth = oss2.Auth(
-        _require_env("OSS_ACCESS_KEY_ID"),
-        _require_env("OSS_ACCESS_KEY_SECRET"),
-    )
-    return oss2.Bucket(
-        auth,
-        _require_env("OSS_ENDPOINT"),
-        RESULT_BUCKET,
-    )
+    global _oss_bucket
+    if _oss_bucket is None:
+        auth = oss2.Auth(
+            _require_env("OSS_ACCESS_KEY_ID"),
+            _require_env("OSS_ACCESS_KEY_SECRET"),
+        )
+        _oss_bucket = oss2.Bucket(
+            auth,
+            _require_env("OSS_ENDPOINT"),
+            RESULT_BUCKET,
+        )
+    return _oss_bucket
 
 
-def _write_shard_result(result: dict) -> None:
-    key = f"{TASK_ID}/{SHARD_INDEX}.json"
+def _write_daily_result(date: str, records: list[dict]) -> None:
+    """
+    按日期写入结果到 OSS，路径格式:
+    {TASK_ID}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
+    """
+    year = date[:4]
+    month = date[4:6]
+    key = f"{TASK_ID}/{year}/{year}{month}/{date}.json"
     bucket = _get_bucket()
-    bucket.put_object(key, json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"))
-    print(f"[worker] 结果已写入 oss://{RESULT_BUCKET}/{key}")
+    payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
+    bucket.put_object(key, payload)
+    _logger.info("日结果已写入 OSS", date=date, records=len(records),
+                 path=f"oss://{RESULT_BUCKET}/{key}")
 
 
 # ---------------------------------------------------------------------------
@@ -157,18 +169,17 @@ def _load_strategy():
 
 
 # ---------------------------------------------------------------------------
-# 默认 outfun：收集每批次结果到全局列表
+# outfun：每日计算完成后直接写入 OSS
 # ---------------------------------------------------------------------------
 
-_all_results: list[dict] = []
 
+def _make_daily_outfun(user_outfun=None):
+    """
+    返回一个 outfun，每个 date 计算完成后立即将该日所有股票结果写入 OSS。
+    路径: {TASK_ID}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
+    """
+    stats = {"total_records": 0, "days_written": 0}
 
-def _make_collecting_outfun(user_outfun=None):
-    """
-    返回一个 outfun，将每批次 DataFrame 收集到 _all_results。
-    如果策略提供了自己的 outfun，先调用它（允许策略做额外处理），
-    再把结果收集起来。
-    """
     def _outfun(date: str, end_time: str, test: pd.DataFrame) -> None:
         if user_outfun is not None:
             try:
@@ -176,66 +187,21 @@ def _make_collecting_outfun(user_outfun=None):
             except Exception as e:
                 _logger.warning("用户 outfun 异常", date=date, error=str(e))
 
-        records = len(test) if not test.empty else 0
-        _logger.info("日期计算完成", date=date, end_time=end_time, records=records)
-
         if test.empty:
+            _logger.info("日期计算完成", date=date, end_time=end_time, records=0)
             return
 
-        for _, row in test.iterrows():
-            record = row.to_dict()
-            record["_date"] = date
-            record["_end_time"] = end_time
-            _all_results.append(record)
+        records = test.to_dict(orient="records")
+        _logger.info("日期计算完成", date=date, end_time=end_time, records=len(records))
 
-    return _outfun
+        try:
+            _write_daily_result(date, records)
+            stats["total_records"] += len(records)
+            stats["days_written"] += 1
+        except Exception as e:
+            _logger.error("写入每日结果失败", date=date, error=str(e))
 
-
-# ---------------------------------------------------------------------------
-# 汇总所有批次结果为 shard JSON
-# ---------------------------------------------------------------------------
-
-def _build_shard_result(all_results: list[dict]) -> dict:
-    """
-    将多个 date×end_time 批次的结果按股票分组汇总。
-    每只股票一条记录，数值列取跨日期均值。
-    """
-    meta = {
-        "shard_index": SHARD_INDEX,
-        "start_date": START_DATE,
-        "end_date": END_DATE,
-        "task_id": TASK_ID,
-    }
-
-    if not all_results:
-        meta["total_records"] = 0
-        meta["stocks"] = []
-        return meta
-
-    df = pd.DataFrame(all_results)
-    skip_cols = {"_date", "_end_time", "code"}
-    numeric_cols = [c for c in df.columns if c not in skip_cols and pd.api.types.is_numeric_dtype(df[c])]
-
-    code_col = "code" if "code" in df.columns else None
-
-    if code_col:
-        stocks = []
-        for code, group in df.groupby(code_col):
-            record = {"code": code, "trading_days": int(group["_date"].nunique()) if "_date" in group.columns else 0}
-            for col in numeric_cols:
-                record[col] = round(float(group[col].mean()), 6)
-            stocks.append(record)
-        meta["total_records"] = len(df)
-        meta["stock_count"] = len(stocks)
-        meta["stocks"] = stocks
-    else:
-        # 无 code 列时退化为全局汇总
-        meta["total_records"] = len(df)
-        meta["stocks"] = []
-        for col in numeric_cols:
-            meta[f"avg_{col}"] = round(float(df[col].mean()), 6)
-
-    return meta
+    return _outfun, stats
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +234,7 @@ def main():
                  need_order=factor_info.get("need_l2_order", False),
                  need_deal=factor_info.get("need_l2_deal", False))
 
-    collecting_outfun = _make_collecting_outfun(user_outfun)
+    daily_outfun, stats = _make_daily_outfun(user_outfun)
 
     t0 = time.time()
     try:
@@ -280,7 +246,7 @@ def main():
             securities=securities or [],
             processes=PROCESSES,
             factor_data_handler=strategy.factor_calculation,
-            outfun=collecting_outfun,
+            outfun=daily_outfun,
             oss_base_path=DATA_PATH,
         )
     except Exception as e:
@@ -288,19 +254,10 @@ def main():
         raise
 
     elapsed = round(time.time() - t0, 1)
-    shard_result = _build_shard_result(_all_results)
     _logger.info("计算完成",
-                 total_records=shard_result["total_records"],
+                 total_records=stats["total_records"],
+                 days_written=stats["days_written"],
                  elapsed_seconds=elapsed)
-
-    try:
-        _write_shard_result(shard_result)
-        _logger.info("结果已写入 OSS",
-                     bucket=RESULT_BUCKET,
-                     key=f"{TASK_ID}/{SHARD_INDEX}.json")
-    except Exception as e:
-        _logger.error("写入 OSS 失败", error=str(e))
-        raise
 
     _logger.info("worker done", elapsed_seconds=elapsed)
 
