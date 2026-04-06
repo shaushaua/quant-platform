@@ -340,11 +340,6 @@ class Collector:
                 logger.error("[OSS] 上传 %s 失败: %s", store_type, e)
 
         logger.info("[OSS] %s 全部上传完成", date_str)
-        logger.info("[日切] %s -> %s", self._trading_day, today)
-        self._trading_day = today
-        self._day_dir = MSG_BACKUP_DIR / today.strftime("%Y%m%d")
-        self._watcher = DayDirWatcher(self._day_dir, skip_history=False)
-        self._load_daily_basic()
 
     def _run_loop(self):
         logger.info("[Collector] 启动，监听目录: %s，poll 间隔: %.1fs", self._day_dir, POLL_INTERVAL)
