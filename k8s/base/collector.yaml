@@ -26,7 +26,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: collector
-          image: 172.24.99.176:5000/quant-platform:latest
+          image: 172.24.99.176:5000/quant-platform/backtest-base:latest
           command: ["python", "-m", "quant_platform.collector.collector"]
           env:
             - name: MSG_BACKUP_DIR
@@ -51,7 +51,6 @@ spec:
           volumeMounts:
             - name: mdl-data
               mountPath: /root/mdl/msg_backup
-              readOnly: true
             - name: shm-store
               mountPath: /dev/shm/store
           resources:
@@ -64,7 +63,7 @@ spec:
       volumes:
         - name: mdl-data
           hostPath:
-            path: /root/mdl/msg_backup
+            path: /www/wwwroot/mdl/msg_backup
             type: DirectoryOrCreate
         # hostPath 替代 emptyDir：允许 collector 和 live-engine CronJob
         # 作为独立 Pod 运行，同时共享宿主机 /dev/shm 内的同一目录

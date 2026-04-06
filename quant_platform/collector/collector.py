@@ -278,7 +278,9 @@ class Collector:
             os.environ["OSS_ACCESS_KEY_ID"],
             os.environ["OSS_ACCESS_KEY_SECRET"],
         )
-        endpoint = os.environ.get("OSS_ENDPOINT", "https://oss-cn-hangzhou-internal.aliyuncs.com")
+        endpoint = os.environ.get("OSS_ENDPOINT", "")
+        if endpoint and not endpoint.startswith("http"):
+            endpoint = f"https://{endpoint}"
         bucket_name = os.environ.get("OSS_DATA_BUCKET", "stock-mdl-data")
         return oss2.Bucket(auth, endpoint, bucket_name)
 
@@ -354,7 +356,9 @@ class Collector:
         logger.info("[Collector] 已停止")
 
     def start(self):
-        self._day_dir.mkdir(parents=True, exist_ok=True)
+        # day_dir 由 hostPath 挂载，可能只读，确保目录存在即可，无需创建
+        if not self._day_dir.exists():
+            logger.warning("[Collector] 监听目录不存在: %s，等待创建", self._day_dir)
         self._load_daily_basic()
         self._run_loop()
 
