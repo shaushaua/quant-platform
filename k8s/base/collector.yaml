@@ -42,6 +42,9 @@ spec:
             # 每只股票 order/deal 最多保留多少行（防止 90GB 数据撑爆内存）
             - name: SHM_MAX_ROWS_PER_SYMBOL
               value: "10000"
+            # daily_basic 从 MySQL 加载的历史天数
+            - name: DAILY_BASIC_MARKET_COUNT
+              value: "5"
           envFrom:
             - secretRef:
                 name: quant-secrets

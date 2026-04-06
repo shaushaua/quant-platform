@@ -21,6 +21,7 @@ CronJob 调用示例：
 
 import argparse
 import importlib
+import json
 import logging
 import os
 import sys
@@ -35,6 +36,49 @@ from ..data.shm_store import ShmStore
 from ..factor.base import StockData
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# OSS 上传
+# ---------------------------------------------------------------------------
+
+def _upload_to_oss(df: pd.DataFrame, date: str, phase: str) -> None:
+    """
+    将因子结果上传到 OSS，路径格式与回测保持一致：
+        {OSS_LIVE_PREFIX}/{YYYY}/{YYYYMM}/{YYYYMMDD}_{phase}.json
+
+    例如: live-factors/2025/202504/20250406_pre-close.json
+    """
+    try:
+        import oss2
+
+        endpoint = os.environ.get("OSS_ENDPOINT", "")
+        ak_id = os.environ.get("OSS_ACCESS_KEY_ID", "")
+        ak_secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
+        bucket_name = os.environ.get("OSS_RESULT_BUCKET", "stock-mdl-data-result")
+        prefix = os.environ.get("OSS_LIVE_PREFIX", "live-factors")
+
+        if not all([endpoint, ak_id, ak_secret]):
+            logger.warning("[OSS] 凭据不完整，跳过上传")
+            return
+
+        auth = oss2.Auth(ak_id, ak_secret)
+        # endpoint 可能带 https:// 前缀，oss2 需要不带前缀的
+        ep_clean = endpoint.replace("https://", "").replace("http://", "")
+        bucket = oss2.Bucket(auth, ep_clean, bucket_name)
+
+        year = date[:4]
+        month = date[4:6]
+        key = f"{prefix}/{year}/{year}{month}/{date}_{phase}.json"
+
+        records = df.to_dict(orient="records")
+        payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
+        bucket.put_object(key, payload)
+
+        logger.info("[OSS] 已上传 oss://%s/%s (%d 条, %d bytes)",
+                    bucket_name, key, len(records), len(payload))
+    except Exception as exc:
+        logger.error("[OSS] 上传失败: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +97,12 @@ def _build_stock_data(
     l2_deal = store.get_deal(code) if factor_info.get("need_l2_deal") else pd.DataFrame()
     l1_tick = store.get_tick(code) if factor_info.get("need_l1_tick") else pd.DataFrame()
     daily_basic = store.get_daily_basic()
+
+    # 按 stock code 过滤 daily_basic
+    if not daily_basic.empty:
+        id_qi = code.split(".")[0].zfill(6)  # "000001.SZ" -> "000001"
+        if "ID_QI" in daily_basic.columns:
+            daily_basic = daily_basic[daily_basic["ID_QI"].astype(str) == id_qi].reset_index(drop=True)
 
     # 按 end_time 过滤（截取截面时刻之前的数据）
     if end_time:

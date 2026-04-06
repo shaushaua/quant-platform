@@ -35,6 +35,90 @@ class TonglanceDataConverter:
         self._sh_pattern = re.compile(r'^[6]\d{5}\.XSHG$')
         self._sz_pattern = re.compile(r'^[03]\d{5}\.XSHE$')
 
+    # ==================== 上交所合并委托+成交 (mdl_4_24_0) ====================
+
+    def convert_sh_order_deal(
+        self, raw_data: Dict, trading_day: datetime
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        转换上交所合并委托+成交数据（mdl_4_24_0 格式）。
+        通过 Type 字段区分：
+            "A" = 普通委托 (OrderType=2)
+            "D" = 撤单委托 (OrderType=5)
+            "T" = 成交
+
+        列映射（与存量 Go data-converter 一致）：
+            SecurityID → Code, TickTime → Time, LocalTime → UpdateTime,
+            BuyOrderNO / SellOrderNO → OrderID（委托）或 BuyOrderID / SaleOrderID（成交）,
+            TickBSFlag → Side (B→0, S→1; 成交还支持 N→10),
+            Price → Price, Qty → Volume, ChannelNo → Channel, BizIndex → SeqNum
+
+        Returns:
+            (order_df, deal_df) 元组
+        """
+        try:
+            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) and not isinstance(raw_data.get("SecurityID"), list) else pd.DataFrame(raw_data)
+            if df.empty:
+                return (
+                    pd.DataFrame(columns=ORDER_COLUMNS),
+                    pd.DataFrame(columns=DEAL_COLUMNS),
+                )
+
+            # 格式化股票代码
+            df["Code"] = df["SecurityID"].astype(str).str.zfill(6) + ".XSHG"
+            df["TradingDay"] = trading_day.date()
+            df["Time"] = self._parse_time(df["TickTime"], trading_day)
+            df["UpdateTime"] = self._parse_time(df["LocalTime"], trading_day)
+            df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+            df["Volume"] = pd.to_numeric(df["Qty"], errors="coerce")
+            df["Channel"] = pd.to_numeric(df["ChannelNo"], errors="coerce").astype("int64")
+            df["SeqNum"] = pd.to_numeric(df["BizIndex"], errors="coerce").astype("int64")
+
+            # Side 映射
+            side_map = {"B": 0, "S": 1, "N": 10}
+            df["Side"] = df["TickBSFlag"].map(side_map).fillna(10).astype("int16")
+
+            # 按 Type 拆分
+            type_col = df["Type"].astype(str).str.strip()
+            order_mask = type_col.isin(["A", "D"])
+            deal_mask = type_col == "T"
+
+            # ---- 委托部分 ----
+            orders = df[order_mask].copy()
+            if not orders.empty:
+                # OrderID = BuyOrderNO + SellOrderNO（只有一个有值）
+                buy_no = pd.to_numeric(orders["BuyOrderNO"], errors="coerce").fillna(0).astype("int64")
+                sell_no = pd.to_numeric(orders["SellOrderNO"], errors="coerce").fillna(0).astype("int64")
+                orders["OrderID"] = buy_no + sell_no
+
+                # OrderType: A=2(普通), D=5(撤单)
+                orders["OrderType"] = type_col[order_mask].map({"A": 2, "D": 5}).astype("int16")
+
+                orders = orders[ORDER_COLUMNS].sort_values("SeqNum").reset_index(drop=True)
+                orders = self._convert_dtypes(orders, "order")
+            else:
+                orders = pd.DataFrame(columns=ORDER_COLUMNS)
+
+            # ---- 成交部分 ----
+            deals = df[deal_mask].copy()
+            if not deals.empty:
+                deals["SaleOrderID"] = pd.to_numeric(deals["SellOrderNO"], errors="coerce").fillna(0).astype("int64")
+                deals["BuyOrderID"] = pd.to_numeric(deals["BuyOrderNO"], errors="coerce").fillna(0).astype("int64")
+                deals["Money"] = deals["Price"] * deals["Volume"]
+                deals = deals[DEAL_COLUMNS].sort_values("SeqNum").reset_index(drop=True)
+                deals = self._convert_dtypes(deals, "deal")
+            else:
+                deals = pd.DataFrame(columns=DEAL_COLUMNS)
+
+            return orders, deals
+
+        except Exception as e:
+            logger.error(f"转换上交所合并委托+成交数据失败: {e}")
+            return (
+                pd.DataFrame(columns=ORDER_COLUMNS),
+                pd.DataFrame(columns=DEAL_COLUMNS),
+            )
+
     # ==================== 委托数据转换 ====================
 
     def convert_sh_order(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:

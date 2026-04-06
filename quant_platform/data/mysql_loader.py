@@ -238,6 +238,114 @@ class MySQLLoader:
             logger.error(f"查询股票列表失败: {e}")
             return []
 
+    # ==================== 日线基础数据 (daily_basic) ====================
+
+    def get_daily_basic(self, trade_date: str, market_count: int = 1) -> pd.DataFrame:
+        """
+        从 MySQL 加载日线基础数据（daily_basic），与 Go data-converter 的
+        GenerateDailyBasicData 保持一致。
+
+        查询 mkt_equd + mkt_equd_adj_af 表，输出列:
+            _date, ID_QI, SECURITY_ID, open, high, low, close,
+            adj_open, adj_close, adj_high, adj_low, adj_pre_close,
+            deal_amount, volume, amount, mkt_cap, float_mkt_cap,
+            turnover_rate, pe_ttm, pb
+
+        Args:
+            trade_date:   交易日期 (YYYY-MM-DD 或 YYYYMMDD)
+            market_count: 需要的历史天数，默认 1（仅当天）
+
+        Returns:
+            pd.DataFrame
+        """
+        if len(trade_date) == 8:
+            trade_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+
+        self._ensure_connection()
+
+        sql = """
+            SELECT
+                t1.TRADE_DATE        AS _date,
+                t1.TICKER_SYMBOL     AS ID_QI,
+                t1.SECURITY_ID,
+                t2.OPEN_PRICE_2      AS open,
+                t2.HIGHEST_PRICE     AS high,
+                t2.LOWEST_PRICE      AS low,
+                t2.CLOSE_PRICE       AS close,
+                t2.OPEN_PRICE_2      AS adj_open,
+                t2.CLOSE_PRICE_2     AS adj_close,
+                t2.HIGHEST_PRICE_2   AS adj_high,
+                t2.LOWEST_PRICE_2    AS adj_low,
+                t2.PRE_CLOSE_PRICE_2 AS adj_pre_close,
+                t1.DEAL_AMOUNT       AS deal_amount,
+                t1.TURNOVER_VOL      AS volume,
+                t1.TURNOVER_VALUE    AS amount,
+                t1.MARKET_VALUE      AS mkt_cap,
+                t1.NEG_MARKET_VALUE  AS float_mkt_cap,
+                t1.TURNOVER_RATE     AS turnover_rate,
+                t1.PE                AS pe_ttm,
+                t1.PB                AS pb
+            FROM mkt_equd t1
+            JOIN mkt_equd_adj_af t2
+                ON  t1.SECURITY_ID = t2.SECURITY_ID
+                AND t1.TRADE_DATE  = t2.TRADE_DATE
+            WHERE t1.TRADE_DATE = %s
+              AND t1.EXCHANGE_CD IN ('XSHG', 'XSHE')
+            ORDER BY t1.TICKER_SYMBOL
+        """
+
+        dfs = []
+        current_date = trade_date
+
+        try:
+            with self._conn.cursor() as cursor:
+                for _ in range(market_count):
+                    cursor.execute(sql, (current_date,))
+                    columns = [desc[0] for desc in cursor.description]
+                    rows = cursor.fetchall()
+                    if rows:
+                        dfs.append(pd.DataFrame(rows, columns=columns))
+
+                    if len(dfs) >= market_count:
+                        break
+
+                    # 获取前一个交易日
+                    cursor.execute(
+                        "SELECT MAX(TRADE_DATE) FROM mkt_equd WHERE TRADE_DATE < %s",
+                        (current_date,),
+                    )
+                    prev = cursor.fetchone()
+                    if prev and prev[0]:
+                        current_date = prev[0].strftime("%Y-%m-%d") if hasattr(prev[0], "strftime") else str(prev[0])
+                    else:
+                        break
+
+            if not dfs:
+                return pd.DataFrame()
+
+            result = pd.concat(dfs, ignore_index=True)
+
+            # 格式化 _date 为 YYYYMMDD 字符串
+            result["_date"] = pd.to_datetime(result["_date"]).dt.strftime("%Y%m%d")
+
+            # 数值类型转换
+            numeric_cols = [
+                "open", "high", "low", "close",
+                "adj_open", "adj_close", "adj_high", "adj_low", "adj_pre_close",
+                "deal_amount", "volume", "amount", "mkt_cap", "float_mkt_cap",
+                "turnover_rate", "pe_ttm", "pb",
+            ]
+            for col in numeric_cols:
+                if col in result.columns:
+                    result[col] = pd.to_numeric(result[col], errors="coerce")
+
+            logger.info(f"获取 daily_basic: {trade_date}, market_count={market_count}, 共 {len(result)} 条")
+            return result
+
+        except Exception as e:
+            logger.error(f"查询 daily_basic 失败: {e}")
+            return pd.DataFrame()
+
     # ==================== 辅助方法 ====================
 
     def _format_code(self, raw_code: str) -> str:
@@ -345,6 +453,61 @@ class PriceCache:
     def is_loaded(self) -> bool:
         """是否已加载数据"""
         return len(self._prices) > 0
+
+
+class DailyBasicCache:
+    """
+    日线基础数据缓存
+
+    使用方式:
+        cache = DailyBasicCache(market_count=5)
+        cache.load(trade_date="20250102")
+
+        df = cache.get_daily_basic()
+    """
+
+    def __init__(self, loader: MySQLLoader = None, market_count: int = 1):
+        self.loader = loader or MySQLLoader()
+        self.market_count = market_count
+        self._df: Optional[pd.DataFrame] = None
+        self._date: str = ""
+        self._lock = threading.RLock()
+
+    def load(self, trade_date: str) -> bool:
+        """
+        加载指定日期的 daily_basic 数据
+
+        Args:
+            trade_date: 交易日期
+
+        Returns:
+            是否成功
+        """
+        try:
+            if not self.loader._conn:
+                self.loader.connect()
+
+            df = self.loader.get_daily_basic(trade_date, self.market_count)
+
+            with self._lock:
+                self._df = df
+                self._date = trade_date
+
+            logger.info(f"daily_basic 缓存加载完成: {trade_date}, market_count={self.market_count}, {len(df)} 条")
+            return True
+
+        except Exception as e:
+            logger.error(f"加载 daily_basic 缓存失败: {e}")
+            return False
+
+    def get_daily_basic(self) -> pd.DataFrame:
+        """获取 daily_basic DataFrame"""
+        with self._lock:
+            return self._df if self._df is not None else pd.DataFrame()
+
+    def is_loaded(self) -> bool:
+        """是否已加载数据"""
+        return self._df is not None and not self._df.empty
 
 
 # ==================== 便捷函数 ====================
