@@ -100,14 +100,45 @@ def calc_factors_by_date_range(
 
     _end_times = end_times if end_times else [""]
 
+    # 如果 securities 为空，先加载第一天 daily_basic 推导全市场股票列表
+    _securities = list(securities) if securities else None
+    if _securities is None and trading_days:
+        try:
+            first_bundle = _load_day_bundle(trading_days[0], factor_info, api, None)
+            if not first_bundle.market.empty:
+                # daily_basic 有 ID_QI 列（6位代码），构建 "XXXXXX.XSHE/XSHG" 格式
+                if "ID_QI" in first_bundle.market.columns:
+                    id_qis = first_bundle.market["ID_QI"].astype(str).str.zfill(6).unique()
+                    # 推断市场：0/3 开头=SZ，6 开头=SH
+                    _securities = []
+                    for q in id_qis:
+                        if q.startswith(("0", "3")):
+                            _securities.append(f"{q}.SZ")
+                        elif q.startswith("6"):
+                            _securities.append(f"{q}.SH")
+                    logger.info("从 daily_basic 自动发现 %d 只股票", len(_securities))
+                else:
+                    logger.warning("daily_basic 无 ID_QI 列，无法自动发现股票")
+                    _securities = []
+            else:
+                logger.warning("daily_basic 为空，无法自动发现股票")
+                _securities = []
+        except Exception as e:
+            logger.warning("自动发现股票失败: %s", e)
+            _securities = []
+
+    if not _securities:
+        logger.warning("股票列表为空，无计算任务")
+        return
+
     logger.info(
         "开始因子计算：%d 个交易日 × %d 个时间切片 × %d 只股票",
-        len(trading_days), len(_end_times), len(securities),
+        len(trading_days), len(_end_times), len(_securities),
     )
 
     for date in trading_days:
         # 每日加载一次原始数据（四分数据），跨 code/end_time 复用
-        bundle = _load_day_bundle(date, factor_info, api, securities)
+        bundle = _load_day_bundle(date, factor_info, api, _securities)
 
         for end_time in _end_times:
             all_res: list = []
