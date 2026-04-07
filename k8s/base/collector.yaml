@@ -31,6 +31,8 @@ spec:
           image: 172.24.99.176:5000/quant-platform/backtest-base:latest
           command: ["python", "-m", "quant_platform.collector.collector"]
           env:
+            - name: TZ
+              value: Asia/Shanghai
             - name: MSG_BACKUP_DIR
               value: /root/mdl/msg_backup
             - name: SHM_STORE_PATH
@@ -54,7 +56,7 @@ spec:
             - name: mdl-data
               mountPath: /root/mdl/msg_backup
             - name: shm-store
-              mountPath: /dev/shm/store
+              mountPath: /dev/shm/quant-store
           resources:
             requests:
               cpu: "1"

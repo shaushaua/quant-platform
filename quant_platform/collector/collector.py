@@ -44,26 +44,30 @@ DataType = str  # "order" | "deal" | "tick" | "order_deal"
 
 def classify_file(filename: str) -> Optional[Tuple[Market, DataType]]:
     """
-    根据文件名后缀返回 (market, data_type)，与 Go data-converter 的命名规范一致。
+    根据文件名返回 (market, data_type)。
+    同时支持实时文件名（mdl_X_Y_Z.csv）和批量文件名（YYYYMMDD_mdl_X_Y_Z.csv）。
     无法识别返回 None。
     """
-    # 上交所 合并委托+成交（新格式，2023-12-21 之后）
-    if filename.endswith("_mdl_4_24_0.csv"):
+    # 去掉 .csv 后缀，按 _ 分隔取最后几段来判断
+    # 实时: mdl_4_24_0.csv  批量: 20260407_mdl_4_24_0.csv
+    # 统一取 "mdl_" 开始的后缀部分
+    idx = filename.find("mdl_")
+    if idx < 0 and not filename.endswith("_MarketData.csv"):
+        return None
+
+    suffix = filename[idx:] if idx >= 0 else filename
+
+    if suffix == "mdl_4_24_0.csv":
         return ("SH", "order_deal")
-    # 上交所 tick 快照
-    if filename.endswith("_MarketData.csv"):
+    if suffix == "MarketData.csv" or filename.endswith("_MarketData.csv"):
         return ("SH", "tick")
-    # 深交所 逐笔委托
-    if filename.endswith("_mdl_6_33_0.csv"):
+    if suffix == "mdl_6_33_0.csv":
         return ("SZ", "order")
-    # 深交所 逐笔成交
-    if filename.endswith("_mdl_6_36_0.csv"):
+    if suffix == "mdl_6_36_0.csv":
         return ("SZ", "deal")
-    # 深交所 tick 快照
-    if filename.endswith("_mdl_6_28_0.csv"):
+    if suffix == "mdl_6_28_0.csv":
         return ("SZ", "tick")
-    # 上交所 逐笔委托（旧格式）
-    if filename.endswith("_mdl_4_19_0.csv"):
+    if suffix == "mdl_4_19_0.csv":
         return ("SH", "order")
     return None
 

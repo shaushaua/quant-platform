@@ -46,6 +46,8 @@ spec:
                 - --phase
                 - pre-open
               env:
+                - name: TZ
+                  value: Asia/Shanghai
                 - name: SHM_STORE_PATH
                   value: /dev/shm/quant-store
                 # 用户因子模块路径，如 quant_platform.factor.examples.momentum
@@ -126,10 +128,12 @@ spec:
                 - --phase
                 - pre-close
               env:
+                - name: TZ
+                  value: Asia/Shanghai
                 - name: SHM_STORE_PATH
                   value: /dev/shm/quant-store
                 - name: FACTOR_MODULE
-                  value: ""   # 必填，在 ACK 控制台编辑此值
+                  value: ""   # 必填，在 ACK 控制台 编辑此值
                 - name: UNIVERSE
                   value: ""
                 - name: FACTOR_OUTPUT_PATH
