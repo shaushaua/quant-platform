@@ -57,7 +57,7 @@ class TonglanceDataConverter:
             (order_df, deal_df) 元组
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) and not isinstance(raw_data.get("SecurityID"), list) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return (
                     pd.DataFrame(columns=ORDER_COLUMNS),
@@ -133,7 +133,7 @@ class TonglanceDataConverter:
             标准格式的委托DataFrame
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=ORDER_COLUMNS)
 
@@ -184,7 +184,7 @@ class TonglanceDataConverter:
         转换深交所逐笔委托
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=ORDER_COLUMNS)
 
@@ -238,7 +238,7 @@ class TonglanceDataConverter:
         转换上交所逐笔成交
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=DEAL_COLUMNS)
 
@@ -288,7 +288,7 @@ class TonglanceDataConverter:
         转换深交所逐笔成交
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=DEAL_COLUMNS)
 
@@ -349,7 +349,7 @@ class TonglanceDataConverter:
         转换上交所Tick快照
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=TICK_COLUMNS)
 
@@ -431,7 +431,7 @@ class TonglanceDataConverter:
         转换深交所Tick快照
         """
         try:
-            df = pd.DataFrame([raw_data]) if isinstance(raw_data, dict) else pd.DataFrame(raw_data)
+            df = pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=TICK_COLUMNS)
 
