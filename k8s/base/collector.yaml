@@ -42,7 +42,7 @@ spec:
             - name: COLLECTOR_SKIP_HISTORY
               value: "true"
             - name: LOG_LEVEL
-              value: DEBUG
+              value: INFO
             # 每只股票 order/deal 最多保留多少行（防止 90GB 数据撑爆内存）
             - name: SHM_MAX_ROWS_PER_SYMBOL
               value: "10000"
