@@ -95,7 +95,10 @@ class FilePoller:
             return None
 
         if current_size <= self._offset:
+            logger.debug("[poll] %s size=%d offset=%d 无新数据", self.path.name, current_size, self._offset)
             return None
+
+        logger.debug("[poll] %s size=%d offset=%d 新增=%d bytes", self.path.name, current_size, self._offset, current_size - self._offset)
 
         with open(self.path, "rb") as f:
             # 若 offset=0 需要读 header
@@ -346,9 +349,13 @@ class Collector:
         logger.info("[OSS] %s 全部上传完成", date_str)
 
     def _run_loop(self):
+        poll_count = 0
         logger.info("[Collector] 启动，监听目录: %s，poll 间隔: %.1fs", self._day_dir, POLL_INTERVAL)
         while not self._stop_event.is_set():
             self._check_day_rollover()
+            poll_count += 1
+            if poll_count % 20 == 1:  # 每 10 秒打印一次
+                logger.debug("[loop] 第 %d 次轮询, 已跟踪 %d 个文件", poll_count, len(self._watcher._pollers))
             for path, market, data_type, df in self._watcher.poll():
                 self._handle(path, market, data_type, df)
             self._stop_event.wait(POLL_INTERVAL)
