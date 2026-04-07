@@ -71,7 +71,7 @@ class TonglanceDataConverter:
             df["UpdateTime"] = self._parse_time(df["LocalTime"], trading_day)
             df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
             df["Volume"] = pd.to_numeric(df["Qty"], errors="coerce")
-            df["Channel"] = pd.to_numeric(df["ChannelNo"], errors="coerce").astype("int64")
+            df["Channel"] = pd.to_numeric(df["Channel"], errors="coerce").astype("int64")
             df["SeqNum"] = pd.to_numeric(df["BizIndex"], errors="coerce").astype("int64")
 
             # Side 映射
