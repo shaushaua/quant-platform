@@ -95,8 +95,8 @@ def calc_factors_by_date_range(
         trading_days = _fallback_trading_days(start_date, end_date)
 
     if not trading_days:
-        logger.warning("交易日列表为空，start=%s end=%s", start_date, end_date)
-        return
+        logger.warning("从 OSS 获取交易日列表失败，使用回退逻辑（剔除周末）")
+        trading_days = _fallback_trading_days(start_date, end_date)
 
     _end_times = end_times if end_times else [""]
 
