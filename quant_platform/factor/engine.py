@@ -121,8 +121,6 @@ def calc_factors_by_date_range(
     )
 
     for date in trading_days:
-
-    for date in trading_days:
         # 如果 securities 数量较大，使用流式加载模式（按股票逐个加载）
         # 避免一次性加载全市场数据导致 OOM
         use_streaming = len(_securities) > 100  # 超过100只股票启用流式模式
