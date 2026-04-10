@@ -100,41 +100,27 @@ def calc_factors_by_date_range(
 
     _end_times = end_times if end_times else [""]
 
-    # 如果 securities 为空，先加载第一天 daily_basic 推导全市场股票列表
-    _securities = list(securities) if securities else None
-    if _securities is None and trading_days:
-        try:
-            first_bundle = _load_day_bundle(trading_days[0], factor_info, api, None)
-            if not first_bundle.market.empty:
-                # daily_basic 有 ID_QI 列（6位代码），构建 "XXXXXX.XSHE/XSHG" 格式
-                if "ID_QI" in first_bundle.market.columns:
-                    id_qis = first_bundle.market["ID_QI"].astype(str).str.zfill(6).unique()
-                    # 推断市场：0/3 开头=SZ，6 开头=SH
-                    _securities = []
-                    for q in id_qis:
-                        if q.startswith(("0", "3")):
-                            _securities.append(f"{q}.SZ")
-                        elif q.startswith("6"):
-                            _securities.append(f"{q}.SH")
-                    logger.info("从 daily_basic 自动发现 %d 只股票", len(_securities))
-                else:
-                    logger.warning("daily_basic 无 ID_QI 列，无法自动发现股票")
-                    _securities = []
-            else:
-                logger.warning("daily_basic 为空，无法自动发现股票")
-                _securities = []
-        except Exception as e:
-            logger.warning("自动发现股票失败: %s", e)
-            _securities = []
+    # 判断是否为全市场模式
+    is_explicit_list = securities and len(securities) > 0
 
-    if not _securities:
-        logger.warning("股票列表为空，无计算任务")
-        return
+    if is_explicit_list:
+        # 明确指定了股票列表，使用传统预加载模式
+        _securities = list(securities)
+        use_streaming = len(_securities) > 100
+        logger.info("指定股票模式：%d 只股票", len(_securities))
+    else:
+        # 全市场模式（securities 为 None 或 []）：使用流式加载模式
+        _securities = []  # 流式模式不需要预先列出所有股票
+        use_streaming = True
+        logger.info("全市场流式模式：按需加载避免 OOM")
 
     logger.info(
-        "开始因子计算：%d 个交易日 × %d 个时间切片 × %d 只股票",
-        len(trading_days), len(_end_times), len(_securities),
+        "开始因子计算：%d 个交易日 × %d 个时间切片 × %s",
+        len(trading_days), len(_end_times),
+        f"{len(_securities)} 只股票" if is_explicit_list else "全市场流式模式",
     )
+
+    for date in trading_days:
 
     for date in trading_days:
         # 如果 securities 数量较大，使用流式加载模式（按股票逐个加载）
