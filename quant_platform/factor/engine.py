@@ -109,10 +109,10 @@ def calc_factors_by_date_range(
         use_streaming = len(_securities) > 100
         logger.info("指定股票模式：%d 只股票", len(_securities))
     else:
-        # 全市场模式（securities 为 None 或 []）：使用流式加载模式
-        _securities = []  # 流式模式不需要预先列出所有股票
+        # 全市场模式（securities 为 None 或 []）：从 daily_basic 获取股票列表
+        # 使用流式加载模式，避免一次性加载全市场数据导致 OOM
         use_streaming = True
-        logger.info("全市场流式模式：按需加载避免 OOM")
+        logger.info("全市场模式：从 daily_basic 获取股票列表")
 
     logger.info(
         "开始因子计算：%d 个交易日 × %d 个时间切片 × %s",
@@ -121,6 +121,18 @@ def calc_factors_by_date_range(
     )
 
     for date in trading_days:
+        # 全市场模式：从 daily_basic 获取股票列表
+        if not is_explicit_list:
+            daily_basic = api.get_daily_data(date, "daily_basic")
+            if "ts_code" in daily_basic.columns:
+                _securities = daily_basic["ts_code"].tolist()
+            elif "Code" in daily_basic.columns:
+                _securities = daily_basic["Code"].tolist()
+            else:
+                logger.warning("无法从 daily_basic 获取股票列表，跳过 date=%s", date)
+                continue
+            logger.info("从 daily_basic 获取到 %d 只股票", len(_securities))
+
         # 如果 securities 数量较大，使用流式加载模式（按股票逐个加载）
         # 避免一次性加载全市场数据导致 OOM
         use_streaming = len(_securities) > 100  # 超过100只股票启用流式模式
@@ -132,8 +144,13 @@ def calc_factors_by_date_range(
             for end_time in _end_times:
                 all_res: list = []
 
-                # 只加载 daily_basic（用于获取 security_id 映射）
-                daily_basic = api.get_daily_data(date, "daily_basic")
+                # 加载 daily_basic（全市场模式已加载，指定模式重新加载）
+                if not is_explicit_list:
+                    # 全市场模式：复用之前加载的 daily_basic
+                    pass
+                else:
+                    # 指定模式：加载 daily_basic 获取 security_id 映射
+                    daily_basic = api.get_daily_data(date, "daily_basic")
 
                 for code in _securities:
                     try:
