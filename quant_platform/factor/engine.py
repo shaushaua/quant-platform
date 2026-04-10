@@ -137,24 +137,75 @@ def calc_factors_by_date_range(
     )
 
     for date in trading_days:
-        # 每日加载一次原始数据（四分数据），跨 code/end_time 复用
-        bundle = _load_day_bundle(date, factor_info, api, _securities)
+        # 如果 securities 数量较大，使用流式加载模式（按股票逐个加载）
+        # 避免一次性加载全市场数据导致 OOM
+        use_streaming = len(_securities) > 100  # 超过100只股票启用流式模式
 
-        for end_time in _end_times:
-            all_res: list = []
+        if use_streaming:
+            # 流式模式：不预加载全市场数据，每个股票按需加载
+            logger.info("启用流式加载模式：%d 只股票分批处理", len(_securities))
 
-            for code in securities:
-                try:
-                    stock_data = _build_stock_data(bundle, code, date, end_time)
-                    if _calc_fn is not None:
-                        res = _calc_fn(stock_data, code, date, end_time)
-                        if res is not None:
-                            all_res.append(res)
-                except Exception as e:
-                    logger.warning(
-                        "因子计算异常 date=%s end_time=%s code=%s: %s",
-                        date, end_time, code, e,
-                    )
+            for end_time in _end_times:
+                all_res: list = []
+
+                # 只加载 daily_basic（用于获取 security_id 映射）
+                daily_basic = api.get_daily_data(date, "daily_basic")
+
+                for code in _securities:
+                    try:
+                        # 设置上下文，让 get_current_data 工作在 per-code 模式
+                        api._set_context(date, code)
+
+                        # 按需加载当前股票的数据
+                        l2_order = api.get_daily_data(date, "order", [code]) if factor_info.get("need_l2_order") else pd.DataFrame()
+                        l2_deal  = api.get_daily_data(date, "deal",  [code]) if factor_info.get("need_l2_deal") else pd.DataFrame()
+                        l1_tick  = api.get_daily_data(date, "tick", [code]) if factor_info.get("need_l1_tick") else pd.DataFrame()
+
+                        # 构建单日数据包
+                        bundle = _DayBundle(
+                            date=date,
+                            l2_order=l2_order,
+                            l2_deal=l2_deal,
+                            l1_tick=l1_tick,
+                            market=daily_basic,  # 所有股票共享 daily_basic
+                        )
+
+                        stock_data = _build_stock_data(bundle, code, date, end_time)
+                        if _calc_fn is not None:
+                            res = _calc_fn(stock_data, code, date, end_time)
+                            if res is not None:
+                                all_res.append(res)
+                    except Exception as e:
+                        logger.warning(
+                            "因子计算异常 date=%s end_time=%s code=%s: %s",
+                            date, end_time, code, e,
+                        )
+
+                test = _merge_results(all_res)
+                if _out_fn is not None:
+                    try:
+                        _out_fn(date, end_time, test)
+                    except Exception as e:
+                        logger.error("outfun 异常 date=%s end_time=%s: %s", date, end_time, e)
+        else:
+            # 传统模式：预加载全市场数据（适用于小规模股票列表）
+            bundle = _load_day_bundle(date, factor_info, api, _securities)
+
+            for end_time in _end_times:
+                all_res: list = []
+
+                for code in securities:
+                    try:
+                        stock_data = _build_stock_data(bundle, code, date, end_time)
+                        if _calc_fn is not None:
+                            res = _calc_fn(stock_data, code, date, end_time)
+                            if res is not None:
+                                all_res.append(res)
+                    except Exception as e:
+                        logger.warning(
+                            "因子计算异常 date=%s end_time=%s code=%s: %s",
+                            date, end_time, code, e,
+                        )
 
             test = _merge_results(all_res)
 
