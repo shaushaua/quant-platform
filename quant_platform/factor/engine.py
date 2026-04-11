@@ -195,7 +195,7 @@ def calc_factors_by_date_range(
             for end_time in _end_times:
                 all_res: list = []
 
-                for code in securities:
+                for code in _securities:
                     try:
                         stock_data = _build_stock_data(bundle, code, date, end_time)
                         if _calc_fn is not None:
