@@ -176,54 +176,58 @@ class OSSDataLoader:
         return result
 
     def _read_large_file_by_codes(self, key: str, data_type: str, codes: List[str]) -> pd.DataFrame:
-        """用 DuckDB S3 谓词下推读取大文件中指定股票的数据。"""
-        # 先尝试从 OSS 下载整个文件到内存（如果不大），否则用 DuckDB
+        """
+        用 oss2 下载到本地，然后 DuckDB 读取本地文件并过滤。
+        避免 s3:// 协议与阿里云 OSS 兼容性问题，同时利用 DuckDB 的内存效率。
+        """
         import re
+        import tempfile
         m = re.search(r'(\d{8})', key)
         date_str = m.group(1) if m else ""
 
-        # 先用 oss2 下载全文件（临时方案）
-        if self._oss_bucket:
-            try:
-                result = self._oss_bucket.get_object(key)
-                import io
-                data = result.read()
-                df = pd.read_parquet(io.BytesIO(data))
-                # 按股票代码过滤
-                security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
-                if not security_ids:
-                    logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
-                    return pd.DataFrame()
-                # 根据列名过滤
-                code_col = "Code" if "Code" in df.columns else ("ts_code" if "ts_code" in df.columns else None)
-                if code_col and code_col in df.columns:
-                    df = df[df[code_col].isin(codes)]
-                else:
-                    # 用 SECURITY_ID 过滤
-                    df = df[df["SECURITY_ID"].isin(security_ids)]
-                logger.info(f"oss2 读取 {key}: {len(df)} 条记录 (过滤后)")
-                return df
-            except Exception as e:
-                logger.warning(f"oss2 读取失败 {key}: {e}")
-
-        # 回退到 DuckDB
-        if not _DUCKDB_AVAILABLE or OSSDataLoader._duckdb_con is None:
-            logger.error("DuckDB 不可用，无法读取大文件")
-            return pd.DataFrame()
-
+        # 解析 security_ids
         security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
         if not security_ids:
             logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
             return pd.DataFrame()
-        ids_str = ", ".join(str(i) for i in security_ids)
-        url = self._s3_url(key)
+
+        # 方案：oss2 下载到本地临时文件，DuckDB 读取本地文件并过滤
+        if not self._oss_bucket:
+            logger.error("OSS bucket 未初始化")
+            return pd.DataFrame()
+
+        if not _DUCKDB_AVAILABLE or OSSDataLoader._duckdb_con is None:
+            logger.error("DuckDB 不可用，无法读取大文件")
+            return pd.DataFrame()
+
         try:
-            sql = f"SELECT * FROM read_parquet('{url}') WHERE SECURITY_ID IN ({ids_str})"
+            # 1. 下载到临时文件
+            with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                logger.info(f"开始下载 {key} 到本地临时文件 {tmp_path}")
+                self._oss_bucket.get_object_to_file(key, tmp_path)
+                logger.info(f"下载完成: {key}")
+
+            # 2. DuckDB 读取本地文件并用 WHERE 过滤
+            ids_str = ", ".join(str(i) for i in security_ids)
+            sql = f"SELECT * FROM read_parquet('{tmp_path}') WHERE SECURITY_ID IN ({ids_str})"
             df = OSSDataLoader._duckdb_con.execute(sql).df()
-            logger.info(f"DuckDB 读取 {key}: {len(df)} 条记录 security_ids={security_ids}")
+            logger.info(f"DuckDB 读取本地文件 {tmp_path}: {len(df)} 条记录 (过滤后 security_ids={security_ids})")
+
+            # 3. 清理临时文件
+            import os as _os
+            try:
+                _os.unlink(tmp_path)
+            except Exception as e:
+                logger.warning(f"删除临时文件失败 {tmp_path}: {e}")
+
             return df
+
+        except oss2.exceptions.NoSuchKey:
+            logger.warning(f"OSS 文件不存在: {key}")
+            return pd.DataFrame()
         except Exception as e:
-            logger.error(f"DuckDB 读取失败 {key}: {e}")
+            logger.error(f"读取大文件失败 {key}: {e}")
             return pd.DataFrame()
 
     def _list_keys_with_prefix(self, prefix: str) -> List[str]:
