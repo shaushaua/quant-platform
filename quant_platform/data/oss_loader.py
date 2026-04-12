@@ -136,7 +136,9 @@ class OSSDataLoader:
         return f"{self.base_path}/{year}{month}/{year}{month}{day}/{year}{month}{day}_{file_suffix}.parquet"
 
     def _s3_url(self, key: str) -> str:
-        return f"s3://{self._data_bucket}/{key}"
+        # 使用 HTTPS URL 而不是 s3:// 协议（DuckDB s3 协议与阿里云 OSS 不兼容）
+        endpoint = self._endpoint.rstrip("/")
+        return f"{endpoint}/{self._data_bucket}/{key}"
 
     def _read_small_file(self, key: str) -> pd.DataFrame:
         """用 oss2 下载小文件到内存，读取 parquet。"""
