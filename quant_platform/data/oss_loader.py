@@ -82,7 +82,7 @@ class OSSDataLoader:
         self._ak = os.environ.get("OSS_ACCESS_KEY_ID", "")
         self._sk = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
         self._endpoint = os.environ.get("OSS_ENDPOINT", "")
-        self._data_bucket = os.environ.get("OSS_DATA_BUCKET", "stock-mdl-data")
+        self._data_bucket = os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data")
         self._region = os.environ.get("OSS_REGION", "oss-cn-hangzhou")
 
         self._oss_bucket = self._init_oss_bucket()
