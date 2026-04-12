@@ -148,8 +148,8 @@ def calc_factors_by_date_range(
         if use_streaming:
             # 分批加载模式：将全市场股票分批，每批下载一次文件并过滤
             # 避免每只股票单独下载（O(N×4GB)），也避免全量加载 OOM
-            # 每批约 500 只，内存占用可控（tick ~700MB/批，deal ~200MB/批）
-            BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "500"))
+            # 默认每批 200 只，内存占用约 600MB~1GB/批（deal+tick 合计）
+            BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "200"))
             batches = [_securities[i:i+BATCH_SIZE] for i in range(0, len(_securities), BATCH_SIZE)]
             logger.info("分批加载模式：%d 只股票分 %d 批处理（每批 %d 只）",
                         len(_securities), len(batches), BATCH_SIZE)
@@ -175,6 +175,9 @@ def calc_factors_by_date_range(
                                 "因子计算异常 date=%s end_time=%s code=%s: %s",
                                 date, end_time, code, e,
                             )
+
+                    # 批次完成后释放大 DataFrame，避免内存积累
+                    del bundle
 
                 test = _merge_results(all_res)
                 if _out_fn is not None:
