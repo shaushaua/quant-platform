@@ -110,14 +110,14 @@ class OSSDataLoader:
         try:
             con = _duckdb.connect()
             con.execute("INSTALL httpfs; LOAD httpfs;")
+            con.execute(f"SET s3_region='{self._region}';")
             # DuckDB s3_endpoint 只需 hostname，去掉 https:// 或 http:// 前缀
             _s3_endpoint = self._endpoint.replace("https://", "").replace("http://", "").rstrip("/")
             con.execute(f"SET s3_endpoint='{_s3_endpoint}';")  # noqa: E501
             con.execute("SET s3_use_ssl=true;")
             con.execute(f"SET s3_access_key_id='{self._ak}';")
             con.execute(f"SET s3_secret_access_key='{self._sk}';")
-            # 阿里云 OSS 使用 path 风格（vhost 是 AWS S3 格式）
-            con.execute("SET s3_url_style='path';")
+            con.execute("SET s3_url_style='vhost';")
             OSSDataLoader._duckdb_con = con
             logger.info("DuckDB S3 连接初始化完成")
         except Exception as e:
