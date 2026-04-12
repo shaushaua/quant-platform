@@ -33,6 +33,7 @@
 """
 
 import logging
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
@@ -145,29 +146,35 @@ def calc_factors_by_date_range(
         use_streaming = len(_securities) > 100  # 超过100只股票启用流式模式
 
         if use_streaming:
-            # 全量预加载模式：每天只下载一次大文件，传入全部 codes 做一次性过滤
-            # 避免每只股票单独触发完整文件下载（全市场 5000 只 × 4GB = 20TB）
-            logger.info("预加载模式：一次性下载并过滤全部 %d 只股票数据", len(_securities))
-            bundle = _load_day_bundle(date, factor_info, api, _securities)
-            if not is_explicit_list:
-                # 全市场模式已加载 daily_basic，注入到 bundle
-                bundle.market = daily_basic
+            # 分批加载模式：将全市场股票分批，每批下载一次文件并过滤
+            # 避免每只股票单独下载（O(N×4GB)），也避免全量加载 OOM
+            # 每批约 500 只，内存占用可控（tick ~700MB/批，deal ~200MB/批）
+            BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "500"))
+            batches = [_securities[i:i+BATCH_SIZE] for i in range(0, len(_securities), BATCH_SIZE)]
+            logger.info("分批加载模式：%d 只股票分 %d 批处理（每批 %d 只）",
+                        len(_securities), len(batches), BATCH_SIZE)
 
             for end_time in _end_times:
                 all_res: list = []
 
-                for code in _securities:
-                    try:
-                        stock_data = _build_stock_data(bundle, code, date, end_time)
-                        if _calc_fn is not None:
-                            res = _calc_fn(stock_data, code, date, end_time)
-                            if res is not None:
-                                all_res.append(res)
-                    except Exception as e:
-                        logger.warning(
-                            "因子计算异常 date=%s end_time=%s code=%s: %s",
-                            date, end_time, code, e,
-                        )
+                for batch_idx, batch_codes in enumerate(batches):
+                    logger.info("处理批次 %d/%d：%d 只股票", batch_idx+1, len(batches), len(batch_codes))
+                    bundle = _load_day_bundle(date, factor_info, api, batch_codes)
+                    if not is_explicit_list:
+                        bundle.market = daily_basic
+
+                    for code in batch_codes:
+                        try:
+                            stock_data = _build_stock_data(bundle, code, date, end_time)
+                            if _calc_fn is not None:
+                                res = _calc_fn(stock_data, code, date, end_time)
+                                if res is not None:
+                                    all_res.append(res)
+                        except Exception as e:
+                            logger.warning(
+                                "因子计算异常 date=%s end_time=%s code=%s: %s",
+                                date, end_time, code, e,
+                            )
 
                 test = _merge_results(all_res)
                 if _out_fn is not None:
