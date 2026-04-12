@@ -110,10 +110,16 @@ class OSSDataLoader:
         try:
             con = _duckdb.connect()
             con.execute("INSTALL httpfs; LOAD httpfs;")
-            # 配置阿里云 OSS 认证 header
-            con.execute(f"SET http_server_encoding='utf-8';")
+            # 提取 region：oss-cn-hangzhou -> hangzhou
+            region = self._region.replace('oss-cn-', '') if self._region.startswith('oss-cn-') else self._region
+            con.execute(f"SET s3_region='{region}';")
+            con.execute(f"SET s3_endpoint='oss-cn-hangzhou.aliyuncs.com';")
+            con.execute("SET s3_use_ssl=true;")
+            con.execute(f"SET s3_access_key_id='{self._ak}';")
+            con.execute(f"SET s3_secret_access_key='{self._sk}';")
+            con.execute("SET s3_url_style='vhost';")
             OSSDataLoader._duckdb_con = con
-            logger.info("DuckDB HTTP 连接初始化完成")
+            logger.info("DuckDB S3 连接初始化完成")
         except Exception as e:
             logger.error(f"DuckDB 初始化失败: {e}")
 
@@ -130,13 +136,9 @@ class OSSDataLoader:
         return f"{self.base_path}/{year}{month}/{year}{month}{day}/{year}{month}{day}_{file_suffix}.parquet"
 
     def _s3_url(self, key: str) -> str:
-        # 使用 HTTPS URL 而不是 s3:// 协议（DuckDB s3 协议与阿里云 OSS 不兼容）
-        # 格式: https://{ak}:{sk}@{endpoint}/{bucket}/{key}
-        from urllib.parse import quote
-        endpoint = self._endpoint.replace("https://", "").replace("http://", "").rstrip("/")
-        encoded_ak = quote(self._ak, safe='')
-        encoded_sk = quote(self._sk, safe='')
-        return f"https://{encoded_ak}:{encoded_sk}@{endpoint}/{self._data_bucket}/{key}"
+        # DuckDB 与阿里云 OSS 兼容性测试
+        # 方案1: s3:// 协议 + vhost 风格
+        return f"s3://{self._data_bucket}/{key}"
 
     def _read_small_file(self, key: str) -> pd.DataFrame:
         """用 oss2 下载小文件到内存，读取 parquet。"""
