@@ -145,39 +145,19 @@ def calc_factors_by_date_range(
         use_streaming = len(_securities) > 100  # 超过100只股票启用流式模式
 
         if use_streaming:
-            # 流式模式：不预加载全市场数据，每个股票按需加载
-            logger.info("启用流式加载模式：%d 只股票分批处理", len(_securities))
+            # 全量预加载模式：每天只下载一次大文件，传入全部 codes 做一次性过滤
+            # 避免每只股票单独触发完整文件下载（全市场 5000 只 × 4GB = 20TB）
+            logger.info("预加载模式：一次性下载并过滤全部 %d 只股票数据", len(_securities))
+            bundle = _load_day_bundle(date, factor_info, api, _securities)
+            if not is_explicit_list:
+                # 全市场模式已加载 daily_basic，注入到 bundle
+                bundle.market = daily_basic
 
             for end_time in _end_times:
                 all_res: list = []
 
-                # 加载 daily_basic（全市场模式已加载，指定模式重新加载）
-                if not is_explicit_list:
-                    # 全市场模式：复用之前加载的 daily_basic
-                    pass
-                else:
-                    # 指定模式：加载 daily_basic 获取 security_id 映射
-                    daily_basic = api.get_daily_data(date, "daily_basic")
-
                 for code in _securities:
                     try:
-                        # 设置上下文，让 get_current_data 工作在 per-code 模式
-                        api._set_context(date, code)
-
-                        # 按需加载当前股票的数据
-                        l2_order = api.get_daily_data(date, "order", [code]) if factor_info.get("need_l2_order") else pd.DataFrame()
-                        l2_deal  = api.get_daily_data(date, "deal",  [code]) if factor_info.get("need_l2_deal") else pd.DataFrame()
-                        l1_tick  = api.get_daily_data(date, "tick", [code]) if factor_info.get("need_l1_tick") else pd.DataFrame()
-
-                        # 构建单日数据包
-                        bundle = _DayBundle(
-                            date=date,
-                            l2_order=l2_order,
-                            l2_deal=l2_deal,
-                            l1_tick=l1_tick,
-                            market=daily_basic,  # 所有股票共享 daily_basic
-                        )
-
                         stock_data = _build_stock_data(bundle, code, date, end_time)
                         if _calc_fn is not None:
                             res = _calc_fn(stock_data, code, date, end_time)
