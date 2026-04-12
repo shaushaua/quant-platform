@@ -163,9 +163,17 @@ class OSSDataLoader:
     def _resolve_security_ids(self, date_str: str, codes: List[str]) -> List[int]:
         """将 000001.SZ 格式的 codes 转成 SECURITY_ID 整数列表。"""
         key = self._object_key(date_str, "daily_basic")
+        logger.info(f"读取 daily_basic 进行 ID 映射 | key={key}")
         df = self._read_small_file(key)
-        if df.empty or "ID_QI" not in df.columns or "SECURITY_ID" not in df.columns:
+        if df.empty:
+            logger.warning(f"daily_basic 文件为空或不存在: {key}")
             return []
+        if "ID_QI" not in df.columns or "SECURITY_ID" not in df.columns:
+            logger.warning(f"daily_basic 缺少必要列 | columns={list(df.columns)}")
+            return []
+
+        logger.info(f"daily_basic 加载成功 | 行数={len(df)} ID_QI样本={df['ID_QI'].head(3).tolist()}")
+
         # ID_QI 是6位纯数字字符串，codes 可能带交易所后缀如 000001.SZ
         id_map = dict(zip(df["ID_QI"].astype(str), df["SECURITY_ID"].astype(int)))
         result = []
@@ -173,6 +181,10 @@ class OSSDataLoader:
             id_qi = code.split(".")[0].zfill(6)  # 000001.SZ -> 000001
             if id_qi in id_map:
                 result.append(id_map[id_qi])
+            else:
+                logger.debug(f"ID_QI {id_qi} 未在 daily_basic 中找到 (from {code})")
+
+        logger.info(f"ID 映射完成 | 输入={len(codes)} 成功={len(result)} 失败={len(codes)-len(result)}")
         return result
 
     def _read_large_file_by_codes(self, key: str, data_type: str, codes: List[str]) -> pd.DataFrame:
@@ -193,10 +205,12 @@ class OSSDataLoader:
             return pd.DataFrame()
 
         # 解析 SECURITY_ID（对应 tick/deal 文件中的 Code 列）
+        logger.info(f"开始解析 {len(codes)} 只股票的 SECURITY_ID | date={date_str} codes_sample={codes[:3]}")
         security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
         if not security_ids:
-            logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
+            logger.warning(f"无法解析 codes={codes[:5]}... 对应的 SECURITY_ID，跳过 {key}")
             return pd.DataFrame()
+        logger.info(f"解析到 {len(security_ids)} 个 SECURITY_ID: {security_ids[:10]}...")
 
         # 方案：oss2 下载到本地临时文件，DuckDB 利用 Code 排序特性过滤
         if not self._oss_bucket:
@@ -213,15 +227,17 @@ class OSSDataLoader:
                 tmp_path = tmp_file.name
                 logger.info(f"开始下载 {key} 到本地临时文件 {tmp_path}")
                 self._oss_bucket.get_object_to_file(key, tmp_path)
-                logger.info(f"下载完成: {key}")
+                file_size = os.path.getsize(tmp_path)
+                logger.info(f"下载完成: {key} ({file_size:,} bytes)")
 
             # 2. DuckDB 读取本地文件并用 WHERE Code IN 过滤
             # tick/deal 文件中的 Code 列即为 SECURITY_ID
             # 由于文件按 Code 排序，DuckDB 会利用 row group 统计信息跳过不相关的块
             ids_str = ", ".join(str(i) for i in security_ids)
             sql = f"SELECT * FROM read_parquet('{tmp_path}') WHERE Code IN ({ids_str})"
+            logger.info(f"执行 DuckDB 查询: {sql[:200]}...")
             df = OSSDataLoader._duckdb_con.execute(sql).df()
-            logger.info(f"DuckDB 读取本地文件 {tmp_path}: {len(df)} 条记录 (过滤 {len(codes)} 只股票, security_ids={security_ids[:5]}...)")
+            logger.info(f"DuckDB 读取完成: {len(df)} 条记录 (codes={len(codes)} security_ids={len(security_ids)})")
 
             # 3. 清理临时文件
             import os as _os
@@ -236,7 +252,7 @@ class OSSDataLoader:
             logger.warning(f"OSS 文件不存在: {key}")
             return pd.DataFrame()
         except Exception as e:
-            logger.error(f"读取大文件失败 {key}: {e}")
+            logger.error(f"读取大文件失败 {key}: {e}", exc_info=True)
             return pd.DataFrame()
 
     def _list_keys_with_prefix(self, prefix: str) -> List[str]:
