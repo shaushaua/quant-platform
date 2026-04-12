@@ -128,7 +128,10 @@ def calc_factors_by_date_range(
             if daily_basic.empty:
                 logger.warning("daily_basic 为空，无法获取股票列表，跳过 date=%s", date)
                 continue
-            if "ts_code" in daily_basic.columns:
+            # 支持多种列名格式
+            if "ID_QI" in daily_basic.columns:
+                _securities = daily_basic["ID_QI"].tolist()
+            elif "ts_code" in daily_basic.columns:
                 _securities = daily_basic["ts_code"].tolist()
             elif "Code" in daily_basic.columns:
                 _securities = daily_basic["Code"].tolist()
