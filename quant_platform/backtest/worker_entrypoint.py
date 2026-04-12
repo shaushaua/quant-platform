@@ -19,6 +19,7 @@ Worker Entrypoint - 基础镜像提供，策略代码无需关心 OSS 写入
 
 import importlib.util
 import json
+import logging
 import os
 import sys
 import time
@@ -26,6 +27,13 @@ from typing import Optional
 
 import oss2
 import pandas as pd
+
+# 让 engine/loader 的 logging 输出到 stdout（kubectl logs 可见）
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 from quant_platform.factor.engine import calc_factors_by_date_range
 
