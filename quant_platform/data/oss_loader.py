@@ -173,13 +173,40 @@ class OSSDataLoader:
 
     def _read_large_file_by_codes(self, key: str, data_type: str, codes: List[str]) -> pd.DataFrame:
         """用 DuckDB S3 谓词下推读取大文件中指定股票的数据。"""
-        if not _DUCKDB_AVAILABLE or OSSDataLoader._duckdb_con is None:
-            logger.error("DuckDB 不可用，无法读取大文件")
-            return pd.DataFrame()
-        # 从 key 中提取日期 YYYYMMDD
+        # 先尝试从 OSS 下载整个文件到内存（如果不大），否则用 DuckDB
         import re
         m = re.search(r'(\d{8})', key)
         date_str = m.group(1) if m else ""
+
+        # 先用 oss2 下载全文件（临时方案）
+        if self._oss_bucket:
+            try:
+                result = self._oss_bucket.get_object(key)
+                import io
+                data = result.read()
+                df = pd.read_parquet(io.BytesIO(data))
+                # 按股票代码过滤
+                security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
+                if not security_ids:
+                    logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
+                    return pd.DataFrame()
+                # 根据列名过滤
+                code_col = "Code" if "Code" in df.columns else ("ts_code" if "ts_code" in df.columns else None)
+                if code_col and code_col in df.columns:
+                    df = df[df[code_col].isin(codes)]
+                else:
+                    # 用 SECURITY_ID 过滤
+                    df = df[df["SECURITY_ID"].isin(security_ids)]
+                logger.info(f"oss2 读取 {key}: {len(df)} 条记录 (过滤后)")
+                return df
+            except Exception as e:
+                logger.warning(f"oss2 读取失败 {key}: {e}")
+
+        # 回退到 DuckDB
+        if not _DUCKDB_AVAILABLE or OSSDataLoader._duckdb_con is None:
+            logger.error("DuckDB 不可用，无法读取大文件")
+            return pd.DataFrame()
+
         security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
         if not security_ids:
             logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
@@ -187,7 +214,7 @@ class OSSDataLoader:
         ids_str = ", ".join(str(i) for i in security_ids)
         url = self._s3_url(key)
         try:
-            sql = f"SELECT * FROM read_parquet('{url}') WHERE Code IN ({ids_str})"
+            sql = f"SELECT * FROM read_parquet('{url}') WHERE SECURITY_ID IN ({ids_str})"
             df = OSSDataLoader._duckdb_con.execute(sql).df()
             logger.info(f"DuckDB 读取 {key}: {len(df)} 条记录 security_ids={security_ids}")
             return df
