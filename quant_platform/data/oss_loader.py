@@ -177,9 +177,9 @@ class OSSDataLoader:
 
     def _read_large_file_by_codes(self, key: str, data_type: str, codes: List[str]) -> pd.DataFrame:
         """
-        用 oss2 下载到本地，然后 DuckDB 按 Code 列过滤读取。
-        利用 parquet 文件按 Code 排序的特性和 row group 统计信息，
-        DuckDB 可以跳过不相关的 row groups，只读取需要的数据块。
+        用 oss2 下载到本地，然后 DuckDB 按 SECURITY_ID 列过滤读取。
+        利用 parquet 文件按 SECURITY_ID 排序的特性和 row group 统计信息，
+        DuckDB 可以跳过不相关的 row groups，只读取需要的数据块，避免 OOM。
         """
         import re
         import tempfile
@@ -190,7 +190,13 @@ class OSSDataLoader:
             logger.warning(f"codes 为空，跳过 {key}")
             return pd.DataFrame()
 
-        # 方案：oss2 下载到本地临时文件，DuckDB 利用排序特性按 Code 过滤
+        # 解析 SECURITY_ID
+        security_ids = self._resolve_security_ids(date_str, codes) if date_str else []
+        if not security_ids:
+            logger.warning(f"无法解析 codes={codes} 对应的 SECURITY_ID，跳过 {key}")
+            return pd.DataFrame()
+
+        # 方案：oss2 下载到本地临时文件，DuckDB 利用 SECURITY_ID 排序特性过滤
         if not self._oss_bucket:
             logger.error("OSS bucket 未初始化")
             return pd.DataFrame()
@@ -207,13 +213,12 @@ class OSSDataLoader:
                 self._oss_bucket.get_object_to_file(key, tmp_path)
                 logger.info(f"下载完成: {key}")
 
-            # 2. DuckDB 读取本地文件并用 WHERE Code IN 过滤
-            # 由于文件按 Code 排序，DuckDB 会利用 row group 统计信息跳过不相关的块
-            code_col = self._CODE_COL.get(data_type, self._DEFAULT_CODE_COL)
-            codes_str = ", ".join(f"'{c}'" for c in codes)
-            sql = f"SELECT * FROM read_parquet('{tmp_path}') WHERE {code_col} IN ({codes_str})"
+            # 2. DuckDB 读取本地文件并用 WHERE SECURITY_ID IN 过滤
+            # 由于文件按 SECURITY_ID 排序，DuckDB 会利用 row group 统计信息跳过不相关的块
+            ids_str = ", ".join(str(i) for i in security_ids)
+            sql = f"SELECT * FROM read_parquet('{tmp_path}') WHERE SECURITY_ID IN ({ids_str})"
             df = OSSDataLoader._duckdb_con.execute(sql).df()
-            logger.info(f"DuckDB 读取本地文件 {tmp_path}: {len(df)} 条记录 (过滤 {len(codes)} 只股票)")
+            logger.info(f"DuckDB 读取本地文件 {tmp_path}: {len(df)} 条记录 (过滤 {len(codes)} 只股票, security_ids={security_ids[:5]}...)")
 
             # 3. 清理临时文件
             import os as _os
