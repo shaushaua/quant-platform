@@ -110,16 +110,17 @@ class OSSDataLoader:
         try:
             con = _duckdb.connect()
             con.execute("INSTALL httpfs; LOAD httpfs;")
-            # 提取 region：oss-cn-hangzhou -> hangzhou
-            region = self._region.replace('oss-cn-', '') if self._region.startswith('oss-cn-') else self._region
-            con.execute(f"SET s3_region='{region}';")
-            con.execute(f"SET s3_endpoint='oss-cn-hangzhou.aliyuncs.com';")
+            # 使用 path 风格适配阿里云 OSS 内网地址
+            # s3_endpoint: 内网 endpoint hostname
+            _s3_endpoint = self._endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+            con.execute(f"SET s3_endpoint='{_s3_endpoint}';")
             con.execute("SET s3_use_ssl=true;")
             con.execute(f"SET s3_access_key_id='{self._ak}';")
             con.execute(f"SET s3_secret_access_key='{self._sk}';")
-            con.execute("SET s3_url_style='vhost';")
+            # path 风格: https://endpoint/bucket/key
+            con.execute("SET s3_url_style='path';")
             OSSDataLoader._duckdb_con = con
-            logger.info("DuckDB S3 连接初始化完成")
+            logger.info("DuckDB S3 连接初始化完成 (内网 path 风格)")
         except Exception as e:
             logger.error(f"DuckDB 初始化失败: {e}")
 
