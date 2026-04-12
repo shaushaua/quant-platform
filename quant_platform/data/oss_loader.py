@@ -7,6 +7,7 @@ OSS数据加载器
 示例:     2025/202501/20250102/20250102_daily_basic_data.parquet
 """
 
+import hashlib
 import io
 import logging
 import os
@@ -84,6 +85,12 @@ class OSSDataLoader:
         self._endpoint = os.environ.get("OSS_ENDPOINT", "")
         self._data_bucket = os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data")
         self._region = os.environ.get("OSS_REGION", "oss-cn-hangzhou")
+
+        # 本地文件缓存目录（用于大文件下载，避免重复下载）
+        self._local_cache_dir = os.environ.get(
+            "OSS_LOCAL_CACHE_DIR",
+            os.path.join(os.path.expanduser("~"), ".oss_cache")
+        )
 
         self._oss_bucket = self._init_oss_bucket()
         if _DUCKDB_AVAILABLE:
@@ -196,7 +203,6 @@ class OSSDataLoader:
         跳过不相关的 row groups，只读取需要的数据块，避免 OOM。
         """
         import re
-        import tempfile
         m = re.search(r'(\d{8})', key)
         date_str = m.group(1) if m else ""
 
@@ -222,10 +228,17 @@ class OSSDataLoader:
             return pd.DataFrame()
 
         try:
-            # 1. 下载到临时文件
-            with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
-                tmp_path = tmp_file.name
-                logger.info(f"开始下载 {key} 到本地临时文件 {tmp_path}")
+            # 1. 检查本地缓存，存在则跳过下载
+            cache_filename = hashlib.md5(key.encode()).hexdigest() + ".parquet"
+            cached_path = os.path.join(self._local_cache_dir, cache_filename)
+            if os.path.exists(cached_path):
+                logger.info(f"命中本地缓存，跳过下载: {key} -> {cached_path}")
+                tmp_path = cached_path
+            else:
+                # 下载到缓存目录（持久化，下次复用）
+                os.makedirs(self._local_cache_dir, exist_ok=True)
+                tmp_path = cached_path
+                logger.info(f"开始下载 {key} 到本地缓存 {tmp_path}")
                 self._oss_bucket.get_object_to_file(key, tmp_path)
                 file_size = os.path.getsize(tmp_path)
                 logger.info(f"下载完成: {key} ({file_size:,} bytes)")
@@ -239,13 +252,7 @@ class OSSDataLoader:
             df = OSSDataLoader._duckdb_con.execute(sql).df()
             logger.info(f"DuckDB 读取完成: {len(df)} 条记录 (codes={len(codes)} security_ids={len(security_ids)})")
 
-            # 3. 清理临时文件
-            import os as _os
-            try:
-                _os.unlink(tmp_path)
-            except Exception as e:
-                logger.warning(f"删除临时文件失败 {tmp_path}: {e}")
-
+            # 3. 临时文件已持久化到缓存，不删除
             return df
 
         except oss2.exceptions.NoSuchKey:

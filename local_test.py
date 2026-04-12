@@ -181,14 +181,15 @@ def main():
 
     try:
         calc_factors_by_date_range(
+            factor_info=factor_info,
             start_date=start_date,
             end_date=end_date,
-            securities=test_codes,
-            factor_info=factor_info,
-            calc_fn=strategy.factor_calculation,
-            out_fn=collect_result,
             end_times=end_times,
-            api=api,
+            securities=test_codes,
+            processes=1,
+            factor_data_handler=strategy.factor_calculation,
+            outfun=collect_result,
+            oss_base_path=None,
         )
 
         print(f"\n✅ 计算完成")
