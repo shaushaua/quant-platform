@@ -73,16 +73,33 @@ def main():
         sys.exit(1)
 
     # 检查环境变量
-    required_env = ['OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET', 'OSS_ENDPOINT']
+    required_env = ['OSS_ACCESS_KEY_ID', 'OSS_ACCESS_KEY_SECRET']
     missing_env = [e for e in required_env if not os.getenv(e)]
     if missing_env:
         print(f"❌ 错误: 缺少环境变量: {', '.join(missing_env)}")
         print("\n请设置以下环境变量:")
         print("  export OSS_ACCESS_KEY_ID='your_access_key'")
         print("  export OSS_ACCESS_KEY_SECRET='your_secret_key'")
-        print("  export OSS_ENDPOINT='https://oss-cn-hangzhou-internal.aliyuncs.com'")
-        print("  export OSS_DATA_BUCKET='quant-mdl-data'  # 可选，默认为 quant-mdl-data")
+        print("\n可选环境变量:")
+        print("  export OSS_ENDPOINT='https://oss-cn-hangzhou.aliyuncs.com'  # 公网地址")
+        print("  export OSS_DATA_BUCKET='quant-mdl-data'  # 默认为 quant-mdl-data")
         sys.exit(1)
+
+    # 自动选择 endpoint（优先使用环境变量，否则使用公网）
+    if not os.getenv('OSS_ENDPOINT'):
+        # 尝试检测是否在集群内网环境
+        import socket
+        try:
+            # 尝试解析内网地址
+            socket.gethostbyname('oss-cn-hangzhou-internal.aliyuncs.com')
+            default_endpoint = 'https://oss-cn-hangzhou-internal.aliyuncs.com'
+            print("ℹ️  检测到内网环境，使用内网 endpoint")
+        except socket.gaierror:
+            # 内网不通，使用公网
+            default_endpoint = 'https://oss-cn-hangzhou.aliyuncs.com'
+            print("ℹ️  检测到公网环境，使用公网 endpoint（会产生流量费用）")
+
+        os.environ['OSS_ENDPOINT'] = default_endpoint
 
     print("=" * 60)
     print("🧪 本地策略测试")

@@ -13,11 +13,23 @@ if [ -z "$OSS_ACCESS_KEY_ID" ]; then
     echo "❌ 错误: 缺少环境变量 OSS_ACCESS_KEY_ID"
     echo ""
     echo "请先设置 OSS 环境变量："
+    echo ""
+    echo "方式 1: 手动设置"
     echo "  export OSS_ACCESS_KEY_ID='your_key'"
     echo "  export OSS_ACCESS_KEY_SECRET='your_secret'"
-    echo "  export OSS_ENDPOINT='https://oss-cn-hangzhou-internal.aliyuncs.com'"
+    echo "  # OSS_ENDPOINT 可选，会自动检测网络环境"
+    echo ""
+    echo "方式 2: 使用配置文件"
+    echo "  cp .env.local.example .env.local"
+    echo "  # 编辑 .env.local 填入你的凭证"
+    echo "  source .env.local"
     echo ""
     exit 1
+fi
+
+# 检测网络环境
+if [ -z "$OSS_ENDPOINT" ]; then
+    echo "ℹ️  OSS_ENDPOINT 未设置，将自动检测网络环境..."
 fi
 
 # 默认参数
