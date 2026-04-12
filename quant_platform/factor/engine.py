@@ -124,12 +124,16 @@ def calc_factors_by_date_range(
         # 全市场模式：从 daily_basic 获取股票列表
         if not is_explicit_list:
             daily_basic = api.get_daily_data(date, "daily_basic")
+            logger.info("daily_basic 加载结果 date=%s shape=%s columns=%s", date, daily_basic.shape, list(daily_basic.columns))
+            if daily_basic.empty:
+                logger.warning("daily_basic 为空，无法获取股票列表，跳过 date=%s", date)
+                continue
             if "ts_code" in daily_basic.columns:
                 _securities = daily_basic["ts_code"].tolist()
             elif "Code" in daily_basic.columns:
                 _securities = daily_basic["Code"].tolist()
             else:
-                logger.warning("无法从 daily_basic 获取股票列表，跳过 date=%s", date)
+                logger.warning("无法从 daily_basic 获取股票列表，columns=%s 跳过 date=%s", list(daily_basic.columns), date)
                 continue
             logger.info("从 daily_basic 获取到 %d 只股票", len(_securities))
 
