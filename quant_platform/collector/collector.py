@@ -240,13 +240,15 @@ class DayDirWatcher:
 
     def start(self):
         """启动监听（使用 inotify 或轮询）。"""
-        # 先扫描现有文件
-        if self.day_dir.exists():
-            for f in self.day_dir.glob("*.csv"):
-                self._register_file(f)
-            logger.info("[watcher] 已注册 %d 个文件", len(self._pollers))
-        else:
-            logger.warning("[watcher] 监听目录不存在: %s", self.day_dir)
+        # 目录不存在则创建（等通联写入文件后自动触发）
+        if not self.day_dir.exists():
+            self.day_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("[watcher] 创建监听目录: %s", self.day_dir)
+
+        # 扫描现有文件
+        for f in self.day_dir.glob("*.csv"):
+            self._register_file(f)
+        logger.info("[watcher] 已注册 %d 个文件", len(self._pollers))
 
         if HAS_WATCHDOG:
             self._observer = Observer()
