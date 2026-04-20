@@ -37,10 +37,10 @@ spec:
               value: /root/mdl/msg_backup
             - name: SHM_STORE_PATH
               value: /dev/shm/quant-store
-            - name: COLLECTOR_POLL_INTERVAL
-              value: "0.5"
             - name: COLLECTOR_SKIP_HISTORY
               value: "true"
+            - name: COLLECTOR_DEBOUNCE_MS
+              value: "100"
             - name: LOG_LEVEL
               value: INFO
             # 每只股票 order/deal 最多保留多少行（防止 90GB 数据撑爆内存）
@@ -49,6 +49,9 @@ spec:
             # daily_basic 从 MySQL 加载的历史天数
             - name: DAILY_BASIC_MARKET_COUNT
               value: "5"
+            # 处理完成后保留源文件天数（防止磁盘打满）
+            - name: DELETE_SOURCE_AFTER_DAYS
+              value: "1"
           envFrom:
             - secretRef:
                 name: quant-secrets

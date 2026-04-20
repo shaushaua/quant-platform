@@ -52,7 +52,7 @@ spec:
                   value: /dev/shm/quant-store
                 # 用户因子模块路径，如 quant_platform.factor.examples.momentum
                 - name: FACTOR_MODULE
-                  value: ""   # 必填，在 ACK 控制台编辑此值
+                  value: "quant_platform.factor.examples.momentum"   # 默认因子模块，可在 ACK 控制台覆盖
                 - name: UNIVERSE
                   value: ""   # 逗号分隔股票代码；空则自动发现 ShmStore 中全部
                 - name: FACTOR_OUTPUT_PATH

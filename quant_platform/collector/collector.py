@@ -10,18 +10,28 @@ Collector：监听通联客户端实时写入的 CSV 文件，增量解析后写
         YYYYMMDD_mdl_6_36_0.csv   深交所 逐笔成交
         YYYYMMDD_mdl_6_28_0.csv   深交所 tick 快照
         YYYYMMDD_OrderQueue.csv   委托队列（暂不处理）
+
+使用 inotify 实时监听文件变化，替代轮询模式。
 """
 
 import logging
 import os
 import threading
+import time
+from collections import deque
 from datetime import date
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Deque, Dict, Optional, Tuple
 
 import oss2
-
 import pandas as pd
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
 
 from ..data.converter import TonglanceDataConverter
 from ..data.mysql_loader import DailyBasicCache
@@ -32,11 +42,14 @@ logger = logging.getLogger(__name__)
 # 通联 msg_backup 根目录
 MSG_BACKUP_DIR = Path(os.environ.get("MSG_BACKUP_DIR", "/root/mdl/msg_backup"))
 
-# poll 间隔（秒）
-POLL_INTERVAL = float(os.environ.get("COLLECTOR_POLL_INTERVAL", "0.5"))
-
 # 启动时是否跳过历史数据（True=只处理启动后的新增行）
 SKIP_HISTORY = os.environ.get("COLLECTOR_SKIP_HISTORY", "true").lower() == "true"
+
+# 是否在处理完成后删除源 CSV 文件（防止磁盘打满）
+DELETE_SOURCE_AFTER_DAYS = int(os.environ.get("DELETE_SOURCE_AFTER_DAYS", "1"))
+
+# 文件变化去重窗口（毫秒），防止同一文件多次触发
+DEBOUNCE_MS = int(os.environ.get("COLLECTOR_DEBOUNCE_MS", "100"))
 
 Market = str   # "SH" | "SZ"
 DataType = str  # "order" | "deal" | "tick" | "order_deal"
@@ -83,6 +96,7 @@ class FilePoller:
         self.path = path
         self._offset = path.stat().st_size if skip_existing else 0
         self._header: Optional[list] = None
+        self._last_read_time = 0.0
 
     def read_new_rows(self) -> Optional[pd.DataFrame]:
         """
@@ -95,18 +109,13 @@ class FilePoller:
             return None
 
         if current_size <= self._offset:
-            logger.debug("[poll] %s size=%d offset=%d 无新数据", self.path.name, current_size, self._offset)
             return None
 
-        logger.debug("[poll] %s size=%d offset=%d 新增=%d bytes", self.path.name, current_size, self._offset, current_size - self._offset)
+        logger.debug("[read] %s size=%d offset=%d 新增=%d bytes",
+                    self.path.name, current_size, self._offset, current_size - self._offset)
 
         with open(self.path, "rb") as f:
-            # 若 offset=0 需要读 header
-            if self._offset == 0:
-                f.seek(0)
-            else:
-                f.seek(self._offset)
-
+            f.seek(self._offset)
             chunk = f.read(current_size - self._offset)
 
         if not chunk:
@@ -120,6 +129,7 @@ class FilePoller:
 
         complete_chunk = chunk[: last_newline + 1]
         self._offset += last_newline + 1
+        self._last_read_time = time.time()
 
         # 解码并解析 CSV
         try:
@@ -146,9 +156,50 @@ class FilePoller:
             return None
 
 
+class FileChangeHandler(FileSystemEventHandler):
+    """
+    watchdog 事件处理器：监听文件创建和修改，触发回调。
+    使用防抖机制避免同一文件短时间内多次触发。
+    """
+
+    def __init__(self, callback: Callable[[Path], None], debounce_ms: int = 100):
+        super().__init__()
+        self._callback = callback
+        self._debounce_ms = debounce_ms
+        self._pending: Dict[str, float] = {}  # path -> last_trigger_time
+        self._lock = threading.Lock()
+
+    def _schedule(self, path: Path):
+        """防抖处理：同一文件在 debounce_ms 内只触发一次。"""
+        path_str = str(path)
+        now = time.time()
+        with self._lock:
+            # 如果已经在等待队列中，更新时间
+            self._pending[path_str] = now
+
+        # 延迟执行，让后续事件合并
+        def deferred():
+            time.sleep(self._debounce_ms / 1000.0)
+            with self._lock:
+                if self._pending.get(path_str, 0) == now:
+                    # 仍然是最新事件，执行回调
+                    del self._pending[path_str]
+                    self._callback(path)
+
+        threading.Thread(target=deferred, daemon=True).start()
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._schedule(Path(event.src_path))
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._schedule(Path(event.src_path))
+
+
 class DayDirWatcher:
     """
-    监听当天日期目录下所有符合命名规范的 CSV 文件。
+    使用 inotify 实时监听当天日期目录下所有符合命名规范的 CSV 文件。
     自动发现新文件，对每个文件做增量读取。
     """
 
@@ -157,35 +208,93 @@ class DayDirWatcher:
         self.skip_history = skip_history
         # path -> (FilePoller, market, data_type)
         self._pollers: Dict[Path, Tuple[FilePoller, Market, DataType]] = {}
+        self._results: Deque[Tuple[Path, Market, DataType, pd.DataFrame]] = deque()
+        self._results_lock = threading.Lock()
+        self._observer = None
 
-    def _register_new_files(self):
-        """扫描目录，注册尚未跟踪的新文件。"""
-        try:
-            files = list(self.day_dir.glob("*.csv"))
-        except FileNotFoundError:
+        if not HAS_WATCHDOG:
+            logger.warning("[watcher] watchdog 库未安装，将使用轮询模式")
+
+    def _register_file(self, path: Path):
+        """注册新文件到跟踪列表。"""
+        if path in self._pollers:
             return
-        for f in files:
-            if f in self._pollers:
-                continue
-            classification = classify_file(f.name)
-            if classification is None:
-                continue  # OrderQueue 等暂不处理
-            market, data_type = classification
-            self._pollers[f] = (FilePoller(f, self.skip_history), market, data_type)
-            logger.info("[发现] %s -> %s %s", f.name, market, data_type)
+        classification = classify_file(path.name)
+        if classification is None:
+            return  # OrderQueue 等暂不处理
+        market, data_type = classification
+        self._pollers[path] = (FilePoller(path, self.skip_history), market, data_type)
+        logger.info("[发现] %s -> %s %s", path.name, market, data_type)
 
-    def poll(self):
+    def _on_file_changed(self, path: Path):
+        """文件变化回调：读取新增数据并放入结果队列。"""
+        if path not in self._pollers:
+            self._register_file(path)
+
+        poller, market, data_type = self._pollers[path]
+        df = poller.read_new_rows()
+        if df is not None and not df.empty:
+            with self._results_lock:
+                self._results.append((path, market, data_type, df))
+            logger.debug("[%s][%s] %s +%d 行", market, data_type, path.name, len(df))
+
+    def start(self):
+        """启动监听（使用 inotify 或轮询）。"""
+        # 先扫描现有文件
+        if self.day_dir.exists():
+            for f in self.day_dir.glob("*.csv"):
+                self._register_file(f)
+            logger.info("[watcher] 已注册 %d 个文件", len(self._pollers))
+        else:
+            logger.warning("[watcher] 监听目录不存在: %s", self.day_dir)
+
+        if HAS_WATCHDOG:
+            self._observer = Observer()
+            handler = FileChangeHandler(self._on_file_changed, DEBOUNCE_MS)
+            self._observer.schedule(handler, str(self.day_dir), recursive=False)
+            self._observer.start()
+            logger.info("[watcher] inotify 监听已启动: %s", self.day_dir)
+        else:
+            logger.warning("[watcher] watchdog 未安装，请运行: pip install watchdog")
+
+    def stop(self):
+        """停止监听。"""
+        if self._observer:
+            self._observer.stop()
+            self._observer.join()
+
+    def get_new_data(self) -> list:
         """
-        扫描新文件 + 读取所有已跟踪文件的新增行。
+        获取所有新的数据（非阻塞）。
         返回 list of (path, market, data_type, DataFrame)
         """
-        self._register_new_files()
-        results = []
-        for path, (poller, market, data_type) in list(self._pollers.items()):
-            df = poller.read_new_rows()
-            if df is not None and not df.empty:
-                results.append((path, market, data_type, df))
+        with self._results_lock:
+            results = list(self._results)
+            self._results.clear()
         return results
+
+    def cleanup_old_files(self, days_to_keep: int = 1):
+        """
+        清理超过指定天数的旧 CSV 文件，防止磁盘打满。
+        只删除已完全读取的文件（在 _pollers 中跟踪过的）。
+        """
+        cutoff_time = time.time() - (days_to_keep * 86400)
+        cleaned = []
+
+        for path, (poller, market, data_type) in list(self._pollers.items()):
+            try:
+                stat = path.stat()
+                # 只删除修改时间超过阈值且已完全读取的文件
+                if stat.st_mtime < cutoff_time and poller._offset > 0:
+                    path.unlink()
+                    del self._pollers[path]
+                    cleaned.append(path.name)
+                    logger.info("[清理] 删除旧文件: %s", path.name)
+            except Exception as e:
+                logger.warning("[清理] 删除失败 %s: %s", path.name, e)
+
+        if cleaned:
+            logger.info("[清理] 已删除 %d 个旧文件", len(cleaned))
 
 
 class Collector:
@@ -276,7 +385,12 @@ class Collector:
             logger.info("[日切] %s -> %s", self._trading_day, today)
             self._trading_day = today
             self._day_dir = MSG_BACKUP_DIR / today.strftime("%Y%m%d")
+
+            # 停止旧 watcher，启动新 watcher
+            self._watcher.stop()
             self._watcher = DayDirWatcher(self._day_dir, skip_history=False)
+            self._watcher.start()
+
             self._load_daily_basic()
 
     def _get_oss_bucket(self) -> oss2.Bucket:
@@ -349,16 +463,29 @@ class Collector:
         logger.info("[OSS] %s 全部上传完成", date_str)
 
     def _run_loop(self):
-        poll_count = 0
-        logger.info("[Collector] 启动，监听目录: %s，poll 间隔: %.1fs", self._day_dir, POLL_INTERVAL)
+        last_cleanup = time.time()
+        logger.info("[Collector] 启动，监听目录: %s", self._day_dir)
+        logger.info("[Collector] 源文件清理: 保留 %d 天", DELETE_SOURCE_AFTER_DAYS)
+
+        self._watcher.start()
+
         while not self._stop_event.is_set():
             self._check_day_rollover()
-            poll_count += 1
-            if poll_count % 20 == 1:  # 每 10 秒打印一次
-                logger.debug("[loop] 第 %d 次轮询, 已跟踪 %d 个文件", poll_count, len(self._watcher._pollers))
-            for path, market, data_type, df in self._watcher.poll():
+
+            # 处理所有新数据
+            for path, market, data_type, df in self._watcher.get_new_data():
                 self._handle(path, market, data_type, df)
-            self._stop_event.wait(POLL_INTERVAL)
+
+            # 每小时清理一次旧文件
+            now = time.time()
+            if now - last_cleanup > 3600:
+                self._watcher.cleanup_old_files(DELETE_SOURCE_AFTER_DAYS)
+                last_cleanup = now
+
+            # 短暂休眠避免 CPU 空转
+            self._stop_event.wait(0.1)
+
+        self._watcher.stop()
         logger.info("[Collector] 已停止")
 
     def start(self):
