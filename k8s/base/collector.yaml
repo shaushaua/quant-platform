@@ -54,6 +54,8 @@ spec:
               value: "1"
             - name: OSS_DATA_BUCKET
               value: "quant-mdl-data"
+            - name: COLLECTOR_DISK_OUTPUT
+              value: /data/collector_output
           envFrom:
             - secretRef:
                 name: quant-secrets
@@ -62,6 +64,8 @@ spec:
               mountPath: /root/mdl/msg_backup
             - name: shm-store
               mountPath: /dev/shm/quant-store
+            - name: disk-output
+              mountPath: /data/collector_output
           resources:
             requests:
               cpu: "1"
@@ -79,4 +83,8 @@ spec:
         - name: shm-store
           hostPath:
             path: /dev/shm/quant-store
+            type: DirectoryOrCreate
+        - name: disk-output
+          hostPath:
+            path: /data/quant/collector_output
             type: DirectoryOrCreate

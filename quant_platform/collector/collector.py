@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 # 通联 msg_backup 根目录
 MSG_BACKUP_DIR = Path(os.environ.get("MSG_BACKUP_DIR", "/root/mdl/msg_backup"))
 
+# 落盘目录（转换后的 parquet 文件，用于 OSS 上传）
+DISK_OUTPUT_DIR = Path(os.environ.get("COLLECTOR_DISK_OUTPUT", "/data/collector_output"))
+
 # 启动时是否跳过历史数据（True=只处理启动后的新增行）
 SKIP_HISTORY = os.environ.get("COLLECTOR_SKIP_HISTORY", "true").lower() == "true"
 
@@ -338,7 +341,7 @@ class Collector:
             logger.warning("[daily_basic] 加载异常: %s", e)
 
     def _handle(self, path: Path, market: str, data_type: str, raw_df: pd.DataFrame):
-        """将原始 DataFrame 转换后写入 ShmStore。"""
+        """将原始 DataFrame 转换后写入 ShmStore（实时）+ 落盘 parquet（全量）。"""
         try:
             trading_day_dt = pd.Timestamp(self._trading_day)
             raw_dict = raw_df.to_dict("list")
@@ -349,9 +352,11 @@ class Collector:
                 if not order_df.empty:
                     for code, sub in order_df.groupby("Code"):
                         self._store.update_order(code, sub)
+                    self._append_to_disk("order", order_df)
                 if not deal_df.empty:
                     for code, sub in deal_df.groupby("Code"):
                         self._store.update_deal(code, sub)
+                    self._append_to_disk("deal", deal_df)
 
             elif data_type == "order":
                 if market == "SZ":
@@ -360,6 +365,7 @@ class Collector:
                     df = self._converter.convert_sh_order(raw_dict, trading_day_dt)
                 for code, sub in df.groupby("Code"):
                     self._store.update_order(code, sub)
+                self._append_to_disk("order", df)
 
             elif data_type == "deal":
                 if market == "SZ":
@@ -368,6 +374,7 @@ class Collector:
                     df = self._converter.convert_sh_deal(raw_dict, trading_day_dt)
                 for code, sub in df.groupby("Code"):
                     self._store.update_deal(code, sub)
+                self._append_to_disk("deal", df)
 
             elif data_type == "tick":
                 if market == "SZ":
@@ -376,11 +383,29 @@ class Collector:
                     df = self._converter.convert_sh_tick(raw_dict, trading_day_dt)
                 for code, sub in df.groupby("Code"):
                     self._store.update_tick(code, sub)
+                self._append_to_disk("tick", df)
 
             logger.debug("[%s][%s] %s +%d 行", market, data_type, path.name, len(raw_df))
 
         except Exception as e:
             logger.warning("处理 %s 失败: %s", path.name, e, exc_info=True)
+
+    def _append_to_disk(self, data_type: str, df: pd.DataFrame):
+        """将转换后的数据追加到本地 parquet 文件（用于 OSS 上传）。"""
+        try:
+            date_str = self._trading_day.strftime("%Y%m%d")
+            out_dir = DISK_OUTPUT_DIR / date_str
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / f"{data_type}.parquet"
+
+            if out_file.exists():
+                existing = pd.read_parquet(out_file)
+                df = pd.concat([existing, df], ignore_index=True)
+
+            df.to_parquet(out_file, index=False)
+            logger.debug("[落盘] %s: %d 行 -> %s", data_type, len(df), out_file)
+        except Exception as e:
+            logger.warning("[落盘] 写入 %s 失败: %s", data_type, e)
 
     def _check_day_rollover(self):
         """交易日切换时：更新监听目录和 daily_basic。"""
@@ -422,14 +447,14 @@ class Collector:
 
     def _upload_day_to_oss(self, trading_date: date) -> None:
         """
-        16:00 收盘后，直接从 CSV 源文件读取全量数据，转换后上传到 OSS。
-        路径格式：quant-mdl-data/{year}/{yearmonth}/{yearmonthday}/{yearmonthday}_{type}.parquet
+        16:00 收盘后，直接上传已落盘的 parquet 文件到 OSS。
+        无需重新转换，速度快。
         """
         date_str = trading_date.strftime("%Y%m%d")
         year = date_str[:4]
         month = date_str[4:6]
         prefix = f"{year}/{year}{month}/{date_str}"
-        day_dir = MSG_BACKUP_DIR / date_str
+        disk_dir = DISK_OUTPUT_DIR / date_str
 
         try:
             bucket = self._get_oss_bucket()
@@ -437,111 +462,38 @@ class Collector:
             logger.error("[OSS] bucket 初始化失败: %s", e)
             return
 
-        if not day_dir.exists():
-            logger.warning("[OSS] 数据目录不存在: %s", day_dir)
+        if not disk_dir.exists():
+            logger.warning("[OSS] 落盘目录不存在: %s", disk_dir)
             return
 
-        trading_day_dt = pd.Timestamp(trading_date)
-        converter = self._converter
-
-        # 文件类型 -> (转换函数名, 输出后缀)
-        upload_map = {
-            "mdl_4_24_0": ("sh_order_deal", "tick"),   # SH order+deal 合并文件
-            "mdl_6_33_0": ("sz_order", "order"),        # SZ order
-            "mdl_6_36_0": ("sz_deal", "deal"),          # SZ deal
-            "mdl_6_28_0": ("sz_tick", "tick"),          # SZ tick
-            "MarketData": ("sh_tick", "tick"),          # SH tick
-        }
-
-        all_orders = []
-        all_deals = []
-        all_ticks = []
-
-        for csv_file in sorted(day_dir.glob("*.csv")):
-            classification = classify_file(csv_file.name)
-            if classification is None:
+        # 上传 order/deal/tick parquet
+        for data_type in ["order", "deal", "tick"]:
+            local_file = disk_dir / f"{data_type}.parquet"
+            if not local_file.exists():
+                logger.info("[OSS] %s 无落盘数据，跳过", data_type)
                 continue
-            market, data_type = classification
 
             try:
-                # 读取全量 CSV
-                df = pd.read_csv(csv_file)
-                if df.empty:
-                    continue
-                logger.info("[OSS] 读取 %s: %d 行", csv_file.name, len(df))
-
-                raw_dict = df.to_dict("list")
-
-                if data_type == "order_deal":
-                    order_df, deal_df = converter.convert_sh_order_deal(raw_dict, trading_day_dt)
-                    if not order_df.empty:
-                        all_orders.append(order_df)
-                    if not deal_df.empty:
-                        all_deals.append(deal_df)
-
-                elif data_type == "order":
-                    if market == "SZ":
-                        converted = converter.convert_sz_order(raw_dict, trading_day_dt)
-                    else:
-                        converted = converter.convert_sh_order(raw_dict, trading_day_dt)
-                    if not converted.empty:
-                        all_orders.append(converted)
-
-                elif data_type == "deal":
-                    if market == "SZ":
-                        converted = converter.convert_sz_deal(raw_dict, trading_day_dt)
-                    else:
-                        converted = converter.convert_sh_deal(raw_dict, trading_day_dt)
-                    if not converted.empty:
-                        all_deals.append(converted)
-
-                elif data_type == "tick":
-                    if market == "SZ":
-                        converted = converter.convert_sz_tick(raw_dict, trading_day_dt)
-                    else:
-                        converted = converter.convert_sh_tick(raw_dict, trading_day_dt)
-                    if not converted.empty:
-                        all_ticks.append(converted)
-
+                key = f"{prefix}/{date_str}_{data_type}.parquet"
+                bucket.put_object_from_file(key, str(local_file))
+                size_mb = local_file.stat().st_size / 1024 / 1024
+                logger.info("[OSS] 已上传 %s -> %s (%.1f MB)", data_type, key, size_mb)
             except Exception as e:
-                logger.error("[OSS] 处理文件 %s 失败: %s", csv_file.name, e)
-
-        # 合并并上传
-        import io
-        for dfs, name in [
-            (all_orders, "order"),
-            (all_deals, "deal"),
-            (all_ticks, "tick"),
-        ]:
-            if not dfs:
-                logger.info("[OSS] %s 数据为空，跳过", name)
-                continue
-            merged = pd.concat(dfs, ignore_index=True)
-            if name == "order":
-                merged = merged.sort_values("SeqNum").reset_index(drop=True)
-            elif name == "deal":
-                merged = merged.sort_values("SeqNum").reset_index(drop=True)
-            elif name == "tick":
-                merged = merged.sort_values("SeqNum").reset_index(drop=True)
-
-            buffer = io.BytesIO()
-            merged.to_parquet(buffer, index=False)
-            buffer.seek(0)
-
-            key = f"{prefix}/{date_str}_{name}.parquet"
-            bucket.put_object(key, buffer.read())
-            logger.info("[OSS] 已上传 %s -> %s (%d 行, %.1f MB)",
-                       name, key, len(merged), len(buffer.getvalue()) / 1024 / 1024)
+                logger.error("[OSS] 上传 %s 失败: %s", data_type, e)
 
         # 上传 daily_basic
         daily_basic = self._store.get_daily_basic()
         if not daily_basic.empty:
-            buffer = io.BytesIO()
-            daily_basic.to_parquet(buffer, index=False)
-            buffer.seek(0)
-            key = f"{prefix}/{date_str}_daily_basic_data.parquet"
-            bucket.put_object(key, buffer.read())
-            logger.info("[OSS] 已上传 daily_basic -> %s (%d 行)", key, len(daily_basic))
+            try:
+                import io
+                buffer = io.BytesIO()
+                daily_basic.to_parquet(buffer, index=False)
+                buffer.seek(0)
+                key = f"{prefix}/{date_str}_daily_basic_data.parquet"
+                bucket.put_object(key, buffer.read())
+                logger.info("[OSS] 已上传 daily_basic -> %s (%d 行)", key, len(daily_basic))
+            except Exception as e:
+                logger.error("[OSS] 上传 daily_basic 失败: %s", e)
 
         logger.info("[OSS] %s 全部上传完成", date_str)
 
