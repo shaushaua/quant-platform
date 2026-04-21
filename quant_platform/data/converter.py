@@ -69,10 +69,10 @@ class TonglanceDataConverter:
             df["TradingDay"] = trading_day.date()
             df["Time"] = self._parse_time(df["TickTime"], trading_day)
             df["UpdateTime"] = self._parse_time(df["LocalTime"], trading_day)
-            df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-            df["Volume"] = pd.to_numeric(df["Qty"], errors="coerce")
-            df["Channel"] = pd.to_numeric(df["Channel"], errors="coerce").astype("int64")
-            df["SeqNum"] = pd.to_numeric(df["BizIndex"], errors="coerce").astype("int64")
+            df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0)
+            df["Volume"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
+            df["Channel"] = pd.to_numeric(df["Channel"], errors="coerce").fillna(0).astype("int64")
+            df["SeqNum"] = pd.to_numeric(df["BizIndex"], errors="coerce").fillna(0).astype("int64")
 
             # Side 映射
             side_map = {"B": 0, "S": 1, "N": 10}
@@ -211,10 +211,17 @@ class TonglanceDataConverter:
             df["UpdateTime"] = self._parse_time(df["UpdateTime"], trading_day)
 
             # 转换买卖方向 (深市用数字)
-            df["Side"] = df["Side"].map({49: 0, 50: 1}).astype("int16")
+            df["Side"] = df["Side"].map({49: 0, 50: 1})
+            df["Side"] = df["Side"].fillna(10).astype("int16")
 
             # 转换委托类型
-            df["OrderType"] = df["OrderType"].map({49: 1, 50: 2, 85: 3}).astype("int16")
+            df["OrderType"] = df["OrderType"].map({49: 1, 50: 2, 85: 3})
+            df["OrderType"] = df["OrderType"].fillna(0).astype("int16")
+
+            # 数值列填充 NaN
+            for col in ["Price", "Volume", "Channel", "OrderID"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
             # 序列号
             df["SeqNum"] = df["OrderID"]
