@@ -316,6 +316,7 @@ class Collector:
         self._day_dir = MSG_BACKUP_DIR / self._trading_day.strftime("%Y%m%d")
         self._watcher = DayDirWatcher(self._day_dir, SKIP_HISTORY)
         self._daily_basic_cache: Optional[DailyBasicCache] = None
+        self._uploaded_today = False
 
     def _load_daily_basic(self):
         """从 MySQL 加载 daily_basic 写入 ShmStore。"""
@@ -382,14 +383,13 @@ class Collector:
             logger.warning("处理 %s 失败: %s", path.name, e, exc_info=True)
 
     def _check_day_rollover(self):
-        """交易日切换时：上传当天数据到 OSS，更新监听目录和 daily_basic。"""
+        """交易日切换时：更新监听目录和 daily_basic。"""
         today = date.today()
         if today != self._trading_day:
-            # 收盘上传前一天数据
-            self._upload_day_to_oss(self._trading_day)
             logger.info("[日切] %s -> %s", self._trading_day, today)
             self._trading_day = today
             self._day_dir = MSG_BACKUP_DIR / today.strftime("%Y%m%d")
+            self._uploaded_today = False
 
             # 停止旧 watcher，启动新 watcher
             self._watcher.stop()
@@ -397,6 +397,16 @@ class Collector:
             self._watcher.start()
 
             self._load_daily_basic()
+
+    def _check_upload_time(self):
+        """16:00 自动上传当天全量 CSV 数据到 OSS。"""
+        if self._uploaded_today:
+            return
+        now = datetime.now()
+        # 北京时间 16:00 上传（闭市后）
+        if now.hour == 16 and now.minute == 0:
+            self._upload_day_to_oss(self._trading_day)
+            self._uploaded_today = True
 
     def _get_oss_bucket(self) -> oss2.Bucket:
         """获取 OSS bucket 客户端。"""
@@ -407,19 +417,19 @@ class Collector:
         endpoint = os.environ.get("OSS_ENDPOINT", "")
         if endpoint and not endpoint.startswith("http"):
             endpoint = f"https://{endpoint}"
-        bucket_name = os.environ.get("OSS_DATA_BUCKET", "stock-mdl-data")
+        bucket_name = os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data")
         return oss2.Bucket(auth, endpoint, bucket_name)
 
     def _upload_day_to_oss(self, trading_date: date) -> None:
         """
-        收盘后把 ShmStore 中当天的 tick/order/deal/daily_basic 数据
-        按 Go data-converter 的目录格式写入 OSS:
-            stock-mdl-data/{year}/{yearmonth}/{yearmonthday}/{yearmonthday}_{type}.parquet
+        16:00 收盘后，直接从 CSV 源文件读取全量数据，转换后上传到 OSS。
+        路径格式：quant-mdl-data/{year}/{yearmonth}/{yearmonthday}/{yearmonthday}_{type}.parquet
         """
         date_str = trading_date.strftime("%Y%m%d")
         year = date_str[:4]
         month = date_str[4:6]
         prefix = f"{year}/{year}{month}/{date_str}"
+        day_dir = MSG_BACKUP_DIR / date_str
 
         try:
             bucket = self._get_oss_bucket()
@@ -427,43 +437,111 @@ class Collector:
             logger.error("[OSS] bucket 初始化失败: %s", e)
             return
 
-        # 按 data_type 汇总并上传
-        type_map = {
-            "tick": "tick",
-            "order": "order",
-            "deal": "deal",
-            "daily_basic": "daily_basic_data",
+        if not day_dir.exists():
+            logger.warning("[OSS] 数据目录不存在: %s", day_dir)
+            return
+
+        trading_day_dt = pd.Timestamp(trading_date)
+        converter = self._converter
+
+        # 文件类型 -> (转换函数名, 输出后缀)
+        upload_map = {
+            "mdl_4_24_0": ("sh_order_deal", "tick"),   # SH order+deal 合并文件
+            "mdl_6_33_0": ("sz_order", "order"),        # SZ order
+            "mdl_6_36_0": ("sz_deal", "deal"),          # SZ deal
+            "mdl_6_28_0": ("sz_tick", "tick"),          # SZ tick
+            "MarketData": ("sh_tick", "tick"),          # SH tick
         }
 
-        for store_type, file_suffix in type_map.items():
+        all_orders = []
+        all_deals = []
+        all_ticks = []
+
+        for csv_file in sorted(day_dir.glob("*.csv")):
+            classification = classify_file(csv_file.name)
+            if classification is None:
+                continue
+            market, data_type = classification
+
             try:
-                if store_type == "daily_basic":
-                    df = self._store.get_daily_basic()
-                elif store_type == "tick":
-                    df = self._store.get_tick()  # 全部股票
-                elif store_type == "order":
-                    df = self._store.get_order()
-                elif store_type == "deal":
-                    df = self._store.get_deal()
-                else:
-                    continue
-
+                # 读取全量 CSV
+                df = pd.read_csv(csv_file)
                 if df.empty:
-                    logger.info("[OSS] %s 数据为空，跳过", store_type)
                     continue
+                logger.info("[OSS] 读取 %s: %d 行", csv_file.name, len(df))
 
-                # 写 parquet 到内存
-                import io
-                buffer = io.BytesIO()
-                df.to_parquet(buffer, index=False)
-                buffer.seek(0)
+                raw_dict = df.to_dict("list")
 
-                key = f"{prefix}/{date_str}_{file_suffix}.parquet"
-                bucket.put_object(key, buffer.read())
-                logger.info("[OSS] 已上传 %s -> %s (%d 行)", store_type, key, len(df))
+                if data_type == "order_deal":
+                    order_df, deal_df = converter.convert_sh_order_deal(raw_dict, trading_day_dt)
+                    if not order_df.empty:
+                        all_orders.append(order_df)
+                    if not deal_df.empty:
+                        all_deals.append(deal_df)
+
+                elif data_type == "order":
+                    if market == "SZ":
+                        converted = converter.convert_sz_order(raw_dict, trading_day_dt)
+                    else:
+                        converted = converter.convert_sh_order(raw_dict, trading_day_dt)
+                    if not converted.empty:
+                        all_orders.append(converted)
+
+                elif data_type == "deal":
+                    if market == "SZ":
+                        converted = converter.convert_sz_deal(raw_dict, trading_day_dt)
+                    else:
+                        converted = converter.convert_sh_deal(raw_dict, trading_day_dt)
+                    if not converted.empty:
+                        all_deals.append(converted)
+
+                elif data_type == "tick":
+                    if market == "SZ":
+                        converted = converter.convert_sz_tick(raw_dict, trading_day_dt)
+                    else:
+                        converted = converter.convert_sh_tick(raw_dict, trading_day_dt)
+                    if not converted.empty:
+                        all_ticks.append(converted)
 
             except Exception as e:
-                logger.error("[OSS] 上传 %s 失败: %s", store_type, e)
+                logger.error("[OSS] 处理文件 %s 失败: %s", csv_file.name, e)
+
+        # 合并并上传
+        import io
+        for dfs, name in [
+            (all_orders, "order"),
+            (all_deals, "deal"),
+            (all_ticks, "tick"),
+        ]:
+            if not dfs:
+                logger.info("[OSS] %s 数据为空，跳过", name)
+                continue
+            merged = pd.concat(dfs, ignore_index=True)
+            if name == "order":
+                merged = merged.sort_values("SeqNum").reset_index(drop=True)
+            elif name == "deal":
+                merged = merged.sort_values("SeqNum").reset_index(drop=True)
+            elif name == "tick":
+                merged = merged.sort_values("SeqNum").reset_index(drop=True)
+
+            buffer = io.BytesIO()
+            merged.to_parquet(buffer, index=False)
+            buffer.seek(0)
+
+            key = f"{prefix}/{date_str}_{name}.parquet"
+            bucket.put_object(key, buffer.read())
+            logger.info("[OSS] 已上传 %s -> %s (%d 行, %.1f MB)",
+                       name, key, len(merged), len(buffer.getvalue()) / 1024 / 1024)
+
+        # 上传 daily_basic
+        daily_basic = self._store.get_daily_basic()
+        if not daily_basic.empty:
+            buffer = io.BytesIO()
+            daily_basic.to_parquet(buffer, index=False)
+            buffer.seek(0)
+            key = f"{prefix}/{date_str}_daily_basic_data.parquet"
+            bucket.put_object(key, buffer.read())
+            logger.info("[OSS] 已上传 daily_basic -> %s (%d 行)", key, len(daily_basic))
 
         logger.info("[OSS] %s 全部上传完成", date_str)
 
@@ -476,8 +554,7 @@ class Collector:
 
         while not self._stop_event.is_set():
             self._check_day_rollover()
-
-            # 处理所有新数据
+            self._check_upload_time()
             for path, market, data_type, df in self._watcher.get_new_data():
                 self._handle(path, market, data_type, df)
 
