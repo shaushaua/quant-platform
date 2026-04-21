@@ -447,8 +447,8 @@ class Collector:
 
     def _upload_day_to_oss(self, trading_date: date) -> None:
         """
-        16:00 收盘后，直接上传已落盘的 parquet 文件到 OSS。
-        无需重新转换，速度快。
+        16:00 收盘后，读取落盘 parquet，按 Code+SeqNum 排序后上传 OSS。
+        排序规则与存量数据（Go data-converter）一致，支持 DuckDB 谓词下推。
         """
         date_str = trading_date.strftime("%Y%m%d")
         year = date_str[:4]
@@ -466,7 +466,7 @@ class Collector:
             logger.warning("[OSS] 落盘目录不存在: %s", disk_dir)
             return
 
-        # 上传 order/deal/tick parquet
+        # 排序并上传 order/deal/tick parquet
         for data_type in ["order", "deal", "tick"]:
             local_file = disk_dir / f"{data_type}.parquet"
             if not local_file.exists():
@@ -474,10 +474,16 @@ class Collector:
                 continue
 
             try:
+                # 读取 → 按 Code + SeqNum 排序 → 写回 → 上传
+                df = pd.read_parquet(local_file)
+                df = df.sort_values(["Code", "SeqNum"]).reset_index(drop=True)
+                df.to_parquet(local_file, index=False)
+
                 key = f"{prefix}/{date_str}_{data_type}.parquet"
                 bucket.put_object_from_file(key, str(local_file))
                 size_mb = local_file.stat().st_size / 1024 / 1024
-                logger.info("[OSS] 已上传 %s -> %s (%.1f MB)", data_type, key, size_mb)
+                logger.info("[OSS] 已上传 %s -> %s (%d 行, %.1f MB)",
+                           data_type, key, len(df), size_mb)
             except Exception as e:
                 logger.error("[OSS] 上传 %s 失败: %s", data_type, e)
 
