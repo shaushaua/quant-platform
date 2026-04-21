@@ -231,6 +231,9 @@ class DayDirWatcher:
         if path not in self._pollers:
             self._register_file(path)
 
+        if path not in self._pollers:
+            return  # 未识别的文件类型，跳过
+
         poller, market, data_type = self._pollers[path]
         df = poller.read_new_rows()
         if df is not None and not df.empty:
