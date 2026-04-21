@@ -423,6 +423,36 @@ class Collector:
 
             self._load_daily_basic()
 
+            # 日切时清理前一天的所有数据
+            self._cleanup_old_data()
+
+    def _cleanup_old_data(self):
+        """清理前一天及更早的 CSV 源文件和落盘 parquet，防止磁盘打满。"""
+        import shutil
+        cutoff = (self._trading_day - __import__("datetime").timedelta(days=DELETE_SOURCE_AFTER_DAYS))
+
+        # 清理旧的 CSV 源文件目录
+        try:
+            for d in MSG_BACKUP_DIR.iterdir():
+                if d.is_dir() and d.name.isdigit() and len(d.name) == 8:
+                    dir_date = date(int(d.name[:4]), int(d.name[4:6]), int(d.name[6:8]))
+                    if dir_date <= cutoff:
+                        shutil.rmtree(d)
+                        logger.info("[清理] 删除旧 CSV 目录: %s", d.name)
+        except Exception as e:
+            logger.warning("[清理] CSV 目录清理失败: %s", e)
+
+        # 清理旧的落盘 parquet 目录
+        try:
+            for d in DISK_OUTPUT_DIR.iterdir():
+                if d.is_dir() and d.name.isdigit() and len(d.name) == 8:
+                    dir_date = date(int(d.name[:4]), int(d.name[4:6]), int(d.name[6:8]))
+                    if dir_date <= cutoff:
+                        shutil.rmtree(d)
+                        logger.info("[清理] 删除旧落盘目录: %s", d.name)
+        except Exception as e:
+            logger.warning("[清理] 落盘目录清理失败: %s", e)
+
     def _check_upload_time(self):
         """16:00 自动上传当天全量 CSV 数据到 OSS。"""
         if self._uploaded_today:
