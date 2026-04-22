@@ -95,6 +95,9 @@ class FilePoller:
     处理通联追加写入时文件可能不完整的情况（末尾行不含换行则跳过）。
     """
 
+    # 单次读取最大字节数（~50MB），防止大文件增量导致 OOM
+    _MAX_CHUNK_BYTES = 50 * 1024 * 1024
+
     def __init__(self, path: Path, skip_existing: bool = True):
         self.path = path
         self._offset = path.stat().st_size if skip_existing else 0
@@ -105,6 +108,7 @@ class FilePoller:
         """
         读取自上次以来的新增行，返回 DataFrame。
         如果没有新数据或读取失败返回 None。
+        单次最多读取 _MAX_CHUNK_BYTES，剩余下次再读。
         """
         try:
             current_size = self.path.stat().st_size
@@ -114,12 +118,15 @@ class FilePoller:
         if current_size <= self._offset:
             return None
 
-        logger.debug("[read] %s size=%d offset=%d 新增=%d bytes",
-                    self.path.name, current_size, self._offset, current_size - self._offset)
+        # 限制单次读取量，避免 OOM
+        bytes_to_read = min(current_size - self._offset, self._MAX_CHUNK_BYTES)
+
+        logger.debug("[read] %s size=%d offset=%d 本次读取=%d bytes",
+                    self.path.name, current_size, self._offset, bytes_to_read)
 
         with open(self.path, "rb") as f:
             f.seek(self._offset)
-            chunk = f.read(current_size - self._offset)
+            chunk = f.read(bytes_to_read)
 
         if not chunk:
             return None
