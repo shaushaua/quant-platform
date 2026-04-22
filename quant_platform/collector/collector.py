@@ -95,8 +95,8 @@ class FilePoller:
     处理通联追加写入时文件可能不完整的情况（末尾行不含换行则跳过）。
     """
 
-    # 单次读取最大字节数（~50MB），防止大文件增量导致 OOM
-    _MAX_CHUNK_BYTES = 50 * 1024 * 1024
+    # 单次读取最大字节数（~100MB），防止大文件增量导致 OOM
+    _MAX_CHUNK_BYTES = 100 * 1024 * 1024
 
     def __init__(self, path: Path, skip_existing: bool = True):
         self.path = path
