@@ -455,12 +455,12 @@ class Collector:
             logger.warning("[清理] 落盘目录清理失败: %s", e)
 
     def _check_upload_time(self):
-        """16:00 自动上传当天全量 CSV 数据到 OSS。"""
+        """16:00~17:00 自动上传当天全量 CSV 数据到 OSS。"""
         if self._uploaded_today:
             return
         now = datetime.now()
-        # 北京时间 16:00 上传（闭市后）
-        if now.hour == 16 and now.minute == 0:
+        # 北京时间 16:00~17:00 上传（闭市后，窗口1小时防止重启错过）
+        if now.hour == 16:
             self._upload_day_to_oss(self._trading_day)
             self._uploaded_today = True
 
