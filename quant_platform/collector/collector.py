@@ -462,12 +462,12 @@ class Collector:
             logger.warning("[清理] 落盘目录清理失败: %s", e)
 
     def _check_upload_time(self):
-        """16:00~17:00 自动上传当天全量 CSV 数据到 OSS。"""
+        """16:00 后自动上传当天全量 CSV 数据到 OSS。"""
         if self._uploaded_today:
             return
         now = datetime.now()
-        # 北京时间 16:00~17:00 上传（闭市后，窗口1小时防止重启错过）
-        if now.hour == 16:
+        # 北京时间 16:00~23:59 上传（窗口宽裕，防止重启错过）
+        if now.hour >= 16:
             self._upload_day_to_oss(self._trading_day)
             self._uploaded_today = True
 
@@ -505,6 +505,9 @@ class Collector:
             return
 
         # 合并分片、排序、上传 order/deal/tick parquet
+        # 使用 DuckDB 流式合并，避免全量加载到内存
+        import duckdb
+
         for data_type in ["order", "deal", "tick"]:
             chunk_dir = disk_dir / data_type
             if not chunk_dir.exists():
@@ -512,17 +515,18 @@ class Collector:
                 continue
 
             try:
-                # 合并所有分片
                 chunks = sorted(chunk_dir.glob("*.parquet"))
-                dfs = [pd.read_parquet(f) for f in chunks]
-                if not dfs:
+                if not chunks:
                     continue
-                df = pd.concat(dfs, ignore_index=True)
-                df = df.sort_values(["Code", "SeqNum"]).reset_index(drop=True)
 
-                # 写入临时文件后上传
                 tmp_file = disk_dir / f"{data_type}.parquet"
-                df.to_parquet(tmp_file, index=False)
+                # DuckDB 流式读取所有分片，排序后直接写出，内存占用低
+                duckdb.sql(f"""
+                    COPY (
+                        SELECT * FROM read_parquet('{chunk_dir}/*.parquet')
+                        ORDER BY Code, SeqNum
+                    ) TO '{tmp_file}' (FORMAT PARQUET)
+                """)
 
                 key = f"{prefix}/{date_str}_{data_type}.parquet"
                 bucket.put_object_from_file(key, str(tmp_file))
