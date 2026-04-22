@@ -391,19 +391,20 @@ class Collector:
             logger.warning("处理 %s 失败: %s", path.name, e, exc_info=True)
 
     def _append_to_disk(self, data_type: str, df: pd.DataFrame):
-        """将转换后的数据追加到本地 parquet 文件（用于 OSS 上传）。"""
+        """将转换后的数据追加到本地 parquet 文件（用于 OSS 上传）。
+
+        使用分片写入：每个文件最多 _CHUNK_SIZE 行，避免全量读取导致 OOM。
+        """
         try:
             date_str = self._trading_day.strftime("%Y%m%d")
-            out_dir = DISK_OUTPUT_DIR / date_str
+            out_dir = DISK_OUTPUT_DIR / date_str / data_type
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_file = out_dir / f"{data_type}.parquet"
 
-            if out_file.exists():
-                existing = pd.read_parquet(out_file)
-                df = pd.concat([existing, df], ignore_index=True)
-
-            df.to_parquet(out_file, index=False)
-            logger.debug("[落盘] %s: %d 行 -> %s", data_type, len(df), out_file)
+            # 分片写入：每次写一个独立的小 parquet 文件
+            chunk_idx = len(list(out_dir.glob("*.parquet")))
+            chunk_file = out_dir / f"{chunk_idx:06d}.parquet"
+            df.to_parquet(chunk_file, index=False)
+            logger.debug("[落盘] %s: +%d 行 -> %s", data_type, len(df), chunk_file.name)
         except Exception as e:
             logger.warning("[落盘] 写入 %s 失败: %s", data_type, e)
 
@@ -496,24 +497,36 @@ class Collector:
             logger.warning("[OSS] 落盘目录不存在: %s", disk_dir)
             return
 
-        # 排序并上传 order/deal/tick parquet
+        # 合并分片、排序、上传 order/deal/tick parquet
         for data_type in ["order", "deal", "tick"]:
-            local_file = disk_dir / f"{data_type}.parquet"
-            if not local_file.exists():
+            chunk_dir = disk_dir / data_type
+            if not chunk_dir.exists():
                 logger.info("[OSS] %s 无落盘数据，跳过", data_type)
                 continue
 
             try:
-                # 读取 → 按 Code + SeqNum 排序 → 写回 → 上传
-                df = pd.read_parquet(local_file)
+                # 合并所有分片
+                chunks = sorted(chunk_dir.glob("*.parquet"))
+                dfs = [pd.read_parquet(f) for f in chunks]
+                if not dfs:
+                    continue
+                df = pd.concat(dfs, ignore_index=True)
                 df = df.sort_values(["Code", "SeqNum"]).reset_index(drop=True)
-                df.to_parquet(local_file, index=False)
+
+                # 写入临时文件后上传
+                tmp_file = disk_dir / f"{data_type}.parquet"
+                df.to_parquet(tmp_file, index=False)
 
                 key = f"{prefix}/{date_str}_{data_type}.parquet"
-                bucket.put_object_from_file(key, str(local_file))
-                size_mb = local_file.stat().st_size / 1024 / 1024
-                logger.info("[OSS] 已上传 %s -> %s (%d 行, %.1f MB)",
-                           data_type, key, len(df), size_mb)
+                bucket.put_object_from_file(key, str(tmp_file))
+                size_mb = tmp_file.stat().st_size / 1024 / 1024
+                logger.info("[OSS] 已上传 %s -> %s (%d 行, %.1f MB, %d 分片)",
+                           data_type, key, len(df), size_mb, len(chunks))
+
+                # 上传成功后删除临时文件和分片
+                tmp_file.unlink(missing_ok=True)
+                for f in chunks:
+                    f.unlink()
             except Exception as e:
                 logger.error("[OSS] 上传 %s 失败: %s", data_type, e)
 
