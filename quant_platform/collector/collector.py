@@ -242,7 +242,7 @@ class DayDirWatcher:
         if df is not None and not df.empty:
             with self._results_lock:
                 self._results.append((path, market, data_type, df))
-            logger.debug("[%s][%s] %s +%d 行", market, data_type, path.name, len(df))
+            logger.info("[%s][%s] %s +%d 行", market, data_type, path.name, len(df))
 
     def start(self):
         """启动监听（使用 inotify 或轮询）。"""
@@ -385,7 +385,7 @@ class Collector:
                     self._store.update_tick(code, sub)
                 self._append_to_disk("tick", df)
 
-            logger.debug("[%s][%s] %s +%d 行", market, data_type, path.name, len(raw_df))
+            logger.info("[%s][%s] %s 处理 +%d 行", market, data_type, path.name, len(raw_df))
 
         except Exception as e:
             logger.warning("处理 %s 失败: %s", path.name, e, exc_info=True)
@@ -404,7 +404,7 @@ class Collector:
             chunk_idx = len(list(out_dir.glob("*.parquet")))
             chunk_file = out_dir / f"{chunk_idx:06d}.parquet"
             df.to_parquet(chunk_file, index=False)
-            logger.debug("[落盘] %s: +%d 行 -> %s", data_type, len(df), chunk_file.name)
+            logger.info("[落盘] %s: +%d 行 -> %s", data_type, len(df), chunk_file.name)
         except Exception as e:
             logger.warning("[落盘] 写入 %s 失败: %s", data_type, e)
 
