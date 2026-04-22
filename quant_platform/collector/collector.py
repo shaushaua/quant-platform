@@ -416,10 +416,16 @@ class Collector:
             logger.warning("[落盘] 写入 %s 失败: %s", data_type, e)
 
     def _check_day_rollover(self):
-        """交易日切换时：更新监听目录和 daily_basic。"""
+        """交易日切换时：先上传前一天数据，再更新监听目录和 daily_basic。"""
         today = date.today()
         if today != self._trading_day:
             logger.info("[日切] %s -> %s", self._trading_day, today)
+
+            # 日切前先尝试上传前一天数据（防止清理时丢失）
+            if not self._uploaded_today:
+                logger.info("[日切] 补上传 %s 数据到 OSS", self._trading_day)
+                self._upload_day_to_oss(self._trading_day)
+
             self._trading_day = today
             self._day_dir = MSG_BACKUP_DIR / today.strftime("%Y%m%d")
             self._uploaded_today = False
@@ -431,7 +437,7 @@ class Collector:
 
             self._load_daily_basic()
 
-            # 日切时清理前一天的所有数据
+            # 日切时清理前一天的所有数据（上传已完成，可安全删除）
             self._cleanup_old_data()
 
     def _cleanup_old_data(self):
