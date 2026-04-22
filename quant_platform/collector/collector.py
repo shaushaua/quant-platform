@@ -519,27 +519,37 @@ class Collector:
                 if not chunks:
                     continue
 
-                tmp_file = disk_dir / f"{data_type}.parquet"
-                # DuckDB 流式读取所有分片，排序后直接写出，内存占用低
-                duckdb.sql(f"""
+                tmp_file = disk_dir / f"tmp_{data_type}.parquet"
+                # 清理可能残留的临时文件
+                tmp_file.unlink(missing_ok=True)
+
+                # DuckDB 流式读取所有分片，排序后直接写出
+                # 设置 memory_limit 防止 OOM
+                con = duckdb.connect(":memory:")
+                con.execute("SET memory_limit='2GB'")
+                con.execute(f"""
                     COPY (
                         SELECT * FROM read_parquet('{chunk_dir}/*.parquet')
                         ORDER BY Code, SeqNum
                     ) TO '{tmp_file}' (FORMAT PARQUET)
                 """)
+                con.close()
 
+                size_mb = tmp_file.stat().st_size / 1024 / 1024
                 key = f"{prefix}/{date_str}_{data_type}.parquet"
                 bucket.put_object_from_file(key, str(tmp_file))
-                size_mb = tmp_file.stat().st_size / 1024 / 1024
-                logger.info("[OSS] 已上传 %s -> %s (%d 行, %.1f MB, %d 分片)",
-                           data_type, key, len(df), size_mb, len(chunks))
+                logger.info("[OSS] 已上传 %s -> %s (%.1f MB, %d 分片)",
+                           data_type, key, size_mb, len(chunks))
 
                 # 上传成功后删除临时文件和分片
                 tmp_file.unlink(missing_ok=True)
                 for f in chunks:
                     f.unlink()
             except Exception as e:
-                logger.error("[OSS] 上传 %s 失败: %s", data_type, e)
+                logger.error("[OSS] 上传 %s 失败: %s", data_type, e, exc_info=True)
+                # 清理残留临时文件
+                tmp_file = disk_dir / f"tmp_{data_type}.parquet"
+                tmp_file.unlink(missing_ok=True)
 
         # 上传 daily_basic
         daily_basic = self._store.get_daily_basic()
