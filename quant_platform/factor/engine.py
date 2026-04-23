@@ -262,6 +262,11 @@ def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: Lis
     l1_tick  = _safe_load("tick",  codes=codes) if factor_info.get("need_l1_tick")  else pd.DataFrame()
     market   = _safe_load("daily_basic")
 
+    logger.info(
+        "[数据加载] date=%s codes=%d order=%d行 deal=%d行 tick=%d行 market=%d行",
+        date, len(codes or []), len(l2_order), len(l2_deal), len(l1_tick), len(market),
+    )
+
     # 若需要多日 market 历史（market_count > 1），尝试追加历史
     market_count = int(factor_info.get("market_count", 1))
     if market_count > 1:
@@ -309,6 +314,8 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
         return df  # 实时数据，无需还原
 
     # --- 需要还原 ---
+    restored_prices = []
+    restored_volumes = []
 
     # 1. Code → 股票代码字符串
     df[code_col] = code
@@ -326,9 +333,19 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
             # 其他 int32 列（SeqNum, OrderID, Channel, TradeNum, Num 等）不处理
 
             if is_price:
+                restored_prices.append(col)
                 df[col] = df[col].astype("float64") / 100.0
             elif is_volume:
+                restored_volumes.append(col)
                 df[col] = df[col].astype("float64") * 100.0
+
+    if restored_prices or restored_volumes:
+        sample_price = df[restored_prices[0]].iloc[0] if restored_prices and len(df) > 0 else None
+        logger.debug(
+            "[精度还原] %s: Code int→str, 价格÷100[%s], 成交量×100[%s], 样本 %s=%.4f",
+            code, ",".join(restored_prices[:3]), ",".join(restored_volumes[:3]),
+            restored_prices[0] if restored_prices else "", sample_price,
+        )
 
     return df
 
@@ -352,6 +369,9 @@ def _build_stock_data(
         rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
         if not rows.empty:
             security_id = int(rows.iloc[0]["SECURITY_ID"])
+            logger.debug("[ID映射] %s -> SECURITY_ID=%d", code, security_id)
+        else:
+            logger.warning("[ID映射] %s 未在 daily_basic 中找到 SECURITY_ID", code)
 
     def _filter(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
@@ -369,15 +389,34 @@ def _build_stock_data(
             return df[df["ID_QI"].astype(str) == id_qi].reset_index(drop=True)
         return df  # 无可识别的 code 列时原样返回
 
+    l2_order_data = _restore_oss_precision(_filter(bundle.l2_order), code)
+    l2_deal_data = _restore_oss_precision(_filter(bundle.l2_deal), code)
+    l1_tick_data = _restore_oss_precision(_filter(bundle.l1_tick), code)
+    market_data = _filter(bundle.market)
+
+    if any(len(d) > 0 for d in [l2_order_data, l2_deal_data, l1_tick_data, market_data]):
+        price_col = "Price"
+        price_sample = None
+        if not l2_deal_data.empty and price_col in l2_deal_data.columns:
+            price_sample = l2_deal_data[price_col].iloc[0]
+        elif not l2_order_data.empty and price_col in l2_order_data.columns:
+            price_sample = l2_order_data[price_col].iloc[0]
+        logger.info(
+            "[StockData] %s date=%s order=%d行 deal=%d行 tick=%d行 market=%d行 Price样本=%s",
+            code, date, len(l2_order_data), len(l2_deal_data),
+            len(l1_tick_data), len(market_data),
+            f"{price_sample:.2f}" if price_sample is not None else "N/A",
+        )
+
     return StockData(
         code=code,
         date=date,
         end_time=end_time,
-        l2_order=_restore_oss_precision(_filter(bundle.l2_order), code),
-        l2_deal=_restore_oss_precision(_filter(bundle.l2_deal), code),
-        l1_tick=_restore_oss_precision(_filter(bundle.l1_tick), code),
-        market=_filter(bundle.market),
-        daily_basic=_filter(bundle.market),  # 别名，与 market 相同
+        l2_order=l2_order_data,
+        l2_deal=l2_deal_data,
+        l1_tick=l1_tick_data,
+        market=market_data,
+        daily_basic=market_data,  # 别名，与 market 相同
     )
 
 
