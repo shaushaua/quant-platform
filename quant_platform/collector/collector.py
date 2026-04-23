@@ -559,6 +559,7 @@ class Collector:
 
         # 上传 daily_basic
         daily_basic = self._store.get_daily_basic()
+        logger.info("[OSS] daily_basic 行数: %d", len(daily_basic))
         if not daily_basic.empty:
             try:
                 import io
