@@ -38,6 +38,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from .base import StockData
@@ -280,6 +281,58 @@ def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: Lis
     )
 
 
+def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """
+    将 OSS 历史压缩数据还原为原始精度。
+
+    Go data-converter (deeptrade) 对数据做了压缩：
+      - Code 列存为 SECURITY_ID 整数 (int32)
+      - 价格列 ×100 存为 int32
+      - 成交量列 ÷100 存为 int32
+
+    通过检测列类型（int32 vs float64/string）自动判断是否需要还原，
+    不影响实时 collector 数据（float64 价格 + string code）。
+    """
+    if df.empty:
+        return df
+
+    # 检测 Code 列是否为整数类型（OSS 历史数据的标志）
+    code_col = None
+    for col in ("Code", "code", "stock_code"):
+        if col in df.columns:
+            code_col = col
+            break
+    if code_col is None:
+        return df
+
+    if not pd.api.types.is_integer_dtype(df[code_col]):
+        return df  # 实时数据，无需还原
+
+    # --- 需要还原 ---
+
+    # 1. Code → 股票代码字符串
+    df[code_col] = code
+
+    # 2. 价格列 ÷100（只处理 int32 列）
+    _PRICE_SUFFIXES = ("Price", "IOPV")
+    for col in df.columns:
+        if col == code_col:
+            continue
+        if pd.api.types.is_integer_dtype(df[col]):
+            # 价格类：列名含 Price 或 IOPV → ÷100
+            is_price = any(s in col for s in _PRICE_SUFFIXES)
+            # 成交量类：列名含 Volume → ×100
+            is_volume = "Volume" in col
+            # 其他 int32 列（SeqNum, OrderID, Channel, TradeNum, Num 等）不处理
+
+            if is_price:
+                df[col] = df[col].astype("float64") / 100.0
+            elif is_volume:
+                df[col] = df[col].astype("float64") * 100.0
+
+    return df
+
+
 def _build_stock_data(
     bundle: _DayBundle,
     code: str,
@@ -320,9 +373,9 @@ def _build_stock_data(
         code=code,
         date=date,
         end_time=end_time,
-        l2_order=_filter(bundle.l2_order),
-        l2_deal=_filter(bundle.l2_deal),
-        l1_tick=_filter(bundle.l1_tick),
+        l2_order=_restore_oss_precision(_filter(bundle.l2_order), code),
+        l2_deal=_restore_oss_precision(_filter(bundle.l2_deal), code),
+        l1_tick=_restore_oss_precision(_filter(bundle.l1_tick), code),
         market=_filter(bundle.market),
         daily_basic=_filter(bundle.market),  # 别名，与 market 相同
     )
