@@ -347,6 +347,13 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
             restored_prices[0] if restored_prices else "", sample_price,
         )
 
+    # 3. 还原 Time 列：int64 UnixMicro → datetime64[ns]
+    if "Time" in df.columns and pd.api.types.is_integer_dtype(df["Time"]):
+        df["Time"] = pd.to_datetime(df["Time"], unit="us")
+    # 还原 UpdateTime 列：int32 微秒偏移 → datetime64[ns]（基于已还原的 Time）
+    if "UpdateTime" in df.columns and pd.api.types.is_integer_dtype(df["UpdateTime"]) and "Time" in df.columns:
+        df["UpdateTime"] = df["Time"] + pd.to_timedelta(df["UpdateTime"], unit="us")
+
     return df
 
 
