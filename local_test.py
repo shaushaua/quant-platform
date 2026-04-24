@@ -21,6 +21,8 @@ import importlib.util
 import json
 import os
 import sys
+
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
@@ -57,7 +59,8 @@ def main():
     parser.add_argument('--date', required=True, help='日期或日期范围 (如 20250106 或 20250106-20250110)')
     parser.add_argument('--codes', help='股票代码列表，逗号分隔 (如 "000001.SZ,000002.SZ")')
     parser.add_argument('--all', action='store_true', help='测试全市场模式（仅前10只股票）')
-    parser.add_argument('--output', default='./local_test_result.json', help='输出结果文件路径')
+    parser.add_argument('--output', default='./local_test_result', help='输出结果文件路径（不含扩展名）')
+    parser.add_argument('--format', choices=['csv', 'parquet', 'json'], default='csv', help='输出格式（默认 csv）')
     parser.add_argument('--verbose', '-v', action='store_true', help='显示详细日志')
 
     args = parser.parse_args()
@@ -202,9 +205,21 @@ def main():
 
     # 保存结果
     if results:
-        output_path = args.output
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        df = pd.DataFrame(results)
+        fmt = args.format
+
+        # 根据格式确定输出路径
+        if args.output.endswith(f'.{fmt}'):
+            output_path = args.output
+        else:
+            output_path = f"{args.output}.{fmt}"
+
+        if fmt == 'csv':
+            df.to_csv(output_path, index=False)
+        elif fmt == 'parquet':
+            df.to_parquet(output_path, index=False)
+        else:
+            df.to_json(output_path, orient='records', indent=2, force_ascii=False)
 
         print(f"\n📊 结果统计:")
         print(f"   总记录数: {len(results)}")
@@ -240,7 +255,7 @@ def main():
             if len(sample) > 15:
                 print(f"      ... (还有 {len(sample) - 15} 个字段)")
 
-        print(f"\n💾 结果已保存到: {output_path}")
+        print(f"\n💾 结果已保存到: {output_path} ({fmt})")
 
     else:
         print(f"\n⚠️  警告: 没有生成任何结果")

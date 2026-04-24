@@ -16,6 +16,8 @@ Collector：监听通联客户端实时写入的 CSV 文件，增量解析后写
 
 import logging
 import os
+import gc
+import io
 import threading
 import time
 from collections import deque
@@ -52,7 +54,8 @@ SKIP_HISTORY = os.environ.get("COLLECTOR_SKIP_HISTORY", "true").lower() == "true
 DELETE_SOURCE_AFTER_DAYS = int(os.environ.get("DELETE_SOURCE_AFTER_DAYS", "1"))
 
 # 文件变化去重窗口（毫秒），防止同一文件多次触发
-DEBOUNCE_MS = int(os.environ.get("COLLECTOR_DEBOUNCE_MS", "100"))
+# 10ms：数据来了就处理，不等多余的 inotify 事件合并
+DEBOUNCE_MS = int(os.environ.get("COLLECTOR_DEBOUNCE_MS", "10"))
 
 Market = str   # "SH" | "SZ"
 DataType = str  # "order" | "deal" | "tick" | "order_deal"
@@ -95,8 +98,10 @@ class FilePoller:
     处理通联追加写入时文件可能不完整的情况（末尾行不含换行则跳过）。
     """
 
-    # 单次读取最大字节数（~100MB），防止大文件增量导致 OOM
-    _MAX_CHUNK_BYTES = 100 * 1024 * 1024
+    # 单次读取最大字节数（~5MB），降低单次处理延迟
+    # 5MB CSV 解析为 DataFrame 后约占 15-25MB 内存
+    # 更小的块 = 更快的单次处理 = 更低的端到端延迟
+    _MAX_CHUNK_BYTES = 5 * 1024 * 1024
 
     def __init__(self, path: Path, skip_existing: bool = True):
         self.path = path
@@ -172,31 +177,45 @@ class FileChangeHandler(FileSystemEventHandler):
     使用防抖机制避免同一文件短时间内多次触发。
     """
 
-    def __init__(self, callback: Callable[[Path], None], debounce_ms: int = 100):
+    def __init__(self, callback: Callable[[Path], None], debounce_ms: int = 10):
         super().__init__()
         self._callback = callback
         self._debounce_ms = debounce_ms
-        self._pending: Dict[str, float] = {}  # path -> last_trigger_time
+        self._pending: Dict[str, float] = {}  # path -> scheduled_fire_time
         self._lock = threading.Lock()
+        self._stopped = True
 
     def _schedule(self, path: Path):
-        """防抖处理：同一文件在 debounce_ms 内只触发一次。"""
+        """防抖：同一文件在 debounce_ms 内只触发一次，复用单个 timer 线程。"""
         path_str = str(path)
-        now = time.time()
+        fire_at = time.time() + self._debounce_ms / 1000.0
         with self._lock:
-            # 如果已经在等待队列中，更新时间
-            self._pending[path_str] = now
+            self._pending[path_str] = fire_at
 
-        # 延迟执行，让后续事件合并
-        def deferred():
-            time.sleep(self._debounce_ms / 1000.0)
+    def _timer_loop(self):
+        """单线程 timer 循环：扫描 pending，到期的触发回调。"""
+        while not self._stopped:
+            now = time.time()
+            ready = []
             with self._lock:
-                if self._pending.get(path_str, 0) == now:
-                    # 仍然是最新事件，执行回调
-                    del self._pending[path_str]
-                    self._callback(path)
+                for path_str, fire_at in list(self._pending.items()):
+                    if now >= fire_at:
+                        ready.append(path_str)
+                        del self._pending[path_str]
+            for path_str in ready:
+                try:
+                    self._callback(Path(path_str))
+                except Exception:
+                    pass
+            time.sleep(0.005)  # 5ms 扫描间隔
 
-        threading.Thread(target=deferred, daemon=True).start()
+    def start(self):
+        self._stopped = False
+        self._timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
+        self._timer_thread.start()
+
+    def stop(self):
+        self._stopped = True
 
     def on_created(self, event):
         if not event.is_directory:
@@ -265,15 +284,18 @@ class DayDirWatcher:
 
         if HAS_WATCHDOG:
             self._observer = Observer()
-            handler = FileChangeHandler(self._on_file_changed, DEBOUNCE_MS)
-            self._observer.schedule(handler, str(self.day_dir), recursive=False)
+            self._handler = FileChangeHandler(self._on_file_changed, DEBOUNCE_MS)
+            self._observer.schedule(self._handler, str(self.day_dir), recursive=False)
             self._observer.start()
+            self._handler.start()
             logger.info("[watcher] inotify 监听已启动: %s", self.day_dir)
         else:
             logger.warning("[watcher] watchdog 未安装，请运行: pip install watchdog")
 
     def stop(self):
         """停止监听。"""
+        if hasattr(self, '_handler'):
+            self._handler.stop()
         if self._observer:
             self._observer.stop()
             self._observer.join()
@@ -328,6 +350,14 @@ class Collector:
         self._daily_basic_cache: Optional[DailyBasicCache] = None
         self._uploaded_today = False
 
+        # 落盘队列：后台线程异步写 parquet，不阻塞实时路径
+        self._disk_queue: Deque[Tuple[str, pd.DataFrame]] = deque()
+        self._disk_queue_lock = threading.Lock()
+        # 落盘文件计数器，避免每次 glob 扫描目录
+        self._disk_chunk_idx: Dict[str, int] = {}
+        self._disk_thread = threading.Thread(target=self._disk_writer_loop, daemon=True)
+        self._disk_thread.start()
+
     def _load_daily_basic(self):
         """从 MySQL 加载 daily_basic 写入 ShmStore。"""
         try:
@@ -348,7 +378,7 @@ class Collector:
             logger.warning("[daily_basic] 加载异常: %s", e)
 
     def _handle(self, path: Path, market: str, data_type: str, raw_df: pd.DataFrame):
-        """将原始 DataFrame 转换后写入 ShmStore（实时）+ 落盘 parquet（全量）。"""
+        """将原始 DataFrame 转换后写入 ShmStore（实时），落盘 parquet 异步执行。"""
         try:
             trading_day_dt = pd.Timestamp(self._trading_day)
             raw_dict = raw_df.to_dict("list")
@@ -359,11 +389,13 @@ class Collector:
                 if not order_df.empty:
                     for code, sub in order_df.groupby("Code"):
                         self._store.update_order(code, sub)
-                    self._append_to_disk("order", order_df)
+                    with self._disk_queue_lock:
+                        self._disk_queue.append(("order", order_df))
                 if not deal_df.empty:
                     for code, sub in deal_df.groupby("Code"):
                         self._store.update_deal(code, sub)
-                    self._append_to_disk("deal", deal_df)
+                    with self._disk_queue_lock:
+                        self._disk_queue.append(("deal", deal_df))
 
             elif data_type == "order":
                 if market == "SZ":
@@ -372,7 +404,8 @@ class Collector:
                     df = self._converter.convert_sh_order(raw_dict, trading_day_dt)
                 for code, sub in df.groupby("Code"):
                     self._store.update_order(code, sub)
-                self._append_to_disk("order", df)
+                with self._disk_queue_lock:
+                    self._disk_queue.append(("order", df))
 
             elif data_type == "deal":
                 if market == "SZ":
@@ -381,7 +414,8 @@ class Collector:
                     df = self._converter.convert_sh_deal(raw_dict, trading_day_dt)
                 for code, sub in df.groupby("Code"):
                     self._store.update_deal(code, sub)
-                self._append_to_disk("deal", df)
+                with self._disk_queue_lock:
+                    self._disk_queue.append(("deal", df))
 
             elif data_type == "tick":
                 if market == "SZ":
@@ -390,26 +424,44 @@ class Collector:
                     df = self._converter.convert_sh_tick(raw_dict, trading_day_dt)
                 for code, sub in df.groupby("Code"):
                     self._store.update_tick(code, sub)
-                self._append_to_disk("tick", df)
+                with self._disk_queue_lock:
+                    self._disk_queue.append(("tick", df))
 
             logger.info("[%s][%s] %s 处理 +%d 行", market, data_type, path.name, len(raw_df))
 
         except Exception as e:
             logger.warning("处理 %s 失败: %s", path.name, e, exc_info=True)
 
-    def _append_to_disk(self, data_type: str, df: pd.DataFrame):
-        """将转换后的数据追加到本地 parquet 文件（用于 OSS 上传）。
+    def _disk_writer_loop(self):
+        """后台线程：从队列取数据写 parquet 落盘，不阻塞实时处理。"""
+        while not self._stop_event.is_set():
+            try:
+                with self._disk_queue_lock:
+                    if self._disk_queue:
+                        data_type, df = self._disk_queue.popleft()
+                    else:
+                        data_type, df = None, None
+                if data_type and df is not None:
+                    self._append_to_disk(data_type, df)
+                    del df
+                else:
+                    self._stop_event.wait(0.05)
+            except Exception as e:
+                logger.warning("[落盘线程] 异常: %s", e)
 
-        使用分片写入：每个文件最多 _CHUNK_SIZE 行，避免全量读取导致 OOM。
-        """
+    def _append_to_disk(self, data_type: str, df: pd.DataFrame):
+        """将转换后的数据追加到本地 parquet 文件（用于 OSS 上传）。"""
         try:
             date_str = self._trading_day.strftime("%Y%m%d")
             out_dir = DISK_OUTPUT_DIR / date_str / data_type
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            # 分片写入：每次写一个独立的小 parquet 文件
-            chunk_idx = len(list(out_dir.glob("*.parquet")))
+            # 递增计数器，避免 glob 扫描目录（文件多时很慢）
+            key = f"{date_str}/{data_type}"
+            chunk_idx = self._disk_chunk_idx.get(key, 0)
             chunk_file = out_dir / f"{chunk_idx:06d}.parquet"
+            self._disk_chunk_idx[key] = chunk_idx + 1
+
             df.to_parquet(chunk_file, index=False)
             logger.info("[落盘] %s: +%d 行 -> %s", data_type, len(df), chunk_file.name)
         except Exception as e:
@@ -424,6 +476,7 @@ class Collector:
             # 日切前先尝试上传前一天数据（防止清理时丢失）
             if not self._uploaded_today:
                 logger.info("[日切] 补上传 %s 数据到 OSS", self._trading_day)
+                self._flush_disk_queue()
                 self._upload_day_to_oss(self._trading_day)
 
             self._trading_day = today
@@ -467,6 +520,16 @@ class Collector:
         except Exception as e:
             logger.warning("[清理] 落盘目录清理失败: %s", e)
 
+    def _flush_disk_queue(self):
+        """等待落盘队列排空，确保所有数据写入 parquet。"""
+        for _ in range(300):  # 最多等 15 秒
+            with self._disk_queue_lock:
+                if not self._disk_queue:
+                    return
+            time.sleep(0.05)
+        logger.warning("[flush] 落盘队列未在 15 秒内排空，剩余 %d 条",
+                       len(self._disk_queue))
+
     def _check_upload_time(self):
         """16:00 后自动上传当天全量 CSV 数据到 OSS。"""
         if self._uploaded_today:
@@ -474,6 +537,8 @@ class Collector:
         now = datetime.now()
         # 北京时间 16:00~23:59 上传（窗口宽裕，防止重启错过）
         if now.hour >= 16:
+            # 先等待落盘队列排空，确保所有数据已写入 parquet
+            self._flush_disk_queue()
             self._upload_day_to_oss(self._trading_day)
             self._uploaded_today = True
 
@@ -562,7 +627,6 @@ class Collector:
         logger.info("[OSS] daily_basic 行数: %d", len(daily_basic))
         if not daily_basic.empty:
             try:
-                import io
                 buffer = io.BytesIO()
                 daily_basic.to_parquet(buffer, index=False)
                 buffer.seek(0)
@@ -576,6 +640,7 @@ class Collector:
 
     def _run_loop(self):
         last_cleanup = time.time()
+        loop_count = 0
         logger.info("[Collector] 启动，监听目录: %s", self._day_dir)
         logger.info("[Collector] 源文件清理: 保留 %d 天", DELETE_SOURCE_AFTER_DAYS)
 
@@ -584,8 +649,16 @@ class Collector:
         while not self._stop_event.is_set():
             self._check_day_rollover()
             self._check_upload_time()
-            for path, market, data_type, df in self._watcher.get_new_data():
+
+            new_data = self._watcher.get_new_data()
+            for path, market, data_type, df in new_data:
                 self._handle(path, market, data_type, df)
+                del df
+
+            loop_count += 1
+            # 每 100 轮做一次 gc，平衡延迟和内存
+            if loop_count % 100 == 0:
+                gc.collect()
 
             # 每小时清理一次旧文件
             now = time.time()
@@ -593,8 +666,9 @@ class Collector:
                 self._watcher.cleanup_old_files(DELETE_SOURCE_AFTER_DAYS)
                 last_cleanup = now
 
-            # 短暂休眠避免 CPU 空转
-            self._stop_event.wait(0.1)
+            # 无新数据时短暂休眠避免 CPU 空转，有数据时立即处理
+            if not new_data:
+                self._stop_event.wait(0.01)  # 10ms
 
         self._watcher.stop()
         logger.info("[Collector] 已停止")
