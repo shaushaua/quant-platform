@@ -388,6 +388,38 @@ class DataAPI:
         """
         return self._oss.load(date, data_type, codes)
 
+    def load_stock_data(
+        self,
+        code: str,
+        date: str,
+        data_type: str = "deal",
+    ) -> pd.DataFrame:
+        """
+        加载单只股票的单日数据，自动还原 Code 和精度。
+
+        交易员在 Jupyter 里直接用：
+            from quant_platform.data.api import DataAPI
+            api = DataAPI(mode="backtest")
+
+            deal = api.load_stock_data("000001.SZ", "20250106", "deal")
+            print(deal[["Code", "Price", "Volume"]].head())
+
+        OSS 历史数据由 Go data-converter 压缩存储（Code 为整数、价格×100、
+        成交量÷100），此方法自动还原为可读格式。实时数据不受影响。
+
+        Args:
+            code: 股票代码，如 "000001.SZ"
+            date: 日期 (YYYYMMDD 或 YYYY-MM-DD)
+            data_type: "order" / "deal" / "tick"
+
+        Returns:
+            还原后的 DataFrame（Code 为字符串，价格为 float64 原始精度）
+        """
+        from ..factor.engine import _restore_oss_precision
+
+        df = self._oss.load(date, data_type, codes=[code])
+        return _restore_oss_precision(df, code)
+
     def get_history(
         self,
         start_date: str,
