@@ -670,6 +670,10 @@ class Collector:
                 self._handle(path, market, data_type, df)
                 del df
 
+            # 每个 chunk 处理完立即刷写脏股票到 /dev/shm
+            if new_data:
+                self._store.flush_dirty()
+
             loop_count += 1
             # 每 10 轮做一次 gc，及时回收临时 DataFrame
             if loop_count % 10 == 0:
