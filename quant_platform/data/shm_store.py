@@ -31,6 +31,10 @@ SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
 # order/deal 每只股票最多保留行数，防止数据撑爆共享内存
 MAX_ROWS_PER_SYMBOL = int(os.environ.get("SHM_MAX_ROWS_PER_SYMBOL", "10000"))
 
+# 三类缓冲（tick+order+deal）的总行数上限
+# 5000 只 × 6000 行 × ~100 bytes ≈ 3GB，4Gi 容器下安全
+MAX_TOTAL_BUFFER_ROWS = int(os.environ.get("SHM_MAX_TOTAL_ROWS", "30000000"))
+
 
 class ShmStore:
     """
@@ -66,6 +70,7 @@ class ShmStore:
         self._dirty_deal: Set[str] = set()
 
         self._flush_count = 0
+        self._total_buffer_rows = 0  # 跟踪三类缓冲总行数
 
     # ------------------------------------------------------------------ #
     # 内部读写                                                              #
@@ -99,15 +104,29 @@ class ShmStore:
         code: str, df: pd.DataFrame
     ) -> None:
         """将新数据累积到内存缓冲，标记脏（调用者需持有 _lock）。"""
+        incoming_rows = len(df)
+        old_rows = len(buffer.get(code, []))
+
         if code in buffer:
             old = buffer[code]
-            merged = pd.concat([old, df], ignore_index=True)
+            new_total = old_rows + incoming_rows
+            if new_total > MAX_ROWS_PER_SYMBOL:
+                # 超限：只保留最新 max_rows 行
+                merged = pd.concat([old, df.iloc[-(MAX_ROWS_PER_SYMBOL):]], ignore_index=True)
+                merged = merged.iloc[-MAX_ROWS_PER_SYMBOL:]
+                self._total_buffer_rows += MAX_ROWS_PER_SYMBOL - old_rows
+            else:
+                merged = pd.concat([old, df], ignore_index=True)
+                self._total_buffer_rows += incoming_rows
             del old
-            if len(merged) > MAX_ROWS_PER_SYMBOL:
-                merged = merged.iloc[-MAX_ROWS_PER_SYMBOL:].copy()
             buffer[code] = merged
         else:
-            buffer[code] = df.copy() if len(df) > MAX_ROWS_PER_SYMBOL else df
+            if incoming_rows > MAX_ROWS_PER_SYMBOL:
+                buffer[code] = df.iloc[-MAX_ROWS_PER_SYMBOL:].copy()
+                self._total_buffer_rows += MAX_ROWS_PER_SYMBOL
+            else:
+                buffer[code] = df
+                self._total_buffer_rows += incoming_rows
         dirty.add(code)
 
     # ------------------------------------------------------------------ #
@@ -165,9 +184,19 @@ class ShmStore:
 
             if total > 0:
                 self._flush_count += 1
-                if self._flush_count % 100 == 0:
+                # 总缓冲超限时强制 gc + 日志告警
+                if self._total_buffer_rows > MAX_TOTAL_BUFFER_ROWS:
                     gc.collect()
-                    logger.info("[ShmStore] 第 %d 次刷写: %d 只股票", self._flush_count, total)
+                    logger.warning(
+                        "[ShmStore] 缓冲总行数 %d 超过上限 %d，已 gc",
+                        self._total_buffer_rows, MAX_TOTAL_BUFFER_ROWS,
+                    )
+                elif self._flush_count % 100 == 0:
+                    gc.collect()
+                    logger.info(
+                        "[ShmStore] 第 %d 次刷写: %d 只股票, 缓冲总行数 %d",
+                        self._flush_count, total, self._total_buffer_rows,
+                    )
 
     def flush(self) -> None:
         """强制刷写所有缓冲到磁盘（停机前调用）。"""
