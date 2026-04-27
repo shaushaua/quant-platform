@@ -38,7 +38,7 @@ class TonglanceDataConverter:
     # ==================== 上交所合并委托+成交 (mdl_4_24_0) ====================
 
     def convert_sh_order_deal(
-        self, raw_data: Dict, trading_day: datetime
+        self, raw_data, trading_day: datetime
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         转换上交所合并委托+成交数据（mdl_4_24_0 格式）。
@@ -47,17 +47,15 @@ class TonglanceDataConverter:
             "D" = 撤单委托 (OrderType=5)
             "T" = 成交
 
-        列映射（与存量 Go data-converter 一致）：
-            SecurityID → Code, TickTime → Time, LocalTime → UpdateTime,
-            BuyOrderNO / SellOrderNO → OrderID（委托）或 BuyOrderID / SaleOrderID（成交）,
-            TickBSFlag → Side (B→0, S→1; 成交还支持 N→10),
-            Price → Price, Qty → Volume, ChannelNo → Channel, BizIndex → SeqNum
+        Args:
+            raw_data: dict 或 DataFrame
+            trading_day: 交易日
 
         Returns:
             (order_df, deal_df) 元组
         """
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return (
                     pd.DataFrame(columns=ORDER_COLUMNS),
@@ -121,19 +119,16 @@ class TonglanceDataConverter:
 
     # ==================== 委托数据转换 ====================
 
-    def convert_sh_order(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
+    def convert_sh_order(self, raw_data, trading_day: datetime) -> pd.DataFrame:
         """
         转换上交所逐笔委托
 
         Args:
-            raw_data: 通联原始数据
+            raw_data: dict 或 DataFrame
             trading_day: 交易日
-
-        Returns:
-            标准格式的委托DataFrame
         """
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=ORDER_COLUMNS)
 
@@ -179,12 +174,10 @@ class TonglanceDataConverter:
             logger.error(f"转换上交所委托数据失败: {e}")
             return pd.DataFrame(columns=ORDER_COLUMNS)
 
-    def convert_sz_order(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
-        """
-        转换深交所逐笔委托
-        """
+    def convert_sz_order(self, raw_data, trading_day: datetime) -> pd.DataFrame:
+        """转换深交所逐笔委托"""
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=ORDER_COLUMNS)
 
@@ -240,12 +233,10 @@ class TonglanceDataConverter:
 
     # ==================== 成交数据转换 ====================
 
-    def convert_sh_deal(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
-        """
-        转换上交所逐笔成交
-        """
+    def convert_sh_deal(self, raw_data, trading_day: datetime) -> pd.DataFrame:
+        """转换上交所逐笔成交"""
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=DEAL_COLUMNS)
 
@@ -290,12 +281,10 @@ class TonglanceDataConverter:
             logger.error(f"转换上交所成交数据失败: {e}")
             return pd.DataFrame(columns=DEAL_COLUMNS)
 
-    def convert_sz_deal(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
-        """
-        转换深交所逐笔成交
-        """
+    def convert_sz_deal(self, raw_data, trading_day: datetime) -> pd.DataFrame:
+        """转换深交所逐笔成交"""
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=DEAL_COLUMNS)
 
@@ -347,16 +336,14 @@ class TonglanceDataConverter:
 
     def convert_sh_tick(
         self,
-        raw_data: Dict,
+        raw_data,
         trading_day: datetime,
         high_limit: float = 0.0,
         low_limit: float = 0.0
     ) -> pd.DataFrame:
-        """
-        转换上交所Tick快照
-        """
+        """转换上交所Tick快照"""
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=TICK_COLUMNS)
 
@@ -433,12 +420,10 @@ class TonglanceDataConverter:
             logger.error(f"转换上交所Tick数据失败: {e}")
             return pd.DataFrame(columns=TICK_COLUMNS)
 
-    def convert_sz_tick(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
-        """
-        转换深交所Tick快照
-        """
+    def convert_sz_tick(self, raw_data, trading_day: datetime) -> pd.DataFrame:
+        """转换深交所Tick快照"""
         try:
-            df = pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=TICK_COLUMNS)
 
@@ -519,26 +504,17 @@ class TonglanceDataConverter:
 
     # ==================== 通用转换 ====================
 
-    def convert_order(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
-        """
-        自动判断市场并转换委托数据
-
-        Args:
-            raw_data: 原始数据（需包含Code字段）
-            trading_day: 交易日
-
-        Returns:
-            标准格式DataFrame
-        """
-        code = raw_data.get("Code", raw_data.get("SecurityID", ""))
+    def convert_order(self, raw_data, trading_day: datetime) -> pd.DataFrame:
+        """自动判断市场并转换委托数据"""
+        code = self._get_first_code(raw_data)
         if self._is_sh_stock(str(code)):
             return self.convert_sh_order(raw_data, trading_day)
         else:
             return self.convert_sz_order(raw_data, trading_day)
 
-    def convert_deal(self, raw_data: Dict, trading_day: datetime) -> pd.DataFrame:
+    def convert_deal(self, raw_data, trading_day: datetime) -> pd.DataFrame:
         """自动判断市场并转换成交数据"""
-        code = raw_data.get("Code", raw_data.get("SecurityID", ""))
+        code = self._get_first_code(raw_data)
         if self._is_sh_stock(str(code)):
             return self.convert_sh_deal(raw_data, trading_day)
         else:
@@ -546,13 +522,13 @@ class TonglanceDataConverter:
 
     def convert_tick(
         self,
-        raw_data: Dict,
+        raw_data,
         trading_day: datetime,
         high_limit: float = 0.0,
         low_limit: float = 0.0
     ) -> pd.DataFrame:
         """自动判断市场并转换Tick数据"""
-        code = raw_data.get("Code", raw_data.get("SecurityID", ""))
+        code = self._get_first_code(raw_data)
         if self._is_sh_stock(str(code)):
             return self.convert_sh_tick(raw_data, trading_day, high_limit, low_limit)
         else:
@@ -604,6 +580,15 @@ class TonglanceDataConverter:
         """判断是否为上海股票"""
         code = code.replace(".XSHG", "").replace(".XSHE", "")
         return code.startswith(("6", "9", "68"))
+
+    def _get_first_code(self, raw_data) -> str:
+        """从 dict 或 DataFrame 中提取第一个股票代码。"""
+        if isinstance(raw_data, pd.DataFrame):
+            for col in ("Code", "SecurityID"):
+                if col in raw_data.columns and not raw_data.empty:
+                    return str(raw_data[col].iloc[0])
+            return ""
+        return raw_data.get("Code", raw_data.get("SecurityID", ""))
 
     def validate_data(self, df: pd.DataFrame, data_type: str) -> Tuple[bool, str]:
         """

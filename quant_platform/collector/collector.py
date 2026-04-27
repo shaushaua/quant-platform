@@ -57,6 +57,9 @@ DELETE_SOURCE_AFTER_DAYS = int(os.environ.get("DELETE_SOURCE_AFTER_DAYS", "1"))
 # 10ms：数据来了就处理，不等多余的 inotify 事件合并
 DEBOUNCE_MS = int(os.environ.get("COLLECTOR_DEBOUNCE_MS", "10"))
 
+# 落盘队列最大长度，防止积压导致 OOM
+MAX_DISK_QUEUE_SIZE = int(os.environ.get("COLLECTOR_MAX_DISK_QUEUE", "50"))
+
 Market = str   # "SH" | "SZ"
 DataType = str  # "order" | "deal" | "tick" | "order_deal"
 
@@ -381,53 +384,65 @@ class Collector:
         """将原始 DataFrame 转换后写入 ShmStore（实时），落盘 parquet 异步执行。"""
         try:
             trading_day_dt = pd.Timestamp(self._trading_day)
-            raw_dict = raw_df.to_dict("list")
 
             if data_type == "order_deal":
                 # 上交所合并委托+成交：按 Type 字段拆分
-                order_df, deal_df = self._converter.convert_sh_order_deal(raw_dict, trading_day_dt)
+                order_df, deal_df = self._converter.convert_sh_order_deal(raw_df, trading_day_dt)
+                del raw_df  # 立即释放原始数据
                 if not order_df.empty:
                     for code, sub in order_df.groupby("Code"):
                         self._store.update_order(code, sub)
                     with self._disk_queue_lock:
-                        self._disk_queue.append(("order", order_df))
+                        if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
+                            self._disk_queue.append(("order", order_df))
                 if not deal_df.empty:
                     for code, sub in deal_df.groupby("Code"):
                         self._store.update_deal(code, sub)
                     with self._disk_queue_lock:
-                        self._disk_queue.append(("deal", deal_df))
+                        if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
+                            self._disk_queue.append(("deal", deal_df))
 
             elif data_type == "order":
                 if market == "SZ":
-                    df = self._converter.convert_sz_order(raw_dict, trading_day_dt)
+                    df = self._converter.convert_sz_order(raw_df, trading_day_dt)
                 else:
-                    df = self._converter.convert_sh_order(raw_dict, trading_day_dt)
+                    df = self._converter.convert_sh_order(raw_df, trading_day_dt)
+                del raw_df
                 for code, sub in df.groupby("Code"):
                     self._store.update_order(code, sub)
                 with self._disk_queue_lock:
-                    self._disk_queue.append(("order", df))
+                    if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
+                        self._disk_queue.append(("order", df))
 
             elif data_type == "deal":
                 if market == "SZ":
-                    df = self._converter.convert_sz_deal(raw_dict, trading_day_dt)
+                    df = self._converter.convert_sz_deal(raw_df, trading_day_dt)
                 else:
-                    df = self._converter.convert_sh_deal(raw_dict, trading_day_dt)
+                    df = self._converter.convert_sh_deal(raw_df, trading_day_dt)
+                del raw_df
                 for code, sub in df.groupby("Code"):
                     self._store.update_deal(code, sub)
                 with self._disk_queue_lock:
-                    self._disk_queue.append(("deal", df))
+                    if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
+                        self._disk_queue.append(("deal", df))
 
             elif data_type == "tick":
                 if market == "SZ":
-                    df = self._converter.convert_sz_tick(raw_dict, trading_day_dt)
+                    df = self._converter.convert_sz_tick(raw_df, trading_day_dt)
                 else:
-                    df = self._converter.convert_sh_tick(raw_dict, trading_day_dt)
+                    df = self._converter.convert_sh_tick(raw_df, trading_day_dt)
+                del raw_df
                 for code, sub in df.groupby("Code"):
                     self._store.update_tick(code, sub)
                 with self._disk_queue_lock:
-                    self._disk_queue.append(("tick", df))
+                    if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
+                        self._disk_queue.append(("tick", df))
 
-            logger.info("[%s][%s] %s 处理 +%d 行", market, data_type, path.name, len(raw_df))
+            else:
+                del raw_df
+                return
+
+            logger.info("[%s][%s] %s 处理完成", market, data_type, path.name)
 
         except Exception as e:
             logger.warning("处理 %s 失败: %s", path.name, e, exc_info=True)
@@ -656,8 +671,8 @@ class Collector:
                 del df
 
             loop_count += 1
-            # 每 100 轮做一次 gc，平衡延迟和内存
-            if loop_count % 100 == 0:
+            # 每 10 轮做一次 gc，及时回收临时 DataFrame
+            if loop_count % 10 == 0:
                 gc.collect()
 
             # 每小时清理一次旧文件
@@ -671,6 +686,8 @@ class Collector:
                 self._stop_event.wait(0.01)  # 10ms
 
         self._watcher.stop()
+        # 停止前刷写缓冲
+        self._store.flush()
         logger.info("[Collector] 已停止")
 
     def start(self):

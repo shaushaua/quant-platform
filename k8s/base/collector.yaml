@@ -69,10 +69,10 @@ spec:
           resources:
             requests:
               cpu: "1"
-              memory: 4Gi
+              memory: 2Gi
             limits:
               cpu: "2"
-              memory: 8Gi
+              memory: 4Gi
       volumes:
         - name: mdl-data
           hostPath:
