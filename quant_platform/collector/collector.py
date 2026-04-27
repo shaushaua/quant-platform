@@ -675,8 +675,8 @@ class Collector:
                 self._store.flush_dirty()
 
             loop_count += 1
-            # 每 10 轮做一次 gc，及时回收临时 DataFrame
-            if loop_count % 10 == 0:
+            # 每 50 轮做一次 gc（~500ms 间隔），平衡延迟和内存
+            if loop_count % 50 == 0:
                 gc.collect()
 
             # 每小时清理一次旧文件

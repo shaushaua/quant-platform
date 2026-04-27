@@ -128,7 +128,7 @@ class TonglanceDataConverter:
             trading_day: 交易日
         """
         try:
-            df = raw_data.copy() if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=ORDER_COLUMNS)
 
@@ -177,7 +177,7 @@ class TonglanceDataConverter:
     def convert_sz_order(self, raw_data, trading_day: datetime) -> pd.DataFrame:
         """转换深交所逐笔委托"""
         try:
-            df = raw_data.copy() if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=ORDER_COLUMNS)
 
@@ -236,7 +236,7 @@ class TonglanceDataConverter:
     def convert_sh_deal(self, raw_data, trading_day: datetime) -> pd.DataFrame:
         """转换上交所逐笔成交"""
         try:
-            df = raw_data.copy() if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=DEAL_COLUMNS)
 
@@ -284,7 +284,7 @@ class TonglanceDataConverter:
     def convert_sz_deal(self, raw_data, trading_day: datetime) -> pd.DataFrame:
         """转换深交所逐笔成交"""
         try:
-            df = raw_data.copy() if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=DEAL_COLUMNS)
 
@@ -343,7 +343,7 @@ class TonglanceDataConverter:
     ) -> pd.DataFrame:
         """转换上交所Tick快照"""
         try:
-            df = raw_data.copy() if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=TICK_COLUMNS)
 
@@ -423,7 +423,7 @@ class TonglanceDataConverter:
     def convert_sz_tick(self, raw_data, trading_day: datetime) -> pd.DataFrame:
         """转换深交所Tick快照"""
         try:
-            df = raw_data.copy() if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
+            df = raw_data if isinstance(raw_data, pd.DataFrame) else pd.DataFrame(raw_data)
             if df.empty:
                 return pd.DataFrame(columns=TICK_COLUMNS)
 

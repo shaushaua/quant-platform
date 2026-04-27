@@ -6,19 +6,19 @@ collector 容器写入 /dev/shm/store/*.arrow
 live-engine 容器 mmap 零拷贝读取
 两个容器通过 hostPath volume 共享同一目录
 
-写入策略：内存缓冲累积 + 每次 batch 后立即刷写脏股票
+写入策略（写回缓存）：
 - update_* 做内存 concat（微秒级），标记脏股票
-- flush_dirty() 将脏股票写入 arrow 文件（/dev/shm 写入 ~0.1ms/股票）
-- 写入 /dev/shm 是内存拷贝，不涉及磁盘 I/O，延迟极低
+- flush_dirty() 先拷贝脏数据，释放锁，再异步写 arrow 文件，写完清缓冲
+- 缓冲只保留自上次 flush 以来的增量数据，内存有界
+- 下次 update 同一只股票时从 arrow 文件读取历史累积
 """
 
 import gc
 import logging
 import os
 import threading
-import time
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -28,23 +28,18 @@ logger = logging.getLogger(__name__)
 
 SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
 
-# order/deal 每只股票最多保留行数，防止数据撑爆共享内存
+# order/deal 每只股票最多保留行数
 MAX_ROWS_PER_SYMBOL = int(os.environ.get("SHM_MAX_ROWS_PER_SYMBOL", "10000"))
-
-# 三类缓冲（tick+order+deal）的总行数上限
-# 5000 只 × 6000 行 × ~100 bytes ≈ 3GB，4Gi 容器下安全
-MAX_TOTAL_BUFFER_ROWS = int(os.environ.get("SHM_MAX_TOTAL_ROWS", "30000000"))
 
 
 class ShmStore:
     """
     Arrow IPC 共享内存存储。
 
-    写入策略（低延迟）：
-    - update_* 做内存 concat（微秒级），标记脏股票
-    - flush_dirty() 由 collector 在每个 chunk 处理完后调用
-    - 只写脏股票（增量刷写），不是全量刷写
-    - /dev/shm 是 RAM disk，写入延迟 ~0.1ms/股票
+    写入策略（写回缓存，低延迟 + 低内存）：
+    - update_* 在内存中累积（微秒级）
+    - flush_dirty() 拷贝脏数据后释放锁，写完清缓冲
+    - 缓冲只保留增量，内存有界（~500 只股票 / 批次）
     """
 
     def __init__(self):
@@ -59,18 +54,17 @@ class ShmStore:
             d.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
-        # 内存缓冲：code -> DataFrame（累积最近 max_rows 行）
+        # 内存缓冲：code -> DataFrame（仅保留自上次 flush 以来的增量）
         self._tick_buffer: Dict[str, pd.DataFrame] = {}
         self._order_buffer: Dict[str, pd.DataFrame] = {}
         self._deal_buffer: Dict[str, pd.DataFrame] = {}
 
-        # 脏集：记录自上次 flush_dirty 以来哪些股票被更新
+        # 脏集
         self._dirty_tick: Set[str] = set()
         self._dirty_order: Set[str] = set()
         self._dirty_deal: Set[str] = set()
 
         self._flush_count = 0
-        self._total_buffer_rows = 0  # 跟踪三类缓冲总行数
 
     # ------------------------------------------------------------------ #
     # 内部读写                                                              #
@@ -78,11 +72,11 @@ class ShmStore:
 
     def _write_arrow(self, path: Path, df: pd.DataFrame) -> None:
         """将 DataFrame 原子写为 Arrow IPC 文件。"""
-        table = pa.Table.from_pandas(df, preserve_index=True)
+        table = pa.Table.from_pandas(df, preserve_index=False)
         tmp = path.with_suffix(".tmp")
         with ipc.new_file(str(tmp), table.schema) as writer:
             writer.write_table(table)
-        tmp.replace(path)  # 原子替换
+        tmp.replace(path)
 
     def _read_arrow(self, path: Path) -> Optional[pd.DataFrame]:
         """mmap 零拷贝读取 Arrow IPC 文件。"""
@@ -101,32 +95,47 @@ class ShmStore:
 
     def _buffer_update(
         self, buffer: Dict[str, pd.DataFrame], dirty: Set[str],
-        code: str, df: pd.DataFrame
+        code: str, df: pd.DataFrame, subdir: str
     ) -> None:
-        """将新数据累积到内存缓冲，标记脏（调用者需持有 _lock）。"""
-        incoming_rows = len(df)
-        old_rows = len(buffer.get(code, []))
-
+        """
+        将新数据累积到内存缓冲（调用者需持有 _lock）。
+        如果缓冲中没有该股票，从 arrow 文件读取历史数据累积。
+        """
         if code in buffer:
+            # 缓冲命中：直接内存 concat（微秒级）
             old = buffer[code]
-            new_total = old_rows + incoming_rows
-            if new_total > MAX_ROWS_PER_SYMBOL:
-                # 超限：只保留最新 max_rows 行
-                merged = pd.concat([old, df.iloc[-(MAX_ROWS_PER_SYMBOL):]], ignore_index=True)
-                merged = merged.iloc[-MAX_ROWS_PER_SYMBOL:]
-                self._total_buffer_rows += MAX_ROWS_PER_SYMBOL - old_rows
+            new_rows = len(df)
+            total = len(old) + new_rows
+            if total > MAX_ROWS_PER_SYMBOL:
+                # 超限：只保留最新行
+                keep = MAX_ROWS_PER_SYMBOL - new_rows
+                if keep > 0:
+                    merged = pd.concat([old.iloc[-keep:], df], ignore_index=True)
+                else:
+                    merged = df.iloc[-MAX_ROWS_PER_SYMBOL:].copy()
+                del old
             else:
                 merged = pd.concat([old, df], ignore_index=True)
-                self._total_buffer_rows += incoming_rows
-            del old
+                del old
             buffer[code] = merged
         else:
-            if incoming_rows > MAX_ROWS_PER_SYMBOL:
-                buffer[code] = df.iloc[-MAX_ROWS_PER_SYMBOL:].copy()
-                self._total_buffer_rows += MAX_ROWS_PER_SYMBOL
+            # 缓冲未命中：从 arrow 文件读取历史，再 concat
+            path = SHM_BASE / subdir / f"{code}.arrow"
+            existing = self._read_arrow(path)
+            if existing is not None and not existing.empty:
+                total = len(existing) + len(df)
+                if total > MAX_ROWS_PER_SYMBOL:
+                    keep = MAX_ROWS_PER_SYMBOL - len(df)
+                    if keep > 0:
+                        merged = pd.concat([existing.iloc[-keep:], df], ignore_index=True)
+                    else:
+                        merged = df.iloc[-MAX_ROWS_PER_SYMBOL:].copy()
+                else:
+                    merged = pd.concat([existing, df], ignore_index=True)
+                del existing
+                buffer[code] = merged
             else:
-                buffer[code] = df
-                self._total_buffer_rows += incoming_rows
+                buffer[code] = df if len(df) <= MAX_ROWS_PER_SYMBOL else df.iloc[-MAX_ROWS_PER_SYMBOL:].copy()
         dirty.add(code)
 
     # ------------------------------------------------------------------ #
@@ -135,15 +144,15 @@ class ShmStore:
 
     def update_tick(self, code: str, df: pd.DataFrame) -> None:
         with self._lock:
-            self._buffer_update(self._tick_buffer, self._dirty_tick, code, df)
+            self._buffer_update(self._tick_buffer, self._dirty_tick, code, df, "tick")
 
     def update_order(self, code: str, df: pd.DataFrame) -> None:
         with self._lock:
-            self._buffer_update(self._order_buffer, self._dirty_order, code, df)
+            self._buffer_update(self._order_buffer, self._dirty_order, code, df, "order")
 
     def update_deal(self, code: str, df: pd.DataFrame) -> None:
         with self._lock:
-            self._buffer_update(self._deal_buffer, self._dirty_deal, code, df)
+            self._buffer_update(self._deal_buffer, self._dirty_deal, code, df, "deal")
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         with self._lock:
@@ -163,12 +172,13 @@ class ShmStore:
 
     def flush_dirty(self) -> None:
         """
-        将脏股票的缓冲刷写到 arrow 文件。
-        由 collector 在每个 chunk 处理完后调用。
-        /dev/shm 是 RAM disk，写入延迟 ~0.1ms/股票。
+        刷写脏股票到 arrow 文件。
+        关键：先拷贝脏数据，释放锁，再写文件（不阻塞 update）。
+        写完后清空缓冲，下次 update 从 arrow 文件读历史。
         """
+        # 1. 快速拷贝脏数据，释放锁
         with self._lock:
-            total = 0
+            to_flush: List[Tuple[str, str, pd.DataFrame]] = []
             for dirty, buffer, subdir in [
                 (self._dirty_tick, self._tick_buffer, "tick"),
                 (self._dirty_order, self._order_buffer, "order"),
@@ -176,45 +186,54 @@ class ShmStore:
             ]:
                 for code in dirty:
                     if code in buffer:
-                        self._write_arrow(
-                            SHM_BASE / subdir / f"{code}.arrow", buffer[code]
-                        )
-                        total += 1
+                        to_flush.append((subdir, code, buffer[code]))
                 dirty.clear()
+            # 清空缓冲（arrow 文件将是数据的唯一来源）
+            self._tick_buffer.clear()
+            self._order_buffer.clear()
+            self._deal_buffer.clear()
 
-            if total > 0:
-                self._flush_count += 1
-                # 总缓冲超限时强制 gc + 日志告警
-                if self._total_buffer_rows > MAX_TOTAL_BUFFER_ROWS:
-                    gc.collect()
-                    logger.warning(
-                        "[ShmStore] 缓冲总行数 %d 超过上限 %d，已 gc",
-                        self._total_buffer_rows, MAX_TOTAL_BUFFER_ROWS,
-                    )
-                elif self._flush_count % 100 == 0:
-                    gc.collect()
-                    logger.info(
-                        "[ShmStore] 第 %d 次刷写: %d 只股票, 缓冲总行数 %d",
-                        self._flush_count, total, self._total_buffer_rows,
-                    )
+        if not to_flush:
+            return
+
+        # 2. 释放锁后写 arrow 文件（不阻塞 update）
+        for subdir, code, df in to_flush:
+            try:
+                self._write_arrow(SHM_BASE / subdir / f"{code}.arrow", df)
+            except Exception as e:
+                logger.warning("[ShmStore] 写 %s/%s 失败: %s", subdir, code, e)
+
+        # 3. 清理
+        self._flush_count += 1
+        if self._flush_count % 100 == 0:
+            gc.collect()
+            logger.info("[ShmStore] 第 %d 次刷写: %d 只股票", self._flush_count, len(to_flush))
 
     def flush(self) -> None:
-        """强制刷写所有缓冲到磁盘（停机前调用）。"""
+        """强制刷写所有缓冲（停机前调用）。"""
         with self._lock:
-            total = 0
+            to_flush: List[Tuple[str, str, pd.DataFrame]] = []
             for buffer, subdir in [
                 (self._tick_buffer, "tick"),
                 (self._order_buffer, "order"),
                 (self._deal_buffer, "deal"),
             ]:
                 for code, df in buffer.items():
-                    self._write_arrow(SHM_BASE / subdir / f"{code}.arrow", df)
-                    total += 1
+                    to_flush.append((subdir, code, df))
+            self._tick_buffer.clear()
+            self._order_buffer.clear()
+            self._deal_buffer.clear()
             self._dirty_tick.clear()
             self._dirty_order.clear()
             self._dirty_deal.clear()
-            gc.collect()
-            logger.info("[ShmStore] 全量刷写: %d 只股票", total)
+
+        for subdir, code, df in to_flush:
+            try:
+                self._write_arrow(SHM_BASE / subdir / f"{code}.arrow", df)
+            except Exception as e:
+                logger.warning("[ShmStore] 写 %s/%s 失败: %s", subdir, code, e)
+        gc.collect()
+        logger.info("[ShmStore] 全量刷写: %d 只股票", len(to_flush))
 
     # ------------------------------------------------------------------ #
     # 读接口（live_engine / DataAPI 调用）                                   #
@@ -225,8 +244,7 @@ class ShmStore:
             df = self._read_arrow(SHM_BASE / "tick" / f"{code}.arrow")
             if df is not None:
                 return df
-            with self._lock:
-                return self._tick_buffer.get(code, pd.DataFrame()).copy()
+            return pd.DataFrame()
         return self._concat_dir(SHM_BASE / "tick")
 
     def get_order(self, code: Optional[str] = None) -> pd.DataFrame:
@@ -234,8 +252,7 @@ class ShmStore:
             df = self._read_arrow(SHM_BASE / "order" / f"{code}.arrow")
             if df is not None:
                 return df
-            with self._lock:
-                return self._order_buffer.get(code, pd.DataFrame()).copy()
+            return pd.DataFrame()
         return self._concat_dir(SHM_BASE / "order")
 
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
@@ -243,8 +260,7 @@ class ShmStore:
             df = self._read_arrow(SHM_BASE / "deal" / f"{code}.arrow")
             if df is not None:
                 return df
-            with self._lock:
-                return self._deal_buffer.get(code, pd.DataFrame()).copy()
+            return pd.DataFrame()
         return self._concat_dir(SHM_BASE / "deal")
 
     def get_kline(self, period: str) -> pd.DataFrame:
@@ -289,7 +305,7 @@ class ShmStore:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def clear_day(self) -> None:
-        """每日收市后清空共享内存（collector 调用）。"""
+        """每日收市后清空共享内存。"""
         import shutil
         with self._lock:
             self._tick_buffer.clear()
