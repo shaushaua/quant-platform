@@ -36,6 +36,12 @@ class StockData:
     由引擎在每次调用 factor_calculation / compute() 前填充。
 
     支持字典式访问：data["l2_order"]，也支持属性访问：data.l2_order。
+
+    历史窗口模式：
+        当 factor_info 设置 lookback_days > 0 时，l2_order_hist/l2_deal_hist/l1_tick_hist
+        包含历史 N 天的数据列表，列表索引 0 为最早日期，索引 -1 为当天。
+        例如 lookback_days=5，计算 20250110：
+            l2_deal_hist = [df_20250106, df_20250107, df_20250108, df_20250109, df_20250110]
     """
     code: str
     date: str
@@ -51,6 +57,12 @@ class StockData:
     market: pd.DataFrame = field(default_factory=pd.DataFrame)
     # 当日日频基础数据（daily_basic：close / turnover / volume 等）
     daily_basic: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # 历史窗口列表（当 lookback_days > 0 时启用）
+    # 每个字段都是 list[pd.DataFrame]，按日期升序排列
+    l2_order_hist: list = field(default_factory=list)
+    l2_deal_hist: list = field(default_factory=list)
+    l1_tick_hist: list = field(default_factory=list)
 
     def __getitem__(self, key: str) -> pd.DataFrame:
         """

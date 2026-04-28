@@ -600,6 +600,124 @@ class DataAPI:
         """检查实时数据是否可用"""
         return self.mode == "realtime" and self._memory is not None
 
+    def load_factor_result(
+        self,
+        oss_path: str,
+        format: str = "parquet",
+    ) -> pd.DataFrame:
+        """
+        从 OSS 路径加载因子计算结果。
+
+        Args:
+            oss_path: OSS 文件路径，如：
+                     - "factor_results/alpha101/20250106.parquet"
+                     - "factor_results/momentum_5d/20250106_20250110.parquet"
+            format: 文件格式，支持 "parquet"（默认）、"csv"
+
+        Returns:
+            pd.DataFrame: 因子结果数据
+
+        Example:
+            >>> api = DataAPI()
+            >>> # 加载单日因子结果
+            >>> df = api.load_factor_result("factor_results/alpha101/20250106.parquet")
+            >>> # 加载多日因子结果
+            >>> df = api.load_factor_result("output/momentum_5d.parquet")
+            >>> # 按 code 和 date 筛选
+            >>> df_filtered = df[(df["code"] == "000001.SZ") & (df["date"] >= "20250106")]
+        """
+        import os
+
+        # 解析文件扩展名自动检测格式
+        if oss_path.endswith(".csv"):
+            format = "csv"
+        elif oss_path.endswith(".parquet") or oss_path.endswith(".pq"):
+            format = "parquet"
+
+        # 使用 OSS loader 读取文件
+        try:
+            bucket = os.getenv("OSS_DATA_BUCKET", "quant-mdl-data")
+            local_cache_path = self._oss._get_cache_path(oss_path)
+
+            # 先检查本地缓存
+            if os.path.exists(local_cache_path):
+                logger.info(f"从本地缓存加载因子结果: {local_cache_path}")
+                if format == "csv":
+                    return pd.read_csv(local_cache_path)
+                else:
+                    return pd.read_parquet(local_cache_path)
+
+            # 从 OSS 下载到本地缓存
+            logger.info(f"从 OSS 下载因子结果: {oss_path}")
+            import oss2
+            auth = oss2.Auth(
+                os.getenv("OSS_ACCESS_KEY_ID"),
+                os.getenv("OSS_ACCESS_KEY_SECRET")
+            )
+            endpoint = os.getenv("OSS_ENDPOINT", "https://oss-cn-hangzhou-internal.aliyuncs.com")
+            bucket_obj = oss2.Bucket(auth, endpoint, bucket)
+
+            # 确保缓存目录存在
+            os.makedirs(os.path.dirname(local_cache_path), exist_ok=True)
+
+            # 下载文件
+            bucket_obj.get_object_to_file(oss_path, local_cache_path)
+
+            # 读取数据
+            if format == "csv":
+                df = pd.read_csv(local_cache_path)
+            else:
+                df = pd.read_parquet(local_cache_path)
+
+            logger.info(f"因子结果加载成功: {len(df)} 行 × {len(df.columns)} 列")
+            return df
+
+        except Exception as e:
+            logger.error(f"加载因子结果失败 {oss_path}: {e}")
+            return pd.DataFrame()
+
+    def list_factor_results(
+        self,
+        oss_prefix: str = "factor_results/",
+    ) -> List[str]:
+        """
+        列出 OSS 上的因子结果文件。
+
+        Args:
+            oss_prefix: OSS 前缀路径，如 "factor_results/alpha101/"
+
+        Returns:
+            List[str]: 文件路径列表
+
+        Example:
+            >>> api = DataAPI()
+            >>> files = api.list_factor_results("factor_results/alpha101/")
+            >>> for f in files:
+            ...     print(f)
+        """
+        import os
+        import oss2
+
+        try:
+            bucket = os.getenv("OSS_DATA_BUCKET", "quant-mdl-data")
+            auth = oss2.Auth(
+                os.getenv("OSS_ACCESS_KEY_ID"),
+                os.getenv("OSS_ACCESS_KEY_SECRET")
+            )
+            endpoint = os.getenv("OSS_ENDPOINT", "https://oss-cn-hangzhou-internal.aliyuncs.com")
+            bucket_obj = oss2.Bucket(auth, endpoint, bucket)
+
+            files = []
+            for obj in oss2.ObjectIterator(bucket_obj, prefix=oss_prefix):
+                if not obj.key.endswith("/"):  # 跳过目录
+                    files.append(obj.key)
+
+            return sorted(files)
+
+        except Exception as e:
+            logger.error(f"列出因子结果失败 {oss_prefix}: {e}")
+            return []
+
 
 # 便捷创建函数
 def create_realtime_api(oss_base_path: Optional[str] = None) -> DataAPI:

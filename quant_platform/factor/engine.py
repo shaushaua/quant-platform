@@ -166,7 +166,30 @@ def calc_factors_by_date_range(
 
                     for code in batch_codes:
                         try:
-                            stock_data = _build_stock_data(bundle, code, date, end_time)
+                            # 检查是否需要历史窗口
+                            hist_bundles = None
+                            lookback_days = factor_info.get("lookback_days")
+                            if lookback_days:
+                                # lookback_days 支持两种格式：
+                                # - 整数：如 5，自动转换为 [0, 1, 2, 3, 4]（当天 + 前4天）
+                                # - 列表：如 [0, 1, 5]，精确指定哪些天
+                                day_offsets = None
+                                if isinstance(lookback_days, int):
+                                    day_offsets = list(range(0, lookback_days))
+                                elif isinstance(lookback_days, list):
+                                    day_offsets = lookback_days
+
+                                if day_offsets:
+                                    # 先从当天的 market 获取 security_id
+                                    id_qi = code.split(".")[0].zfill(6)
+                                    security_id = None
+                                    if not bundle.market.empty:
+                                        rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
+                                        if not rows.empty and "SECURITY_ID" in bundle.market.columns:
+                                            security_id = int(rows.iloc[0]["SECURITY_ID"])
+                                    hist_bundles = _load_history_bundle_by_offsets(date, day_offsets, factor_info, api, code, security_id)
+
+                            stock_data = _build_stock_data(bundle, code, date, end_time, factor_info, api, hist_bundles)
                             if _calc_fn is not None:
                                 res = _calc_fn(stock_data, code, date, end_time)
                                 if res is not None:
@@ -195,7 +218,30 @@ def calc_factors_by_date_range(
 
                 for code in _securities:
                     try:
-                        stock_data = _build_stock_data(bundle, code, date, end_time)
+                        # 检查是否需要历史窗口
+                        hist_bundles = None
+                        lookback_days = factor_info.get("lookback_days")
+                        if lookback_days:
+                            # lookback_days 支持两种格式：
+                            # - 整数：如 5，自动转换为 [0, 1, 2, 3, 4]（当天 + 前4天）
+                            # - 列表：如 [0, 1, 5]，精确指定哪些天
+                            day_offsets = None
+                            if isinstance(lookback_days, int):
+                                day_offsets = list(range(0, lookback_days))
+                            elif isinstance(lookback_days, list):
+                                day_offsets = lookback_days
+
+                            if day_offsets:
+                                # 先从当天的 market 获取 security_id
+                                id_qi = code.split(".")[0].zfill(6)
+                                security_id = None
+                                if not bundle.market.empty:
+                                    rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
+                                    if not rows.empty and "SECURITY_ID" in bundle.market.columns:
+                                        security_id = int(rows.iloc[0]["SECURITY_ID"])
+                                hist_bundles = _load_history_bundle_by_offsets(date, day_offsets, factor_info, api, code, security_id)
+
+                        stock_data = _build_stock_data(bundle, code, date, end_time, factor_info, api, hist_bundles)
                         if _calc_fn is not None:
                             res = _calc_fn(stock_data, code, date, end_time)
                             if res is not None:
@@ -357,17 +403,111 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     return df
 
 
+def _load_history_bundle_by_offsets(
+    target_date: str,
+    day_offsets: List[int],
+    factor_info: Dict,
+    api: DataAPI,
+    code: str,
+    security_id: Optional[int],
+) -> List[_DayBundle]:
+    """
+    根据日期偏移列表加载历史数据包。
+
+    Args:
+        target_date: 目标日期（如 "20250110"）
+        day_offsets: 日期偏移列表，[0]=当天, [1]=1天前, [2]=2天前
+                     例如 [0, 1, 2] 表示加载当天、1天前、2天前
+        factor_info: 数据需求配置
+        api: DataAPI 实例
+        code: 股票代码（如 "000001.SZ"）
+        security_id: SECURITY_ID 整数
+
+    Returns:
+        List[_DayBundle]，按 day_offsets 顺序排列
+        例如 day_offsets=[0,1], target_date="20250110"，
+        返回 [bundle_20250110, bundle_20250109]
+    """
+    if not day_offsets:
+        return []
+
+    bundles = []
+    # 计算需要加载的最大偏移量，用于获取交易日列表
+    max_offset = max(day_offsets) if day_offsets else 0
+
+    try:
+        # 获取足够大的交易日范围
+        start_date = _shift_date_str(target_date, -max_offset - 10)
+        all_trading_days = api.get_trading_days(start_date, target_date)
+    except Exception:
+        # 回退到简单的日期递推
+        all_trading_days = []
+        d = _shift_date_str(target_date, -max_offset - 10)
+        while d <= target_date:
+            all_trading_days.append(d)
+            d = _shift_date_str(d, 1)
+
+    # 找到目标日期在交易日列表中的索引
+    try:
+        target_idx = all_trading_days.index(target_date)
+    except ValueError:
+        target_idx = len(all_trading_days) - 1
+
+    # 根据 day_offsets 加载对应日期的数据
+    for offset in day_offsets:
+        if offset < 0:
+            continue
+        hist_idx = target_idx - offset
+        if 0 <= hist_idx < len(all_trading_days):
+            hist_date = all_trading_days[hist_idx]
+
+            def _safe_load(data_type: str) -> pd.DataFrame:
+                try:
+                    df = api.get_daily_data(hist_date, data_type, codes=[code])
+                    return df
+                except Exception as e:
+                    logger.debug("加载历史 %s %s %s 失败: %s", hist_date, code, data_type, e)
+                    return pd.DataFrame()
+
+            l2_order = _safe_load("order") if factor_info.get("need_l2_order") else pd.DataFrame()
+            l2_deal = _safe_load("deal") if factor_info.get("need_l2_deal") else pd.DataFrame()
+            l1_tick = _safe_load("tick") if factor_info.get("need_l1_tick") else pd.DataFrame()
+            market = _safe_load("daily_basic")
+
+            bundles.append(_DayBundle(
+                date=hist_date,
+                l2_order=l2_order,
+                l2_deal=l2_deal,
+                l1_tick=l1_tick,
+                market=market,
+            ))
+
+    return bundles
+
+
 def _build_stock_data(
     bundle: _DayBundle,
     code: str,
     date: str,
     end_time: str,
+    factor_info: Optional[Dict] = None,
+    api: Optional[DataAPI] = None,
+    hist_bundles: Optional[List[_DayBundle]] = None,
 ) -> StockData:
     """
     从全市场数据包中过滤出单只股票的数据，组装成 StockData。
     过滤列优先尝试 "Code"，其次 "stock_code"。
     大文件（tick/order/deal）的 Code 列是 SECURITY_ID 整数，
     需从 market(daily_basic) 的 ID_QI/SECURITY_ID 映射转换。
+
+    Args:
+        bundle: 当日数据包
+        code: 股票代码
+        date: 日期
+        end_time: 时间切片
+        factor_info: 数据需求配置（用于历史窗口）
+        api: DataAPI 实例（用于历史窗口）
+        hist_bundles: 历史数据包列表（用于历史窗口）
     """
     # 从 market 数据推导 security_id（整数）
     id_qi = code.split(".")[0].zfill(6)  # "000001.SZ" -> "000001"
@@ -415,6 +555,24 @@ def _build_stock_data(
             f"{price_sample:.2f}" if price_sample is not None else "N/A",
         )
 
+    # 构建历史列表（如果启用 lookback_days）
+    l2_order_hist = []
+    l2_deal_hist = []
+    l1_tick_hist = []
+
+    if factor_info and factor_info.get("lookback_days", 0) > 0 and hist_bundles:
+        # hist_bundles 已是按日期升序排列的历史数据包
+        for hist_bundle in hist_bundles:
+            l2_order_hist.append(_restore_oss_precision(_filter(hist_bundle.l2_order), code))
+            l2_deal_hist.append(_restore_oss_precision(_filter(hist_bundle.l2_deal), code))
+            l1_tick_hist.append(_restore_oss_precision(_filter(hist_bundle.l1_tick), code))
+
+        logger.debug(
+            "[历史窗口] %s date=%s offsets=%s 历史列表长度: order=%d deal=%d tick=%d",
+            code, date, factor_info.get("lookback_days"),
+            len(l2_order_hist), len(l2_deal_hist), len(l1_tick_hist),
+        )
+
     return StockData(
         code=code,
         date=date,
@@ -424,6 +582,9 @@ def _build_stock_data(
         l1_tick=l1_tick_data,
         market=market_data,
         daily_basic=market_data,  # 别名，与 market 相同
+        l2_order_hist=l2_order_hist,
+        l2_deal_hist=l2_deal_hist,
+        l1_tick_hist=l1_tick_hist,
     )
 
 
@@ -435,6 +596,13 @@ def _merge_results(all_res: list) -> pd.DataFrame:
     if not all_res:
         return pd.DataFrame()
     return pd.DataFrame(all_res)
+
+
+def _shift_date_str(date_str: str, days: int) -> str:
+    """日期字符串偏移，days 可为负数。"""
+    fmt = "%Y%m%d"
+    d = datetime.strptime(date_str, fmt)
+    return (d + timedelta(days=days)).strftime(fmt)
 
 
 def _fallback_trading_days(start_date: str, end_date: str) -> List[str]:

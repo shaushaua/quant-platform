@@ -37,6 +37,9 @@ factor_info = {
     "need_l1_tick": True,    # 需要 L1 tick 快照
     "need_l2_deal": True,    # 需要 L2 逐笔成交
     "need_l2_order": False,  # 不需要 L2 逐笔委托
+    # 可选：历史窗口，支持整数或列表
+    "lookback_days": [0, 1, 2],  # [0]=当天, [1]=1天前, [2]=2天前
+    # "lookback_days": 5,       # 整数形式，自动转换为 [0,1,2,3,4]
 }
 
 # === 2. 股票列表（可选，空列表=全市场） ===
@@ -109,6 +112,65 @@ def outfun(date, end_time, test_df):
 | `data.l2_order` | DataFrame | L2 逐笔委托 | 更大 |
 | `data.market` | DataFrame | 日频基础数据（open/close/volume等） | 1行 |
 | `data.daily_basic` | DataFrame | 同 market | 1行 |
+
+### 历史窗口模式（lookback_days）
+
+当 `factor_info` 中设置 `lookback_days` 时，引擎会额外返回历史数据列表：
+
+**支持两种格式：**
+
+1. **整数形式**：自动转换为连续天数列表
+   ```python
+   "lookback_days": 5  # 相当于 [0, 1, 2, 3, 4]
+   ```
+
+2. **列表形式**：精确指定需要的天数
+   ```python
+   "lookback_days": [0, 1, 5]  # 当天、1天前、5天前
+   ```
+
+**索引对应关系：**
+- `[0]` = 当天
+- `[1]` = 1天前
+- `[2]` = 2天前
+- `[5]` = 5天前
+
+**返回的数据结构：**
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `data.l1_tick_hist` | List[DataFrame] | 历史窗口的 tick 数据列表 |
+| `data.l2_deal_hist` | List[DataFrame] | 历史窗口的 deal 数据列表 |
+| `data.l2_order_hist` | List[DataFrame] | 历史窗口的 order 数据列表 |
+
+**示例：**
+
+```python
+factor_info = {
+    "lookback_days": [0, 1, 2],  # 当天 + 1天前 + 2天前
+}
+
+# 响应：
+data.l2_deal_hist[0]  # 当天的数据
+data.l2_deal_hist[1]  # 1天前的数据
+data.l2_deal_hist[2]  # 2天前的数据
+```
+
+**用法示例：**
+```python
+def factor_calculation(data, code, date, end_time):
+    result = {"code": code, "date": date}
+
+    if data.l2_deal_hist:
+        # 当天成交量
+        today_vol = data.l2_deal_hist[0]["Volume"].sum()
+        # 1天前成交量
+        prev1_vol = data.l2_deal_hist[1]["Volume"].sum()
+        # 变化率
+        result["volume_change"] = (today_vol - prev1_vol) / prev1_vol
+
+    return result
+```
 
 ### 数据已经自动还原
 
@@ -239,9 +301,92 @@ vwap = (deal["Price"] * deal["Volume"]).sum() / deal["Volume"].sum()
 print(f"VWAP: {vwap:.4f}")
 ```
 
+### 方式四：读取已计算的因子结果
+
+```python
+from quant_platform.data.api import DataAPI
+
+api = DataAPI(mode="backtest")
+
+# 列出可用的因子结果文件
+files = api.list_factor_results("factor_results/")
+print(files)
+
+# 读取因子结果
+df = api.load_factor_result("factor_results/alpha101/20250106.parquet")
+print(df.head())
+
+# 按股票和日期筛选
+df_filtered = df[
+    (df["code"] == "000001.SZ") &
+    (df["date"] >= "20250106")
+]
+print(df_filtered)
+```
+
 ---
 
-## 五、完整示例：TAQ 因子策略
+## 五、完整示例：三种数据获取方式
+
+以下策略展示了三种数据获取方式的组合使用：
+
+```python
+"""example_complete_strategy.py"""
+import pandas as pd
+
+factor_info = {
+    # 方式1：基础数据 - 需要 21 天日线计算 20 日动量
+    "market_count": 21,
+    "need_l2_deal": True,
+
+    # 方式2：历史窗口 - 当天 + 前3天的成交数据
+    "lookback_days": [0, 1, 2, 3],  # 0=今天, 1=1天前, 2=2天前, 3=3天前
+
+    # 方式3：自定义参数 - OSS 历史因子路径
+    "prev_factor_path": "factor_results/momentum_20d/",
+}
+
+def factor_calculation(stock_data, code, date, end_time):
+    result = {"code": code, "date": date}
+
+    # === 方式1：使用基础数据 (market/daily_basic) ===
+    market = stock_data.market
+    if not market.empty:
+        closes = market["close"].dropna().values
+        # 计算 20 日动量
+        if len(closes) >= 21:
+            result["momentum_20d"] = float(closes[-1] / closes[-21] - 1)
+
+    # === 方式2：使用历史窗口 (lookback_days) ===
+    if stock_data.l2_deal_hist:
+        # l2_deal_hist[0] = 今天, [1] = 1天前, [2] = 2天前, [3] = 3天前
+        volumes = [df["Volume"].sum() for df in stock_data.l2_deal_hist if not df.empty]
+        if len(volumes) >= 2:
+            today_vol = volumes[0]
+            prev_avg = sum(volumes[1:]) / (len(volumes) - 1)
+            result["volume_ratio"] = today_vol / prev_avg
+
+    # === 方式3：从 OSS 读取历史因子 ===
+    from quant_platform.data.api import DataAPI
+    api = DataAPI(mode="backtest")
+    prev_df = api.load_factor_result("factor_results/alpha101/20250105.parquet")
+    if not prev_df.empty:
+        prev_row = prev_df[prev_df["code"] == code]
+        if not prev_row.empty:
+            result["prev_momentum"] = prev_row.iloc[-1]["momentum_20d"]
+
+    return result
+```
+
+### 运行完整示例
+
+```bash
+python example_complete_strategy.py
+```
+
+---
+
+## 六、完整示例：TAQ 因子策略
 
 以下是一个实际的 TAQ（交易与报价）因子策略，计算 1 分钟和 5 分钟频率的交易/报价统计指标：
 
