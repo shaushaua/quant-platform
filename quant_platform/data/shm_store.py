@@ -6,10 +6,18 @@ collector 容器写入 /dev/shm/store/*.arrow
 live-engine 容器 mmap 零拷贝读取
 两个容器通过 hostPath volume 共享同一目录
 
-写入策略（直接覆盖，零拷贝）：
-- update_* 直接覆盖写入 arrow 文件，不做 concat
-- 无缓冲、无累积、无 flush —— 内存有界，永不 OOM
-- live engine 读取时拿到的是最近一次写入的数据
+存储布局（批量写入，按类型聚合）：
+- tick/latest.arrow    所有股票的最新 tick 快照（~5MB）
+- order/latest.arrow   所有股票的最新委托（~5MB）
+- deal/latest.arrow    所有股票的最新成交（~5MB）
+- quote/{code}.arrow   每只股票最新行情（小额，保留按股票存储）
+- kline/{period}.arrow K线数据
+- daily_basic/daily_basic.arrow  日线基础数据
+
+写入策略：
+- 每次 update 直接覆盖 latest.arrow（不做 groupby 拆分）
+- 写入耗时从 3000×0.2ms=600ms 降到 1×5ms=5ms
+- live_engine 读取后按 code 过滤即可
 """
 
 import logging
@@ -32,10 +40,10 @@ class ShmStore:
     """
     Arrow IPC 共享内存存储。
 
-    写入策略（直接覆盖）：
-    - update_* 直接覆盖 arrow 文件，不做 concat，不缓冲
+    写入策略（批量覆盖）：
+    - tick/order/deal 写入单个 latest.arrow，不做按股票拆分
     - 内存峰值 = 单次写入的 DataFrame 大小
-    - /dev/shm 是 RAM disk，写入 ~0.1ms/股票
+    - 写入耗时 ~5ms（vs 之前按股票拆分 ~600ms）
     """
 
     def __init__(self):
@@ -85,17 +93,20 @@ class ShmStore:
     # 写接口（collector 调用）                                               #
     # ------------------------------------------------------------------ #
 
-    def update_tick(self, code: str, df: pd.DataFrame) -> None:
+    def update_tick(self, df: pd.DataFrame) -> None:
+        """覆盖写入所有股票的 tick 数据。"""
         with self._locks["tick"]:
-            self._write_arrow(SHM_BASE / "tick" / f"{code}.arrow", df)
+            self._write_arrow(SHM_BASE / "tick" / "latest.arrow", df)
 
-    def update_order(self, code: str, df: pd.DataFrame) -> None:
+    def update_order(self, df: pd.DataFrame) -> None:
+        """覆盖写入所有股票的委托数据。"""
         with self._locks["order"]:
-            self._write_arrow(SHM_BASE / "order" / f"{code}.arrow", df)
+            self._write_arrow(SHM_BASE / "order" / "latest.arrow", df)
 
-    def update_deal(self, code: str, df: pd.DataFrame) -> None:
+    def update_deal(self, df: pd.DataFrame) -> None:
+        """覆盖写入所有股票的成交数据。"""
         with self._locks["deal"]:
-            self._write_arrow(SHM_BASE / "deal" / f"{code}.arrow", df)
+            self._write_arrow(SHM_BASE / "deal" / "latest.arrow", df)
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         with self._locks["kline"]:
@@ -126,22 +137,28 @@ class ShmStore:
     # ------------------------------------------------------------------ #
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
+        df = self._read_arrow(SHM_BASE / "tick" / "latest.arrow")
+        if df is None or df.empty:
+            return pd.DataFrame()
         if code:
-            df = self._read_arrow(SHM_BASE / "tick" / f"{code}.arrow")
-            return df if df is not None else pd.DataFrame()
-        return self._concat_dir(SHM_BASE / "tick")
+            return df[df["Code"] == code].reset_index(drop=True)
+        return df
 
     def get_order(self, code: Optional[str] = None) -> pd.DataFrame:
+        df = self._read_arrow(SHM_BASE / "order" / "latest.arrow")
+        if df is None or df.empty:
+            return pd.DataFrame()
         if code:
-            df = self._read_arrow(SHM_BASE / "order" / f"{code}.arrow")
-            return df if df is not None else pd.DataFrame()
-        return self._concat_dir(SHM_BASE / "order")
+            return df[df["Code"] == code].reset_index(drop=True)
+        return df
 
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
+        df = self._read_arrow(SHM_BASE / "deal" / "latest.arrow")
+        if df is None or df.empty:
+            return pd.DataFrame()
         if code:
-            df = self._read_arrow(SHM_BASE / "deal" / f"{code}.arrow")
-            return df if df is not None else pd.DataFrame()
-        return self._concat_dir(SHM_BASE / "deal")
+            return df[df["Code"] == code].reset_index(drop=True)
+        return df
 
     def get_kline(self, period: str) -> pd.DataFrame:
         df = self._read_arrow(SHM_BASE / "kline" / f"{period}.arrow")
@@ -170,19 +187,6 @@ class ShmStore:
     def get_trading_day(self) -> Optional[str]:
         p = SHM_BASE / "trading_day"
         return p.read_text().strip() if p.exists() else None
-
-    # ------------------------------------------------------------------ #
-    # 工具方法                                                              #
-    # ------------------------------------------------------------------ #
-
-    def _concat_dir(self, directory: Path) -> pd.DataFrame:
-        """读取目录下所有 .arrow 文件并 concat。"""
-        frames = []
-        for f in sorted(directory.glob("*.arrow")):
-            df = self._read_arrow(f)
-            if df is not None:
-                frames.append(df)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def clear_day(self) -> None:
         """每日收市后清空共享内存。"""

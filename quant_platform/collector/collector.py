@@ -394,10 +394,8 @@ class Collector:
                 self._disk_queue.append((data_type, df))
 
     def _write_to_store(self, data_type: str, df: pd.DataFrame):
-        """按股票代码拆分后写入 ShmStore。"""
-        update_fn = getattr(self._store, f"update_{data_type}")
-        for code, sub in df.groupby("Code"):
-            update_fn(code, sub)
+        """直接写整个 DataFrame 到 ShmStore（一个 arrow 文件，不做 groupby 拆分）。"""
+        getattr(self._store, f"update_{data_type}")(df)
 
     def _handle(self, path: Path, market: str, data_type: str, raw_df: pd.DataFrame):
         """将原始 DataFrame 转换后写入 ShmStore（实时），落盘 parquet 异步执行。"""
