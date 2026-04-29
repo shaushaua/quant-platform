@@ -48,7 +48,15 @@ class ShmStore:
             SHM_BASE / "daily_basic",
         ]:
             d.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        # 按数据类型分锁，多线程写入不同类型时互不阻塞
+        self._locks = {
+            "tick": threading.Lock(),
+            "order": threading.Lock(),
+            "deal": threading.Lock(),
+            "kline": threading.Lock(),
+            "quote": threading.Lock(),
+            "daily_basic": threading.Lock(),
+        }
 
     # ------------------------------------------------------------------ #
     # 内部读写                                                              #
@@ -78,28 +86,28 @@ class ShmStore:
     # ------------------------------------------------------------------ #
 
     def update_tick(self, code: str, df: pd.DataFrame) -> None:
-        with self._lock:
+        with self._locks["tick"]:
             self._write_arrow(SHM_BASE / "tick" / f"{code}.arrow", df)
 
     def update_order(self, code: str, df: pd.DataFrame) -> None:
-        with self._lock:
+        with self._locks["order"]:
             self._write_arrow(SHM_BASE / "order" / f"{code}.arrow", df)
 
     def update_deal(self, code: str, df: pd.DataFrame) -> None:
-        with self._lock:
+        with self._locks["deal"]:
             self._write_arrow(SHM_BASE / "deal" / f"{code}.arrow", df)
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
-        with self._lock:
+        with self._locks["kline"]:
             self._write_arrow(SHM_BASE / "kline" / f"{period}.arrow", df)
 
     def update_quote(self, code: str, quote: dict) -> None:
         df = pd.DataFrame([quote])
-        with self._lock:
+        with self._locks["quote"]:
             self._write_arrow(SHM_BASE / "quote" / f"{code}.arrow", df)
 
     def update_daily_basic(self, df: pd.DataFrame) -> None:
-        with self._lock:
+        with self._locks["daily_basic"]:
             self._write_arrow(SHM_BASE / "daily_basic" / "daily_basic.arrow", df)
 
     def set_trading_day(self, trading_day: str) -> None:
@@ -178,8 +186,6 @@ class ShmStore:
 
     def clear_day(self) -> None:
         """每日收市后清空共享内存。"""
-        with self._lock:
-            pass  # 无缓冲需要清空
         for subdir in ["tick", "order", "deal", "kline", "quote", "daily_basic"]:
             d = SHM_BASE / subdir
             if d.exists():

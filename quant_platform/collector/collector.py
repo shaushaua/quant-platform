@@ -21,6 +21,7 @@ import io
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Deque, Dict, Optional, Tuple
@@ -270,8 +271,11 @@ class DayDirWatcher:
         df = poller.read_new_rows()
         if df is not None and not df.empty:
             with self._results_lock:
+                q_len = len(self._results)
                 self._results.append((path, market, data_type, df))
-            logger.info("[%s][%s] %s +%d 行", market, data_type, path.name, len(df))
+            if q_len > 10:
+                logger.warning("[积压] 队列=%d 文件=%s（处理速度跟不上写入速度）", q_len, path.name)
+            logger.info("[%s][%s] %s +%d 行 队列=%d", market, data_type, path.name, len(df), q_len)
 
     def start(self):
         """启动监听（使用 inotify 或轮询）。"""
@@ -353,6 +357,9 @@ class Collector:
         self._daily_basic_cache: Optional[DailyBasicCache] = None
         self._uploaded_today = False
 
+        # 线程池：并行处理多个文件的数据（order/deal/tick 同时到达时并行）
+        self._pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="handler")
+
         # 落盘队列：后台线程异步写 parquet，不阻塞实时路径
         self._disk_queue: Deque[Tuple[str, pd.DataFrame]] = deque()
         self._disk_queue_lock = threading.Lock()
@@ -380,6 +387,18 @@ class Collector:
         except Exception as e:
             logger.warning("[daily_basic] 加载异常: %s", e)
 
+    def _enqueue_disk(self, data_type: str, df: pd.DataFrame):
+        """尝试将 DataFrame 放入落盘队列。队列满则丢弃（已有 ShmStore 实时数据兜底）。"""
+        with self._disk_queue_lock:
+            if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
+                self._disk_queue.append((data_type, df))
+
+    def _write_to_store(self, data_type: str, df: pd.DataFrame):
+        """按股票代码拆分后写入 ShmStore。"""
+        update_fn = getattr(self._store, f"update_{data_type}")
+        for code, sub in df.groupby("Code"):
+            update_fn(code, sub)
+
     def _handle(self, path: Path, market: str, data_type: str, raw_df: pd.DataFrame):
         """将原始 DataFrame 转换后写入 ShmStore（实时），落盘 parquet 异步执行。"""
         try:
@@ -390,17 +409,13 @@ class Collector:
                 order_df, deal_df = self._converter.convert_sh_order_deal(raw_df, trading_day_dt)
                 del raw_df  # 立即释放原始数据
                 if not order_df.empty:
-                    for code, sub in order_df.groupby("Code"):
-                        self._store.update_order(code, sub)
-                    with self._disk_queue_lock:
-                        if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
-                            self._disk_queue.append(("order", order_df))
+                    self._write_to_store("order", order_df)
+                    self._enqueue_disk("order", order_df)
+                    del order_df
                 if not deal_df.empty:
-                    for code, sub in deal_df.groupby("Code"):
-                        self._store.update_deal(code, sub)
-                    with self._disk_queue_lock:
-                        if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
-                            self._disk_queue.append(("deal", deal_df))
+                    self._write_to_store("deal", deal_df)
+                    self._enqueue_disk("deal", deal_df)
+                    del deal_df
 
             elif data_type == "order":
                 if market == "SZ":
@@ -408,11 +423,10 @@ class Collector:
                 else:
                     df = self._converter.convert_sh_order(raw_df, trading_day_dt)
                 del raw_df
-                for code, sub in df.groupby("Code"):
-                    self._store.update_order(code, sub)
-                with self._disk_queue_lock:
-                    if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
-                        self._disk_queue.append(("order", df))
+                if not df.empty:
+                    self._write_to_store("order", df)
+                    self._enqueue_disk("order", df)
+                del df
 
             elif data_type == "deal":
                 if market == "SZ":
@@ -420,11 +434,10 @@ class Collector:
                 else:
                     df = self._converter.convert_sh_deal(raw_df, trading_day_dt)
                 del raw_df
-                for code, sub in df.groupby("Code"):
-                    self._store.update_deal(code, sub)
-                with self._disk_queue_lock:
-                    if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
-                        self._disk_queue.append(("deal", df))
+                if not df.empty:
+                    self._write_to_store("deal", df)
+                    self._enqueue_disk("deal", df)
+                del df
 
             elif data_type == "tick":
                 if market == "SZ":
@@ -432,11 +445,10 @@ class Collector:
                 else:
                     df = self._converter.convert_sh_tick(raw_df, trading_day_dt)
                 del raw_df
-                for code, sub in df.groupby("Code"):
-                    self._store.update_tick(code, sub)
-                with self._disk_queue_lock:
-                    if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
-                        self._disk_queue.append(("tick", df))
+                if not df.empty:
+                    self._write_to_store("tick", df)
+                    self._enqueue_disk("tick", df)
+                del df
 
             else:
                 del raw_df
@@ -653,11 +665,38 @@ class Collector:
 
         logger.info("[OSS] %s 全部上传完成", date_str)
 
+    def _log_memory(self):
+        """打印当前进程内存使用，帮助排查 OOM。"""
+        try:
+            import psutil
+            proc = psutil.Process()
+            rss_mb = proc.memory_info().rss / 1024 / 1024
+            disk_q = len(self._disk_queue)
+            logger.info("[内存] RSS=%.0fMB disk_queue=%d", rss_mb, disk_q)
+            if self._tracemalloc:
+                import tracemalloc
+                snapshot = tracemalloc.take_snapshot()
+                top = snapshot.statistics("lineno")[:5]
+                for stat in top:
+                    logger.info("[内存] %s", stat)
+        except Exception as e:
+            logger.debug("[内存] 采集失败: %s", e)
+
     def _run_loop(self):
         last_cleanup = time.time()
+        last_memlog = time.time()
         loop_count = 0
         logger.info("[Collector] 启动，监听目录: %s", self._day_dir)
         logger.info("[Collector] 源文件清理: 保留 %d 天", DELETE_SOURCE_AFTER_DAYS)
+
+        # 启用内存追踪，每分钟打印一次内存快照帮助排查 OOM
+        try:
+            import tracemalloc
+            tracemalloc.start()
+            self._tracemalloc = True
+            logger.info("[内存] tracemalloc 已启用")
+        except Exception:
+            self._tracemalloc = False
 
         self._watcher.start()
 
@@ -666,21 +705,34 @@ class Collector:
             self._check_upload_time()
 
             new_data = self._watcher.get_new_data()
-            for path, market, data_type, df in new_data:
-                self._handle(path, market, data_type, df)
-                del df
-
-            # 每个 chunk 处理完立即刷写脏股票到 /dev/shm
             if new_data:
-                self._store.flush_dirty()
+                t0 = time.time()
+                # 并行提交所有 _handle 任务到线程池
+                futures = [
+                    self._pool.submit(self._handle, path, market, data_type, df)
+                    for path, market, data_type, df in new_data
+                ]
+                # 等待所有任务完成（保证 gc 前所有 DataFrame 已释放）
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logger.warning("[线程] 处理异常: %s", e)
+                elapsed_ms = (time.time() - t0) * 1000
+                if elapsed_ms > 100:
+                    logger.warning("[耗时] 并行处理 %d 条数据耗时 %.0fms", len(new_data), elapsed_ms)
 
-            loop_count += 1
-            # 每 50 轮做一次 gc（~500ms 间隔），平衡延迟和内存
-            if loop_count % 50 == 0:
+            # 每批数据处理完后立即 gc，防止 Python 内存碎片累积导致 OOM
+            if new_data:
                 gc.collect()
 
-            # 每小时清理一次旧文件
+            # 每 5 分钟打印一次内存快照
             now = time.time()
+            if now - last_memlog > 300:
+                self._log_memory()
+                last_memlog = now
+
+            # 每小时清理一次旧文件
             if now - last_cleanup > 3600:
                 self._watcher.cleanup_old_files(DELETE_SOURCE_AFTER_DAYS)
                 last_cleanup = now
@@ -690,6 +742,7 @@ class Collector:
                 self._stop_event.wait(0.01)  # 10ms
 
         self._watcher.stop()
+        self._pool.shutdown(wait=False)
         # 停止前刷写缓冲
         self._store.flush()
         logger.info("[Collector] 已停止")
