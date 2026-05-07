@@ -82,6 +82,8 @@ def classify_file(filename: str) -> Optional[Tuple[Market, DataType]]:
 
     if suffix == "mdl_4_24_0.csv":
         return ("SH", "order_deal")
+    if suffix == "mdl_4_4_0.csv":
+        return ("SH", "tick")
     if suffix == "MarketData.csv" or filename.endswith("_MarketData.csv"):
         return ("SH", "tick")
     if suffix == "mdl_6_33_0.csv":
@@ -647,9 +649,22 @@ class Collector:
                 tmp_file = disk_dir / f"tmp_{data_type}.parquet"
                 tmp_file.unlink(missing_ok=True)
 
-        # 上传 daily_basic
+        # 上传 daily_basic：优先从 ShmStore 读，为空则重新从 MySQL 加载
         daily_basic = self._store.get_daily_basic()
-        logger.info("[OSS] daily_basic 行数: %d", len(daily_basic))
+        logger.info("[OSS] daily_basic ShmStore 行数: %d", len(daily_basic))
+        if daily_basic.empty:
+            logger.info("[OSS] ShmStore 无 daily_basic，尝试从 MySQL 加载")
+            try:
+                market_count = int(os.environ.get("DAILY_BASIC_MARKET_COUNT", "1"))
+                loader = DailyBasicCache(market_count=market_count)
+                if loader.load(date_str):
+                    daily_basic = loader.get_daily_basic()
+                    logger.info("[OSS] MySQL daily_basic 行数: %d", len(daily_basic))
+                    # 回写 ShmStore 供后续使用
+                    if not daily_basic.empty:
+                        self._store.update_daily_basic(daily_basic)
+            except Exception as e:
+                logger.warning("[OSS] MySQL 加载 daily_basic 失败: %s", e)
         if not daily_basic.empty:
             try:
                 buffer = io.BytesIO()
@@ -682,6 +697,7 @@ class Collector:
 
     def _run_loop(self):
         last_cleanup = time.time()
+        last_rolling_cleanup = time.time()
         last_memlog = time.time()
         loop_count = 0
         logger.info("[Collector] 启动，监听目录: %s", self._day_dir)
@@ -729,6 +745,11 @@ class Collector:
             if now - last_memlog > 300:
                 self._log_memory()
                 last_memlog = now
+
+            # 每 30 秒清理过期的滚动 chunk 文件
+            if now - last_rolling_cleanup > 30:
+                self._store.cleanup_rolling()
+                last_rolling_cleanup = now
 
             # 每小时清理一次旧文件
             if now - last_cleanup > 3600:

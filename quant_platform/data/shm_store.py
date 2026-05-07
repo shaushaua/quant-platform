@@ -1,31 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-Arrow IPC 共享内存存储
+Arrow IPC 共享内存存储（滚动 chunk 模式）
 
 collector 容器写入 /dev/shm/store/*.arrow
 live-engine 容器 mmap 零拷贝读取
 两个容器通过 hostPath volume 共享同一目录
 
-存储布局（批量写入，按类型聚合）：
-- tick/latest.arrow    所有股票的最新 tick 快照（~5MB）
-- order/latest.arrow   所有股票的最新委托（~5MB）
-- deal/latest.arrow    所有股票的最新成交（~5MB）
-- quote/{code}.arrow   每只股票最新行情（小额，保留按股票存储）
-- kline/{period}.arrow K线数据
-- daily_basic/daily_basic.arrow  日线基础数据
+存储布局（滚动 chunk，保留最近 N 分钟数据）：
+- tick/chunk_{timestamp_ms}.arrow   所有股票的 tick 数据（每个 chunk 一个文件）
+- order/chunk_{timestamp_ms}.arrow  所有股票的委托数据
+- deal/chunk_{timestamp_ms}.arrow   所有股票的成交数据
+- quote/{code}.arrow                每只股票最新行情（单文件覆盖，不需滚动）
+- kline/{period}.arrow              K线数据（单文件覆盖）
+- daily_basic/daily_basic.arrow     日线基础数据（单文件覆盖）
 
 写入策略：
-- 每次 update 直接覆盖 latest.arrow（不做 groupby 拆分）
-- 写入耗时从 3000×0.2ms=600ms 降到 1×5ms=5ms
-- live_engine 读取后按 code 过滤即可
+- 每次 update 写入新的 chunk 文件（时间戳命名）
+- 后台定期清理超过 ROLLING_WINDOW_SECONDS 的旧文件
+- live_engine 读取时 concat 所有 chunk 文件，按 code 过滤
 """
 
 import logging
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -35,15 +36,19 @@ logger = logging.getLogger(__name__)
 
 SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
 
+# 滚动窗口时长（秒），默认 5 分钟
+ROLLING_WINDOW_SECONDS = int(os.environ.get("ROLLING_WINDOW_SECONDS", "300"))
+
+# 需要滚动 chunk 的数据类型
+_ROLLING_TYPES = {"tick", "order", "deal"}
+
 
 class ShmStore:
     """
-    Arrow IPC 共享内存存储。
+    Arrow IPC 共享内存存储（滚动 chunk 模式）。
 
-    写入策略（批量覆盖）：
-    - tick/order/deal 写入单个 latest.arrow，不做按股票拆分
-    - 内存峰值 = 单次写入的 DataFrame 大小
-    - 写入耗时 ~5ms（vs 之前按股票拆分 ~600ms）
+    tick/order/deal：每次写入新的 timestamped chunk，后台清理旧文件。
+    quote/kline/daily_basic：单文件覆盖（数据量小，不需滚动）。
     """
 
     def __init__(self):
@@ -89,24 +94,52 @@ class ShmStore:
         except Exception:
             return None
 
+    def _read_all_chunks(self, data_type: str) -> pd.DataFrame:
+        """
+        读取某个类型的所有 chunk 文件并合并。
+        用于 tick/order/deal 滚动模式。
+        """
+        chunk_dir = SHM_BASE / data_type
+        if not chunk_dir.exists():
+            return pd.DataFrame()
+
+        chunks = sorted(chunk_dir.glob("chunk_*.arrow"))
+        if not chunks:
+            return pd.DataFrame()
+
+        dfs = []
+        for f in chunks:
+            df = self._read_arrow(f)
+            if df is not None and not df.empty:
+                dfs.append(df)
+
+        if not dfs:
+            return pd.DataFrame()
+
+        result = pd.concat(dfs, ignore_index=True)
+        return result
+
     # ------------------------------------------------------------------ #
     # 写接口（collector 调用）                                               #
     # ------------------------------------------------------------------ #
 
     def update_tick(self, df: pd.DataFrame) -> None:
-        """覆盖写入所有股票的 tick 数据。"""
+        """写入新的 tick chunk。"""
+        ts = int(time.time() * 1000)
         with self._locks["tick"]:
-            self._write_arrow(SHM_BASE / "tick" / "latest.arrow", df)
+            self._write_arrow(SHM_BASE / "tick" / f"chunk_{ts}.arrow", df)
 
     def update_order(self, df: pd.DataFrame) -> None:
-        """覆盖写入所有股票的委托数据。"""
+        """写入新的 order chunk。"""
+        ts = int(time.time() * 1000)
         with self._locks["order"]:
-            self._write_arrow(SHM_BASE / "order" / "latest.arrow", df)
+            self._write_arrow(SHM_BASE / "order" / f"chunk_{ts}.arrow", df)
 
     def update_deal(self, df: pd.DataFrame) -> None:
-        """覆盖写入所有股票的成交数据。"""
+        """写入新的 deal chunk。"""
+        ts = int(time.time() * 1000)
         with self._locks["deal"]:
-            self._write_arrow(SHM_BASE / "deal" / "latest.arrow", df)
+            self._write_arrow(SHM_BASE / "deal" / f"chunk_{ts}.arrow", df)
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         with self._locks["kline"]:
@@ -133,28 +166,59 @@ class ShmStore:
         pass
 
     # ------------------------------------------------------------------ #
+    # 滚动清理                                                              #
+    # ------------------------------------------------------------------ #
+
+    def cleanup_rolling(self) -> int:
+        """
+        清理超过 ROLLING_WINDOW_SECONDS 的旧 chunk 文件。
+        返回清理的文件数量。
+        """
+        cutoff = time.time() - ROLLING_WINDOW_SECONDS
+        cleaned = 0
+
+        for data_type in _ROLLING_TYPES:
+            chunk_dir = SHM_BASE / data_type
+            if not chunk_dir.exists():
+                continue
+
+            with self._locks[data_type]:
+                for f in chunk_dir.glob("chunk_*.arrow"):
+                    try:
+                        if f.stat().st_mtime < cutoff:
+                            f.unlink()
+                            cleaned += 1
+                    except OSError:
+                        pass
+
+        if cleaned:
+            logger.info("[滚动清理] 已删除 %d 个过期 chunk 文件（窗口=%ds）",
+                        cleaned, ROLLING_WINDOW_SECONDS)
+        return cleaned
+
+    # ------------------------------------------------------------------ #
     # 读接口（live_engine / DataAPI 调用）                                   #
     # ------------------------------------------------------------------ #
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
-        df = self._read_arrow(SHM_BASE / "tick" / "latest.arrow")
-        if df is None or df.empty:
+        df = self._read_all_chunks("tick")
+        if df.empty:
             return pd.DataFrame()
         if code:
             return df[df["Code"] == code].reset_index(drop=True)
         return df
 
     def get_order(self, code: Optional[str] = None) -> pd.DataFrame:
-        df = self._read_arrow(SHM_BASE / "order" / "latest.arrow")
-        if df is None or df.empty:
+        df = self._read_all_chunks("order")
+        if df.empty:
             return pd.DataFrame()
         if code:
             return df[df["Code"] == code].reset_index(drop=True)
         return df
 
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
-        df = self._read_arrow(SHM_BASE / "deal" / "latest.arrow")
-        if df is None or df.empty:
+        df = self._read_all_chunks("deal")
+        if df.empty:
             return pd.DataFrame()
         if code:
             return df[df["Code"] == code].reset_index(drop=True)
@@ -187,6 +251,26 @@ class ShmStore:
     def get_trading_day(self) -> Optional[str]:
         p = SHM_BASE / "trading_day"
         return p.read_text().strip() if p.exists() else None
+
+    def get_all_codes(self, data_type: str = "tick") -> List[str]:
+        """
+        获取某个数据类型中所有出现过的股票代码。
+        读取最新的 chunk 文件提取 unique Code 值。
+        """
+        chunk_dir = SHM_BASE / data_type
+        if not chunk_dir.exists():
+            return []
+
+        chunks = sorted(chunk_dir.glob("chunk_*.arrow"), reverse=True)
+        if not chunks:
+            return []
+
+        # 只读最新的 chunk 获取代码列表（避免 concat 全量数据）
+        df = self._read_arrow(chunks[0])
+        if df is None or df.empty or "Code" not in df.columns:
+            return []
+
+        return sorted(df["Code"].unique().tolist())
 
     def clear_day(self) -> None:
         """每日收市后清空共享内存。"""

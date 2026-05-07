@@ -244,13 +244,11 @@ def _get_securities(store: ShmStore) -> List[str]:
     universe_env = os.environ.get("UNIVERSE", "").strip()
     if universe_env:
         return [s.strip() for s in universe_env.split(",") if s.strip()]
-    # 自动发现
-    tick_dir = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/quant-store")) / "tick"
-    if tick_dir.exists():
-        codes = [f.stem for f in tick_dir.glob("*.arrow")]
-        if codes:
-            logger.info("[live-engine] 自动发现 %d 只股票", len(codes))
-            return codes
+    # 自动发现：从 ShmStore 的最新 chunk 中提取所有股票代码
+    codes = store.get_all_codes("tick")
+    if codes:
+        logger.info("[live-engine] 自动发现 %d 只股票", len(codes))
+        return codes
     logger.warning("[live-engine] UNIVERSE 未配置且 ShmStore 无数据，退出")
     return []
 
@@ -258,6 +256,7 @@ def _get_securities(store: ShmStore) -> List[str]:
 PHASE_END_TIME = {
     "pre-open":  "092500",   # 开盘集合竞价结束前
     "pre-close": "145500",   # 收盘集合竞价结束前
+    "live":      None,       # 实盘模式，使用当前时间
 }
 
 
@@ -270,9 +269,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="实盘因子计算引擎")
     parser.add_argument(
         "--phase",
-        choices=["pre-open", "pre-close"],
+        choices=["pre-open", "pre-close", "live"],
         required=True,
-        help="触发阶段：pre-open（开盘前）或 pre-close（收盘前）",
+        help="触发阶段：pre-open / pre-close / live（实盘每分钟）",
     )
     parser.add_argument(
         "--end-time",
@@ -287,6 +286,8 @@ def main() -> None:
         sys.exit(1)
 
     end_time = args.end_time or PHASE_END_TIME[args.phase]
+    if end_time is None:
+        end_time = datetime.now().strftime("%H%M%S")
     output_path_str = os.environ.get("FACTOR_OUTPUT_PATH", "")
     output_path = Path(output_path_str) if output_path_str else None
     processes = int(os.environ.get("FACTOR_PROCESSES", "4"))

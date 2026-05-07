@@ -1,104 +1,19 @@
 # live-engine CronJob：读取 collector 写入的共享内存，执行因子计算
-# 在 ACK 控制台直接修改 schedule 字段即可调整触发时间，无需改代码。
-#
-# 两个任务：
-#   pre-open  : 09:25 开盘前（北京时间 = UTC+8，cron 用 UTC）
-#   pre-close : 14:55 收盘前
+# 交易时段每分钟触发一次（北京 09:30-14:55）
+# 无数据时快速退出，有数据时计算因子并上传 OSS
 ---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: live-engine-pre-open
+  name: live-engine
   namespace: quant
   labels:
     app: live-engine
-    phase: pre-open
 spec:
-  # 北京时间 09:25 = UTC 01:25（ACK 控制台可直接编辑）
-  schedule: "25 1 * * 1-5"
-  concurrencyPolicy: Forbid          # 上一次未完成则跳过，防止重叠
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
-  jobTemplate:
-    spec:
-      backoffLimit: 0                # 不重试，因子计算幂等
-      template:
-        metadata:
-          labels:
-            app: live-engine
-            phase: pre-open
-        spec:
-          restartPolicy: Never
-          nodeSelector:
-            role: live-trading
-          tolerations:
-            - key: role
-              operator: Equal
-              value: live-trading
-              effect: NoSchedule
-          containers:
-            - name: live-engine
-              image: 172.24.99.176:5000/quant-platform/backtest-base:latest
-              command:
-                - python
-                - -m
-                - quant_platform.live_engine.factor_engine
-                - --phase
-                - pre-open
-              env:
-                - name: TZ
-                  value: Asia/Shanghai
-                - name: SHM_STORE_PATH
-                  value: /dev/shm/quant-store
-                # 用户因子模块路径，如 quant_platform.factor.examples.momentum
-                - name: FACTOR_MODULE
-                  value: "quant_platform.factor.examples.momentum"   # 默认因子模块，可在 ACK 控制台覆盖
-                - name: UNIVERSE
-                  value: ""   # 逗号分隔股票代码；空则自动发现 ShmStore 中全部
-                - name: FACTOR_OUTPUT_PATH
-                  value: /data/factors
-                - name: FACTOR_PROCESSES
-                  value: "4"
-                - name: LOG_LEVEL
-                  value: INFO
-              envFrom:
-                - secretRef:
-                    name: quant-secrets
-              volumeMounts:
-                - name: shm-store
-                  mountPath: /dev/shm/quant-store
-                  readOnly: true
-                - name: factor-output
-                  mountPath: /data/factors
-              resources:
-                requests:
-                  cpu: "2"
-                  memory: 4Gi
-                limits:
-                  cpu: "4"
-                  memory: 8Gi
-          volumes:
-            - name: shm-store
-              hostPath:
-                path: /dev/shm/quant-store
-                type: DirectoryOrCreate
-            - name: factor-output
-              hostPath:
-                path: /data/quant/factors
-                type: DirectoryOrCreate
----
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: live-engine-pre-close
-  namespace: quant
-  labels:
-    app: live-engine
-    phase: pre-close
-spec:
-  # 北京时间 14:55 = UTC 06:55（ACK 控制台可直接编辑）
-  schedule: "55 6 * * 1-5"
-  concurrencyPolicy: Forbid
+  # 北京时间 09:30-14:55 每分钟 = UTC 01:30-06:55
+  # */1 1-6 覆盖 UTC 01:00-06:59，开盘前空跑无数据会秒退
+  schedule: "*/1 1-6 * * 1-5"
+  concurrencyPolicy: Forbid          # 上一次未完成则跳过
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   jobTemplate:
@@ -108,7 +23,6 @@ spec:
         metadata:
           labels:
             app: live-engine
-            phase: pre-close
         spec:
           restartPolicy: Never
           nodeSelector:
@@ -126,16 +40,16 @@ spec:
                 - -m
                 - quant_platform.live_engine.factor_engine
                 - --phase
-                - pre-close
+                - live
               env:
                 - name: TZ
                   value: Asia/Shanghai
                 - name: SHM_STORE_PATH
                   value: /dev/shm/quant-store
                 - name: FACTOR_MODULE
-                  value: ""   # 必填，在 ACK 控制台 编辑此值
+                  value: "quant_platform.factor.examples.live_vwap"
                 - name: UNIVERSE
-                  value: ""
+                  value: ""   # 空=自动发现 ShmStore 中全部股票
                 - name: FACTOR_OUTPUT_PATH
                   value: /data/factors
                 - name: FACTOR_PROCESSES
