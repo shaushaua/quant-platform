@@ -84,13 +84,12 @@ class ShmStore:
         tmp.replace(path)
 
     def _read_arrow(self, path: Path) -> Optional[pd.DataFrame]:
-        """mmap 零拷贝读取 Arrow IPC 文件。"""
+        """读取 Arrow IPC 文件。"""
         if not path.exists():
             return None
         try:
-            mmap = ipc.MemoryMappedFile(str(path), mode="r")
-            with ipc.open_file(mmap) as reader:
-                return reader.read_pandas()
+            reader = ipc.open_file(str(path))
+            return reader.read_all().to_pandas()
         except Exception:
             return None
 
