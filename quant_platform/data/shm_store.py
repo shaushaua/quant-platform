@@ -254,22 +254,23 @@ class ShmStore:
     def get_all_codes(self, data_type: str = "tick") -> List[str]:
         """
         获取某个数据类型中所有出现过的股票代码。
-        读取最新的 chunk 文件提取 unique Code 值。
+        扫描所有 chunk 文件提取 unique Code 值。
         """
         chunk_dir = SHM_BASE / data_type
         if not chunk_dir.exists():
             return []
 
-        chunks = sorted(chunk_dir.glob("chunk_*.arrow"), reverse=True)
+        chunks = sorted(chunk_dir.glob("chunk_*.arrow"))
         if not chunks:
             return []
 
-        # 只读最新的 chunk 获取代码列表（避免 concat 全量数据）
-        df = self._read_arrow(chunks[0])
-        if df is None or df.empty or "Code" not in df.columns:
-            return []
+        codes = set()
+        for f in chunks:
+            df = self._read_arrow(f)
+            if df is not None and not df.empty and "Code" in df.columns:
+                codes.update(df["Code"].unique().tolist())
 
-        return sorted(df["Code"].unique().tolist())
+        return sorted(codes)
 
     def clear_day(self) -> None:
         """每日收市后清空共享内存。"""
