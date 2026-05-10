@@ -129,20 +129,23 @@ class ShmStore:
     def update_tick(self, df: pd.DataFrame) -> None:
         """写入新的 tick chunk。"""
         with self._locks["tick"]:
+            ts = int(time.time() * 1000)
             seq = next(self._seq)
-            self._write_arrow(SHM_BASE / "tick" / f"chunk_{seq}.arrow", df)
+            self._write_arrow(SHM_BASE / "tick" / f"chunk_{ts}_{seq:06d}.arrow", df)
 
     def update_order(self, df: pd.DataFrame) -> None:
         """写入新的 order chunk。"""
         with self._locks["order"]:
+            ts = int(time.time() * 1000)
             seq = next(self._seq)
-            self._write_arrow(SHM_BASE / "order" / f"chunk_{seq}.arrow", df)
+            self._write_arrow(SHM_BASE / "order" / f"chunk_{ts}_{seq:06d}.arrow", df)
 
     def update_deal(self, df: pd.DataFrame) -> None:
         """写入新的 deal chunk。"""
         with self._locks["deal"]:
+            ts = int(time.time() * 1000)
             seq = next(self._seq)
-            self._write_arrow(SHM_BASE / "deal" / f"chunk_{seq}.arrow", df)
+            self._write_arrow(SHM_BASE / "deal" / f"chunk_{ts}_{seq:06d}.arrow", df)
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         with self._locks["kline"]:

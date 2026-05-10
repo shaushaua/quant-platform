@@ -64,10 +64,12 @@ def _read_arrow(path: Path) -> Optional[pd.DataFrame]:
 def _extract_chunk_ts(filename: str) -> float:
     """从 chunk 文件名提取写入时间戳（秒）。
 
-    chunk_1715312345678.arrow -> 1715312345.678
+    chunk_1715312345678_000001.arrow -> 1715312345.678
     """
     try:
-        ts_ms = int(filename.replace("chunk_", "").replace(".arrow", ""))
+        # chunk_{ts_ms}_{seq}.arrow -> 取第一段数字作为时间戳
+        body = filename.replace("chunk_", "").replace(".arrow", "")
+        ts_ms = int(body.split("_")[0])
         return ts_ms / 1000.0
     except (ValueError, IndexError):
         return 0.0
@@ -206,12 +208,18 @@ class StreamingEngine:
         if df is None or df.empty or "Code" not in df.columns:
             return
         now = time.time()
+        # groupby 在锁外完成（CPU 密集，不涉及共享数据）
+        groups = list(df.groupby("Code"))
+        # 锁内：只做新增 StockState
         with self._lock:
-            for code, group in df.groupby("Code"):
+            for code, _ in groups:
                 code_str = str(code)
                 if code_str not in self.states:
                     self.states[code_str] = StockState(code=code_str)
-                state = self.states[code_str]
+        # 锁外：更新已有状态（GIL 保护单对象属性写入）
+        for code, group in groups:
+            state = self.states.get(str(code))
+            if state is not None:
                 getattr(state, f"update_{data_type}")(group)
                 state.last_update_ts = now
                 if chunk_ts > 0:
@@ -237,11 +245,13 @@ class StreamingEngine:
                     new_files.append(f)
 
             for f in new_files:
+                with self._lock:
+                    if f.name in self.processed_chunks[data_type]:
+                        continue  # 已被 inotify 占位，跳过
+                    self.processed_chunks[data_type].add(f.name)  # 先占位
                 chunk_ts = _extract_chunk_ts(f.name)
                 df = _read_arrow(f)
                 self._update_states(df, data_type, chunk_ts)
-                with self._lock:
-                    self.processed_chunks[data_type].add(f.name)
                 consumed += 1
 
             # 清理 set 中已被 collector 滚动删除的文件名
@@ -334,11 +344,10 @@ class StreamingEngine:
                 for s in self.processed_chunks.values():
                     s.clear()
                 self._trading_day = today
-            # 删掉旧 checkpoint
-            try:
-                self._checkpoint_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+                try:
+                    self._checkpoint_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ #
     # inotify 监听                                                         #
@@ -369,13 +378,11 @@ class StreamingEngine:
         with self._lock:
             if path.name in self.processed_chunks.get(parent, set()):
                 return
+            self.processed_chunks[parent].add(path.name)  # 立即占位，防 TOCTOU
 
         chunk_ts = _extract_chunk_ts(path.name)
         df = _read_arrow(path)
         self._update_states(df, parent, chunk_ts)
-
-        with self._lock:
-            self.processed_chunks[parent].add(path.name)
 
     # ------------------------------------------------------------------ #
     # 主循环                                                               #

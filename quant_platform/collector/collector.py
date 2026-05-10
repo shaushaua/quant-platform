@@ -699,6 +699,7 @@ class Collector:
         last_cleanup = time.time()
         last_rolling_cleanup = time.time()
         last_memlog = time.time()
+        last_gc = time.time()
         loop_count = 0
         logger.info("[Collector] 启动，监听目录: %s", self._day_dir)
         logger.info("[Collector] 源文件清理: 保留 %d 天", DELETE_SOURCE_AFTER_DAYS)
@@ -715,6 +716,7 @@ class Collector:
         self._watcher.start()
 
         while not self._stop_event.is_set():
+            now = time.time()
             self._check_day_rollover()
             self._check_upload_time()
 
@@ -736,12 +738,12 @@ class Collector:
                 if elapsed_ms > 100:
                     logger.warning("[耗时] 并行处理 %d 条数据耗时 %.0fms", len(new_data), elapsed_ms)
 
-            # 每批数据处理完后立即 gc，防止 Python 内存碎片累积导致 OOM
-            if new_data:
+            # 每 30 秒 gc 一次，防止 Python 内存碎片累积导致 OOM
+            if new_data and now - last_gc > 30:
                 gc.collect()
+                last_gc = now
 
             # 每 5 分钟打印一次内存快照
-            now = time.time()
             if now - last_memlog > 300:
                 self._log_memory()
                 last_memlog = now
