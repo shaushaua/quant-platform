@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -33,6 +34,13 @@ import pyarrow.ipc as ipc
 
 from ..data.shm_store import SHM_BASE
 from ..factor.base import StockState
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
 
 logger = logging.getLogger(__name__)
 
@@ -211,21 +219,61 @@ class StreamingEngine:
             self._trading_day = today
 
     # ------------------------------------------------------------------ #
+    # inotify 监听                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _start_watcher(self) -> None:
+        """启动 inotify 监听 ShmStore 目录，新 chunk 写入时立即消费。"""
+        if not HAS_WATCHDOG:
+            logger.warning("[streaming] watchdog 未安装，使用轮询模式")
+            return
+
+        handler = _ChunkHandler(self)
+        self._observer = Observer()
+        for data_type in ("tick", "deal", "order"):
+            watch_dir = SHM_BASE / data_type
+            watch_dir.mkdir(parents=True, exist_ok=True)
+            self._observer.schedule(handler, str(watch_dir), recursive=False)
+        self._observer.start()
+        logger.info("[streaming] inotify 监听已启动")
+
+    def on_new_chunk(self, path: Path) -> None:
+        """inotify 回调：新 chunk 文件写入时触发。"""
+        # 判断数据类型
+        parent = path.parent.name
+        if parent not in ("tick", "deal", "order"):
+            return
+        if not path.name.startswith("chunk_") or not path.name.endswith(".arrow"):
+            return
+        if path.name in self.processed_chunks.get(parent, set()):
+            return
+
+        df = _read_arrow(path)
+        if df is not None and not df.empty and "Code" in df.columns:
+            for code, group in df.groupby("Code"):
+                code_str = str(code)
+                if code_str not in self.states:
+                    self.states[code_str] = StockState(code=code_str)
+                getattr(self.states[code_str], f"update_{parent}")(group)
+
+        self.processed_chunks[parent].add(path.name)
+
+    # ------------------------------------------------------------------ #
     # 主循环                                                               #
     # ------------------------------------------------------------------ #
 
     def run(self) -> None:
-        """主循环：增量消费 + 定时计算。"""
+        """主循环：inotify 驱动数据消费 + 定时因子计算。"""
         logger.info("[streaming] 引擎启动")
         self._trading_day = datetime.now().strftime("%Y%m%d")
 
-        while not self._stopped:
-            # 增量消费新 chunk
-            consumed = self._consume_new_chunks()
-            if consumed:
-                logger.debug("[streaming] 消费 %d 个新 chunk, 活跃股票=%d",
-                             consumed, len(self.states))
+        # 启动时消费已有的 chunk（避免错过启动前的数据）
+        self._consume_new_chunks()
 
+        # 启动 inotify 监听
+        self._start_watcher()
+
+        while not self._stopped:
             # 定时计算
             now = time.time()
             if now - self._last_output_ts >= self.compute_interval:
@@ -238,10 +286,29 @@ class StreamingEngine:
             # 日切检查
             self._check_day_rollover()
 
-            time.sleep(0.1)
+            time.sleep(0.01)  # 10ms，仅用于定时器精度
 
     def stop(self) -> None:
         self._stopped = True
+        if hasattr(self, '_observer'):
+            self._observer.stop()
+            self._observer.join()
+
+
+class _ChunkHandler(FileSystemEventHandler):
+    """inotify 事件处理器：新 chunk 文件写入时通知 StreamingEngine。"""
+
+    def __init__(self, engine: StreamingEngine):
+        super().__init__()
+        self._engine = engine
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._engine.on_new_chunk(Path(event.src_path))
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._engine.on_new_chunk(Path(event.src_path))
 
 
 def main() -> None:
