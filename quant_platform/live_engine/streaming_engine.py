@@ -14,7 +14,7 @@
     SHM_STORE_PATH     共享内存目录（默认 /dev/shm/quant-store）
     FACTOR_MODULE      交易员因子模块路径，须暴露 factor_calculation / outfun
     COMPUTE_INTERVAL   计算间隔秒数（默认 60）
-    FACTOR_OUTPUT_PATH 因子结果输出目录
+    FACTOR_OUTPUT_PATH 因子结果输出目录（checkpoint 也存在这里）
     LOG_LEVEL          日志级别
 """
 
@@ -22,10 +22,11 @@ import importlib
 import json
 import logging
 import os
+import pickle
 import sys
 import threading
 import time
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -41,6 +42,9 @@ try:
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
+    # 提供 stub，避免 class 定义报错
+    class FileSystemEventHandler:  # type: ignore[no-redef]
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,18 @@ def _read_arrow(path: Path) -> Optional[pd.DataFrame]:
         return reader.read_all().to_pandas()
     except Exception:
         return None
+
+
+def _extract_chunk_ts(filename: str) -> float:
+    """从 chunk 文件名提取写入时间戳（秒）。
+
+    chunk_1715312345678.arrow -> 1715312345.678
+    """
+    try:
+        ts_ms = int(filename.replace("chunk_", "").replace(".arrow", ""))
+        return ts_ms / 1000.0
+    except (ValueError, IndexError):
+        return 0.0
 
 
 def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
@@ -97,6 +113,9 @@ class StreamingEngine:
     每 COMPUTE_INTERVAL 秒触发因子计算并输出结果。
     """
 
+    # Checkpoint 文件名
+    _CHECKPOINT_NAME = "streaming_checkpoint.pkl"
+
     def __init__(self):
         self.states: Dict[str, StockState] = {}
         self.processed_chunks: Dict[str, Set[str]] = {
@@ -118,16 +137,81 @@ class StreamingEngine:
         # 计算间隔
         self.compute_interval = int(os.environ.get("COMPUTE_INTERVAL", "60"))
 
-        # 输出目录
+        # 输出目录 & checkpoint 路径
         output_path_str = os.environ.get("FACTOR_OUTPUT_PATH", "")
         self.output_path = Path(output_path_str) if output_path_str else None
+        if self.output_path:
+            self._checkpoint_path = self.output_path / self._CHECKPOINT_NAME
+        else:
+            self._checkpoint_path = Path("/tmp") / self._CHECKPOINT_NAME
 
-        logger.info("[streaming] 初始化完成: module=%s interval=%ds",
-                    module_path, self.compute_interval)
+        # 恢复 checkpoint
+        self._load_checkpoint()
+
+        logger.info("[streaming] 初始化完成: module=%s interval=%ds checkpoint=%s",
+                    module_path, self.compute_interval, self._checkpoint_path)
+
+    # ------------------------------------------------------------------ #
+    # Checkpoint                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _save_checkpoint(self) -> None:
+        """持久化 StockState 到磁盘，Pod 重启后可恢复。"""
+        try:
+            data = {
+                "trading_day": self._trading_day,
+                "states": self.states,
+                "processed_chunks": {k: list(v) for k, v in self.processed_chunks.items()},
+            }
+            self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._checkpoint_path.with_suffix(".tmp")
+            with open(tmp, "wb") as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp.replace(self._checkpoint_path)
+            logger.debug("[checkpoint] 已保存: %d stocks", len(self.states))
+        except Exception as exc:
+            logger.warning("[checkpoint] 保存失败: %s", exc)
+
+    def _load_checkpoint(self) -> None:
+        """从磁盘恢复 StockState。"""
+        if not self._checkpoint_path.exists():
+            logger.info("[checkpoint] 无历史 checkpoint，冷启动")
+            return
+        try:
+            with open(self._checkpoint_path, "rb") as f:
+                data = pickle.load(f)
+            self._trading_day = data.get("trading_day", "")
+            self.states = data.get("states", {})
+            for k, v in data.get("processed_chunks", {}).items():
+                if k in self.processed_chunks:
+                    self.processed_chunks[k] = set(v)
+            logger.info("[checkpoint] 已恢复: trading_day=%s stocks=%d",
+                        self._trading_day, len(self.states))
+        except Exception as exc:
+            logger.warning("[checkpoint] 恢复失败，冷启动: %s", exc)
+            self.states.clear()
+            for s in self.processed_chunks.values():
+                s.clear()
 
     # ------------------------------------------------------------------ #
     # 增量消费                                                             #
     # ------------------------------------------------------------------ #
+
+    def _update_states(self, df: pd.DataFrame, data_type: str,
+                       chunk_ts: float = 0.0) -> None:
+        """将 DataFrame 按 Code 分组更新到对应的 StockState。"""
+        if df is None or df.empty or "Code" not in df.columns:
+            return
+        now = time.time()
+        for code, group in df.groupby("Code"):
+            code_str = str(code)
+            if code_str not in self.states:
+                self.states[code_str] = StockState(code=code_str)
+            state = self.states[code_str]
+            getattr(state, f"update_{data_type}")(group)
+            state.last_update_ts = now
+            if chunk_ts > 0:
+                state.last_chunk_ts = chunk_ts
 
     def _consume_new_chunks(self) -> int:
         """扫描 ShmStore 中未处理的 chunk，增量更新 per-stock 状态。返回新处理数量。"""
@@ -143,13 +227,9 @@ class StreamingEngine:
                 if f.name in known:
                     continue
 
+                chunk_ts = _extract_chunk_ts(f.name)
                 df = _read_arrow(f)
-                if df is not None and not df.empty and "Code" in df.columns:
-                    for code, group in df.groupby("Code"):
-                        code_str = str(code)
-                        if code_str not in self.states:
-                            self.states[code_str] = StockState(code=code_str)
-                        getattr(self.states[code_str], f"update_{data_type}")(group)
+                self._update_states(df, data_type, chunk_ts)
 
                 known.add(f.name)
                 consumed += 1
@@ -177,6 +257,14 @@ class StreamingEngine:
             try:
                 result = self.factor_calculation(state, code, date_str, end_time)
                 if result is not None:
+                    # 注入延迟统计字段
+                    result["_compute_ts"] = t0
+                    result["_chunk_ts"] = state.last_chunk_ts
+                    result["_consume_ts"] = state.last_update_ts
+                    if state.last_chunk_ts > 0:
+                        result["e2e_latency_ms"] = round(
+                            (t0 - state.last_chunk_ts) * 1000, 1
+                        )
                     results.append(result)
             except Exception as exc:
                 logger.warning("[%s] 因子计算失败: %s", code, exc)
@@ -185,6 +273,15 @@ class StreamingEngine:
 
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info("[streaming] 计算完成: %d 条结果, 耗时 %.0fms", len(result_df), elapsed_ms)
+
+        # 延迟统计
+        if not result_df.empty and "e2e_latency_ms" in result_df.columns:
+            valid = result_df["e2e_latency_ms"].dropna()
+            if not valid.empty:
+                logger.info(
+                    "[streaming] 延迟: avg=%.0fms max=%.0fms min=%.0fms p50=%.0fms",
+                    valid.mean(), valid.max(), valid.min(), valid.median(),
+                )
 
         # 写 CSV
         if self.output_path and not result_df.empty:
@@ -217,6 +314,11 @@ class StreamingEngine:
             for s in self.processed_chunks.values():
                 s.clear()
             self._trading_day = today
+            # 删掉旧 checkpoint
+            try:
+                self._checkpoint_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # inotify 监听                                                         #
@@ -239,7 +341,6 @@ class StreamingEngine:
 
     def on_new_chunk(self, path: Path) -> None:
         """inotify 回调：新 chunk 文件写入时触发。"""
-        # 判断数据类型
         parent = path.parent.name
         if parent not in ("tick", "deal", "order"):
             return
@@ -248,13 +349,9 @@ class StreamingEngine:
         if path.name in self.processed_chunks.get(parent, set()):
             return
 
+        chunk_ts = _extract_chunk_ts(path.name)
         df = _read_arrow(path)
-        if df is not None and not df.empty and "Code" in df.columns:
-            for code, group in df.groupby("Code"):
-                code_str = str(code)
-                if code_str not in self.states:
-                    self.states[code_str] = StockState(code=code_str)
-                getattr(self.states[code_str], f"update_{parent}")(group)
+        self._update_states(df, parent, chunk_ts)
 
         self.processed_chunks[parent].add(path.name)
 
@@ -263,7 +360,7 @@ class StreamingEngine:
     # ------------------------------------------------------------------ #
 
     def run(self) -> None:
-        """主循环：inotify 驱动数据消费 + 定时因子计算。"""
+        """主循环：inotify 驱动 + 轮询兜底 + 定时因子计算。"""
         logger.info("[streaming] 引擎启动")
         self._trading_day = datetime.now().strftime("%Y%m%d")
 
@@ -273,9 +370,21 @@ class StreamingEngine:
         # 启动 inotify 监听
         self._start_watcher()
 
+        # 轮询/计算/checkpoint 时间戳
+        last_poll_ts = time.time()
+        last_checkpoint_ts = time.time()
+
         while not self._stopped:
-            # 定时计算
             now = time.time()
+
+            # 轮询兜底：每 1 秒扫描新 chunk（防止 inotify 丢事件）
+            if now - last_poll_ts >= 1.0:
+                consumed = self._consume_new_chunks()
+                if consumed:
+                    logger.info("[streaming] 轮询消费 %d 个新 chunk", consumed)
+                last_poll_ts = now
+
+            # 定时计算
             if now - self._last_output_ts >= self.compute_interval:
                 if self.states:
                     self._compute_and_output()
@@ -283,13 +392,21 @@ class StreamingEngine:
                     logger.debug("[streaming] 无股票数据，跳过计算")
                 self._last_output_ts = now
 
+            # 定时 checkpoint：每 30 秒保存一次
+            if now - last_checkpoint_ts >= 30 and self.states:
+                self._save_checkpoint()
+                last_checkpoint_ts = now
+
             # 日切检查
             self._check_day_rollover()
 
-            time.sleep(0.01)  # 10ms，仅用于定时器精度
+            time.sleep(0.01)  # 10ms
 
     def stop(self) -> None:
+        """停止引擎，保存 checkpoint。"""
         self._stopped = True
+        if self.states:
+            self._save_checkpoint()
         if hasattr(self, '_observer'):
             self._observer.stop()
             self._observer.join()

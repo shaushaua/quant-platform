@@ -116,10 +116,14 @@ class StockState:
     tick_count: int = 0
     order_count: int = 0
 
-    # --- 时间 ---
+    # --- 时间（数据时间）---
     last_deal_time: str = ""
     last_tick_time: str = ""
     last_order_time: str = ""
+
+    # --- 时间（系统时间，用于延迟统计）---
+    last_update_ts: float = 0.0     # wall clock of last chunk update
+    last_chunk_ts: float = 0.0      # chunk write timestamp (from filename, seconds)
 
     def update_tick(self, df: pd.DataFrame) -> None:
         """从新的 tick chunk 更新状态。"""
@@ -135,8 +139,9 @@ class StockState:
                     self.open = float(nonzero.iloc[0])
                 self.latest_price = float(nonzero.iloc[-1])
                 self.high = max(self.high, float(nonzero.max()))
-                if self.low == float('inf') or nonzero.min() > 0:
-                    self.low = min(self.low, float(nonzero.min()))
+                low_candidate = float(nonzero.min())
+                if low_candidate < self.low:
+                    self.low = low_candidate
 
         if 'PreClosePrice' in df.columns:
             pc = df['PreClosePrice'].iloc[-1]
