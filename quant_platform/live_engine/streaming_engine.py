@@ -118,6 +118,7 @@ class StreamingEngine:
     _CHECKPOINT_NAME = "streaming_checkpoint.pkl"
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.states: Dict[str, StockState] = {}
         self.processed_chunks: Dict[str, Set[str]] = {
             "tick": set(), "deal": set(), "order": set(),
@@ -159,11 +160,12 @@ class StreamingEngine:
     def _save_checkpoint(self) -> None:
         """持久化 StockState 到磁盘，Pod 重启后可恢复。"""
         try:
-            data = {
-                "trading_day": self._trading_day,
-                "states": self.states,
-                "processed_chunks": {k: list(v) for k, v in self.processed_chunks.items()},
-            }
+            with self._lock:
+                data = {
+                    "trading_day": self._trading_day,
+                    "states": dict(self.states),
+                    "processed_chunks": {k: list(v) for k, v in self.processed_chunks.items()},
+                }
             self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._checkpoint_path.with_suffix(".tmp")
             with open(tmp, "wb") as f:
@@ -200,19 +202,20 @@ class StreamingEngine:
 
     def _update_states(self, df: pd.DataFrame, data_type: str,
                        chunk_ts: float = 0.0) -> None:
-        """将 DataFrame 按 Code 分组更新到对应的 StockState。"""
+        """将 DataFrame 按 Code 分组更新到对应的 StockState。线程安全。"""
         if df is None or df.empty or "Code" not in df.columns:
             return
         now = time.time()
-        for code, group in df.groupby("Code"):
-            code_str = str(code)
-            if code_str not in self.states:
-                self.states[code_str] = StockState(code=code_str)
-            state = self.states[code_str]
-            getattr(state, f"update_{data_type}")(group)
-            state.last_update_ts = now
-            if chunk_ts > 0:
-                state.last_chunk_ts = chunk_ts
+        with self._lock:
+            for code, group in df.groupby("Code"):
+                code_str = str(code)
+                if code_str not in self.states:
+                    self.states[code_str] = StockState(code=code_str)
+                state = self.states[code_str]
+                getattr(state, f"update_{data_type}")(group)
+                state.last_update_ts = now
+                if chunk_ts > 0:
+                    state.last_chunk_ts = chunk_ts
 
     def _consume_new_chunks(self) -> int:
         """扫描 ShmStore 中未处理的 chunk，增量更新 per-stock 状态。返回新处理数量。"""
@@ -222,26 +225,30 @@ class StreamingEngine:
             if not chunk_dir.exists():
                 continue
 
-            known = self.processed_chunks[data_type]
+            with self._lock:
+                known = set(self.processed_chunks[data_type])
 
             # 收集当前存在的文件名，用于清理 set 中已删除的条目
             alive = set()
+            new_files = []
             for f in chunk_dir.glob("chunk_*.arrow"):
                 alive.add(f.name)
-                if f.name in known:
-                    continue
+                if f.name not in known:
+                    new_files.append(f)
 
+            for f in new_files:
                 chunk_ts = _extract_chunk_ts(f.name)
                 df = _read_arrow(f)
                 self._update_states(df, data_type, chunk_ts)
-
-                known.add(f.name)
+                with self._lock:
+                    self.processed_chunks[data_type].add(f.name)
                 consumed += 1
 
             # 清理 set 中已被 collector 滚动删除的文件名
-            stale = known - alive
-            if stale:
-                known -= stale
+            with self._lock:
+                stale = self.processed_chunks[data_type] - alive
+                if stale:
+                    self.processed_chunks[data_type] -= stale
 
         return consumed
 
@@ -255,14 +262,17 @@ class StreamingEngine:
         date_str = now.strftime("%Y%m%d")
         end_time = now.strftime("%H%M%S")
 
-        self._trading_day = date_str
+        # 快照 states：持锁拷贝 dict，释放锁后再计算
+        with self._lock:
+            self._trading_day = date_str
+            snapshot = dict(self.states)
 
         logger.info("[streaming] 开始计算: date=%s end_time=%s stocks=%d",
-                    date_str, end_time, len(self.states))
+                    date_str, end_time, len(snapshot))
 
         t0 = time.time()
         results = []
-        for code, state in self.states.items():
+        for code, state in snapshot.items():
             try:
                 result = self.factor_calculation(state, code, date_str, end_time)
                 if result is not None:
@@ -317,12 +327,13 @@ class StreamingEngine:
     def _check_day_rollover(self) -> None:
         """交易日切换时清空状态。"""
         today = datetime.now().strftime("%Y%m%d")
-        if self._trading_day and today != self._trading_day:
-            logger.info("[streaming] 日切: %s -> %s，清空状态", self._trading_day, today)
-            self.states.clear()
-            for s in self.processed_chunks.values():
-                s.clear()
-            self._trading_day = today
+        with self._lock:
+            if self._trading_day and today != self._trading_day:
+                logger.info("[streaming] 日切: %s -> %s，清空状态", self._trading_day, today)
+                self.states.clear()
+                for s in self.processed_chunks.values():
+                    s.clear()
+                self._trading_day = today
             # 删掉旧 checkpoint
             try:
                 self._checkpoint_path.unlink(missing_ok=True)
@@ -349,20 +360,22 @@ class StreamingEngine:
         logger.info("[streaming] inotify 监听已启动")
 
     def on_new_chunk(self, path: Path) -> None:
-        """inotify 回调：新 chunk 文件写入时触发。"""
+        """inotify 回调：新 chunk 文件写入时触发。线程安全。"""
         parent = path.parent.name
         if parent not in ("tick", "deal", "order"):
             return
         if not path.name.startswith("chunk_") or not path.name.endswith(".arrow"):
             return
-        if path.name in self.processed_chunks.get(parent, set()):
-            return
+        with self._lock:
+            if path.name in self.processed_chunks.get(parent, set()):
+                return
 
         chunk_ts = _extract_chunk_ts(path.name)
         df = _read_arrow(path)
         self._update_states(df, parent, chunk_ts)
 
-        self.processed_chunks[parent].add(path.name)
+        with self._lock:
+            self.processed_chunks[parent].add(path.name)
 
     # ------------------------------------------------------------------ #
     # 主循环                                                               #

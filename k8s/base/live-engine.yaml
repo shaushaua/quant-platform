@@ -18,6 +18,8 @@ spec:
       labels:
         app: live-engine
     spec:
+      hostNetwork: true
+      dnsPolicy: Default
       nodeSelector:
         role: live-trading
       tolerations:

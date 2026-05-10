@@ -20,6 +20,7 @@ live-engine 容器 mmap 零拷贝读取
 - live_engine 读取时 concat 所有 chunk 文件，按 code 过滤
 """
 
+import itertools
 import logging
 import os
 import shutil
@@ -50,6 +51,9 @@ class ShmStore:
     tick/order/deal：每次写入新的 timestamped chunk，后台清理旧文件。
     quote/kline/daily_basic：单文件覆盖（数据量小，不需滚动）。
     """
+
+    # 递增序列号，保证 chunk 文件名唯一
+    _seq = itertools.count(int(time.time() * 1000))
 
     def __init__(self):
         for d in [
@@ -124,21 +128,21 @@ class ShmStore:
 
     def update_tick(self, df: pd.DataFrame) -> None:
         """写入新的 tick chunk。"""
-        ts = int(time.time() * 1000)
         with self._locks["tick"]:
-            self._write_arrow(SHM_BASE / "tick" / f"chunk_{ts}.arrow", df)
+            seq = next(self._seq)
+            self._write_arrow(SHM_BASE / "tick" / f"chunk_{seq}.arrow", df)
 
     def update_order(self, df: pd.DataFrame) -> None:
         """写入新的 order chunk。"""
-        ts = int(time.time() * 1000)
         with self._locks["order"]:
-            self._write_arrow(SHM_BASE / "order" / f"chunk_{ts}.arrow", df)
+            seq = next(self._seq)
+            self._write_arrow(SHM_BASE / "order" / f"chunk_{seq}.arrow", df)
 
     def update_deal(self, df: pd.DataFrame) -> None:
         """写入新的 deal chunk。"""
-        ts = int(time.time() * 1000)
         with self._locks["deal"]:
-            self._write_arrow(SHM_BASE / "deal" / f"chunk_{ts}.arrow", df)
+            seq = next(self._seq)
+            self._write_arrow(SHM_BASE / "deal" / f"chunk_{seq}.arrow", df)
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         with self._locks["kline"]:
