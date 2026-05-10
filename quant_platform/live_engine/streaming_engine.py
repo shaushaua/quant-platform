@@ -56,7 +56,8 @@ def _read_arrow(path: Path) -> Optional[pd.DataFrame]:
     try:
         reader = ipc.open_file(str(path))
         return reader.read_all().to_pandas()
-    except Exception:
+    except Exception as exc:
+        logger.warning("[read_arrow] 读取失败 %s: %s", path.name, exc)
         return None
 
 
@@ -223,7 +224,10 @@ class StreamingEngine:
 
             known = self.processed_chunks[data_type]
 
+            # 收集当前存在的文件名，用于清理 set 中已删除的条目
+            alive = set()
             for f in chunk_dir.glob("chunk_*.arrow"):
+                alive.add(f.name)
                 if f.name in known:
                     continue
 
@@ -233,6 +237,11 @@ class StreamingEngine:
 
                 known.add(f.name)
                 consumed += 1
+
+            # 清理 set 中已被 collector 滚动删除的文件名
+            stale = known - alive
+            if stale:
+                known -= stale
 
         return consumed
 
