@@ -1,83 +1,74 @@
-# live-engine CronJob：读取 collector 写入的共享内存，执行因子计算
-# 交易时段每分钟触发一次（北京 09:30-14:55）
-# 无数据时快速退出，有数据时计算因子并上传 OSS
+# live-engine：流式因子计算引擎（常驻 Deployment）
+# 增量消费 ShmStore chunk，维护 per-stock 聚合状态，每分钟计算因子
 ---
-apiVersion: batch/v1
-kind: CronJob
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: live-engine
   namespace: quant
   labels:
     app: live-engine
 spec:
-  # 北京时间 09:30-14:55 每分钟 = UTC 01:30-06:55
-  # */1 1-6 覆盖 UTC 01:00-06:59，开盘前空跑无数据会秒退
-  schedule: "*/1 1-6 * * 1-5"
-  concurrencyPolicy: Forbid          # 上一次未完成则跳过
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
-  jobTemplate:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: live-engine
+  template:
+    metadata:
+      labels:
+        app: live-engine
     spec:
-      backoffLimit: 0
-      template:
-        metadata:
-          labels:
-            app: live-engine
-        spec:
-          restartPolicy: Never
-          nodeSelector:
-            role: live-trading
-          tolerations:
-            - key: role
-              operator: Equal
-              value: live-trading
-              effect: NoSchedule
-          containers:
-            - name: live-engine
-              image: 172.24.99.176:5000/quant-platform/backtest-base:latest
-              command:
-                - python
-                - -m
-                - quant_platform.live_engine.factor_engine
-                - --phase
-                - live
-              env:
-                - name: TZ
-                  value: Asia/Shanghai
-                - name: SHM_STORE_PATH
-                  value: /dev/shm/quant-store
-                - name: FACTOR_MODULE
-                  value: "quant_platform.factor.examples.live_vwap"
-                - name: UNIVERSE
-                  value: ""   # 空=自动发现 ShmStore 中全部股票
-                - name: FACTOR_OUTPUT_PATH
-                  value: /data/factors
-                - name: FACTOR_PROCESSES
-                  value: "4"
-                - name: LOG_LEVEL
-                  value: INFO
-              envFrom:
-                - secretRef:
-                    name: quant-secrets
-              volumeMounts:
-                - name: shm-store
-                  mountPath: /dev/shm/quant-store
-                  readOnly: true
-                - name: factor-output
-                  mountPath: /data/factors
-              resources:
-                requests:
-                  cpu: "2"
-                  memory: 4Gi
-                limits:
-                  cpu: "4"
-                  memory: 8Gi
-          volumes:
+      nodeSelector:
+        role: live-trading
+      tolerations:
+        - key: role
+          operator: Equal
+          value: live-trading
+          effect: NoSchedule
+      containers:
+        - name: live-engine
+          image: 172.24.99.176:5000/quant-platform/backtest-base:latest
+          command:
+            - python
+            - -m
+            - quant_platform.live_engine.streaming_engine
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: SHM_STORE_PATH
+              value: /dev/shm/quant-store
+            - name: FACTOR_MODULE
+              value: "quant_platform.factor.examples.live_vwap"
+            - name: COMPUTE_INTERVAL
+              value: "60"
+            - name: UNIVERSE
+              value: ""
+            - name: FACTOR_OUTPUT_PATH
+              value: /data/factors
+            - name: LOG_LEVEL
+              value: INFO
+          envFrom:
+            - secretRef:
+                name: quant-secrets
+          volumeMounts:
             - name: shm-store
-              hostPath:
-                path: /dev/shm/quant-store
-                type: DirectoryOrCreate
+              mountPath: /dev/shm/quant-store
+              readOnly: true
             - name: factor-output
-              hostPath:
-                path: /data/quant/factors
-                type: DirectoryOrCreate
+              mountPath: /data/factors
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: shm-store
+          hostPath:
+            path: /dev/shm/quant-store
+            type: DirectoryOrCreate
+        - name: factor-output
+          hostPath:
+            path: /data/quant/factors
+            type: DirectoryOrCreate

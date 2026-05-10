@@ -26,6 +26,7 @@
 """
 
 from dataclasses import dataclass, field
+from typing import Optional
 import pandas as pd
 
 
@@ -79,6 +80,139 @@ class StockData:
             return getattr(self, key)
         except AttributeError:
             return default
+
+
+@dataclass
+class StockState:
+    """
+    单只股票的聚合状态（用于实盘流式计算）。
+
+    由 StreamingEngine 维护，每只股票约 200 bytes。
+    交易员的 factor_calculation(state, code, date, end_time) 直接读取此对象。
+
+    回测兼容：通过 from_stock_data() 从 StockData 提取聚合值。
+    """
+    code: str
+
+    # --- VWAP ---
+    cum_amount: float = 0.0    # sum(Price * Volume)
+    cum_volume: int = 0        # 累计成交量
+
+    # --- 价格 ---
+    latest_price: float = 0.0
+    open: float = 0.0
+    high: float = 0.0
+    low: float = float('inf')
+    pre_close: float = 0.0
+
+    # --- 买卖盘（最新快照）---
+    ask1: float = 0.0
+    bid1: float = 0.0
+    ask_volume1: int = 0
+    bid_volume1: int = 0
+
+    # --- 计数 ---
+    deal_count: int = 0
+    tick_count: int = 0
+    order_count: int = 0
+
+    # --- 时间 ---
+    last_deal_time: str = ""
+    last_tick_time: str = ""
+    last_order_time: str = ""
+
+    def update_tick(self, df: pd.DataFrame) -> None:
+        """从新的 tick chunk 更新状态。"""
+        if df.empty:
+            return
+        self.tick_count += len(df)
+
+        if 'CurrentPrice' in df.columns:
+            prices = df['CurrentPrice']
+            nonzero = prices[prices > 0]
+            if not nonzero.empty:
+                if self.open == 0.0:
+                    self.open = float(nonzero.iloc[0])
+                self.latest_price = float(nonzero.iloc[-1])
+                self.high = max(self.high, float(nonzero.max()))
+                if self.low == float('inf') or nonzero.min() > 0:
+                    self.low = min(self.low, float(nonzero.min()))
+
+        if 'PreClosePrice' in df.columns:
+            pc = df['PreClosePrice'].iloc[-1]
+            if pc > 0:
+                self.pre_close = float(pc)
+
+        if 'AskPrice1' in df.columns:
+            a1 = df['AskPrice1'].iloc[-1]
+            if a1 > 0:
+                self.ask1 = float(a1)
+        if 'BidPrice1' in df.columns:
+            b1 = df['BidPrice1'].iloc[-1]
+            if b1 > 0:
+                self.bid1 = float(b1)
+        if 'AskVolume1' in df.columns:
+            self.ask_volume1 = int(df['AskVolume1'].iloc[-1])
+        if 'BidVolume1' in df.columns:
+            self.bid_volume1 = int(df['BidVolume1'].iloc[-1])
+
+        if 'Time' in df.columns:
+            self.last_tick_time = str(df['Time'].iloc[-1])
+
+    def update_deal(self, df: pd.DataFrame) -> None:
+        """从新的 deal chunk 更新状态。"""
+        if df.empty:
+            return
+        self.deal_count += len(df)
+
+        if 'Price' in df.columns and 'Volume' in df.columns:
+            self.cum_amount += float((df['Price'] * df['Volume']).sum())
+            self.cum_volume += int(df['Volume'].sum())
+
+        if 'Time' in df.columns:
+            self.last_deal_time = str(df['Time'].iloc[-1])
+
+    def update_order(self, df: pd.DataFrame) -> None:
+        """从新的 order chunk 更新状态。"""
+        if df.empty:
+            return
+        self.order_count += len(df)
+
+        if 'Time' in df.columns:
+            self.last_order_time = str(df['Time'].iloc[-1])
+
+    @property
+    def vwap(self) -> float:
+        """加权平均成交价。"""
+        if self.cum_volume > 0:
+            return round(self.cum_amount / self.cum_volume, 4)
+        return float('nan')
+
+    @property
+    def spread(self) -> float:
+        """买卖一档价差。"""
+        if self.ask1 > 0 and self.bid1 > 0:
+            return round(self.ask1 - self.bid1, 4)
+        return float('nan')
+
+    @property
+    def change_pct(self) -> float:
+        """涨跌幅。"""
+        if self.pre_close > 0:
+            return round((self.latest_price - self.pre_close) / self.pre_close * 100, 4)
+        return float('nan')
+
+    @classmethod
+    def from_stock_data(cls, data: 'StockData') -> 'StockState':
+        """从 StockData（回测全量数据）提取聚合状态，用于回测兼容。"""
+        state = cls(code=data.code)
+        if not data.l1_tick.empty:
+            state.update_tick(data.l1_tick)
+        if not data.l2_deal.empty:
+            state.update_deal(data.l2_deal)
+        if not data.l2_order.empty:
+            state.update_order(data.l2_order)
+        return state
 
 
 class BaseFactor:
