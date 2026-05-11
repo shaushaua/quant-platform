@@ -157,9 +157,13 @@ class StockState:
             if b1 > 0:
                 self.bid1 = float(b1)
         if 'AskVolume1' in df.columns:
-            self.ask_volume1 = int(df['AskVolume1'].iloc[-1])
+            v = df['AskVolume1'].iloc[-1]
+            if pd.notna(v):
+                self.ask_volume1 = int(v)
         if 'BidVolume1' in df.columns:
-            self.bid_volume1 = int(df['BidVolume1'].iloc[-1])
+            v = df['BidVolume1'].iloc[-1]
+            if pd.notna(v):
+                self.bid_volume1 = int(v)
 
         if 'Time' in df.columns:
             self.last_tick_time = str(df['Time'].iloc[-1])
