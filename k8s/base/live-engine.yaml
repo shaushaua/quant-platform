@@ -40,7 +40,7 @@ spec:
             - name: SHM_STORE_PATH
               value: /dev/shm/quant-store
             - name: FACTOR_MODULE
-              value: "quant_platform.factor.examples.live_vwap"
+              value: "quant_platform.factor.examples.live_momentum"
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: UNIVERSE
