@@ -37,6 +37,9 @@ class TonglanceDataConverter:
 
     def _map_codes(self, df: pd.DataFrame, market: str) -> pd.DataFrame:
         """将 SecurityID（股票代码）格式化为标准格式。"""
+        # 如果原始列名是 SecurityID，先改为 Code
+        if "SecurityID" in df.columns and "Code" not in df.columns:
+            df = df.rename(columns={"SecurityID": "Code"})
         suffix = ".XSHG" if market == "SH" else ".XSHE"
         df["Code"] = df["Code"].astype(str).str.zfill(6) + suffix
         return df
