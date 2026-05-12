@@ -350,7 +350,7 @@ class Collector:
     """
 
     def __init__(self):
-        self._converter = TonglanceDataConverter()
+        self._converter = TonglanceDataConverter()  # 先创建，后面加载映射表后更新
         self._store = ShmStore()
         self._stop_event = threading.Event()
         self._trading_day = date.today()
@@ -358,6 +358,7 @@ class Collector:
         self._watcher = DayDirWatcher(self._day_dir, SKIP_HISTORY)
         self._daily_basic_cache: Optional[DailyBasicCache] = None
         self._uploaded_today = False
+        self._security_id_map: Dict[int, str] = {}  # SECURITY_ID → "000001.XSHE"
 
         # 线程池：并行处理多个文件的数据（order/deal/tick 同时到达时并行）
         self._pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="handler")
@@ -371,7 +372,7 @@ class Collector:
         self._disk_thread.start()
 
     def _load_daily_basic(self):
-        """从 MySQL 加载 daily_basic 写入 ShmStore。"""
+        """从 MySQL 加载 daily_basic 写入 ShmStore，并构建 SECURITY_ID 映射表。"""
         try:
             market_count = int(os.environ.get("DAILY_BASIC_MARKET_COUNT", "1"))
             cache = DailyBasicCache(market_count=market_count)
@@ -381,13 +382,36 @@ class Collector:
                 if not df.empty:
                     self._store.update_daily_basic(df)
                     self._daily_basic_cache = cache
-                    logger.info("[daily_basic] 已加载到 ShmStore: %d 条", len(df))
+                    # 构建 SECURITY_ID → 股票代码 映射
+                    self._build_security_id_map(df)
+                    logger.info("[daily_basic] 已加载到 ShmStore: %d 条, 映射表: %d 条",
+                                len(df), len(self._security_id_map))
                 else:
                     logger.warning("[daily_basic] MySQL 返回空数据")
             else:
                 logger.warning("[daily_basic] 加载失败，继续运行")
         except Exception as e:
             logger.warning("[daily_basic] 加载异常: %s", e)
+
+    def _build_security_id_map(self, daily_basic: pd.DataFrame) -> None:
+        """从 daily_basic 构建 SECURITY_ID → 股票代码 映射表，更新 converter。"""
+        if "SECURITY_ID" not in daily_basic.columns or "ID_QI" not in daily_basic.columns:
+            logger.warning("[映射表] daily_basic 缺少 SECURITY_ID 或 ID_QI 列")
+            return
+        sec_map = {}
+        for _, row in daily_basic.iterrows():
+            sec_id = int(row["SECURITY_ID"])
+            code = str(row["ID_QI"]).zfill(6)
+            # 判断市场后缀
+            if code.startswith(("6", "9", "68")):
+                sec_map[sec_id] = f"{code}.XSHG"
+            else:
+                sec_map[sec_id] = f"{code}.XSHE"
+        self._security_id_map = sec_map
+        # 更新 converter 的映射表
+        self._converter = TonglanceDataConverter(security_id_map=sec_map)
+        logger.info("[映射表] 已构建: %d 条 (示例: %s)",
+                    len(sec_map), dict(list(sec_map.items())[:3]))
 
     def _enqueue_disk(self, data_type: str, df: pd.DataFrame):
         """尝试将 DataFrame 放入落盘队列。队列满则丢弃（已有 ShmStore 实时数据兜底）。"""
