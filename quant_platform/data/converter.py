@@ -387,7 +387,11 @@ class TonglanceDataConverter:
 
             # 解析时间
             df["Time"] = self._parse_time(df["Time"], trading_day)
-            df["UpdateTime"] = self._parse_time(df["UpdateTime"], trading_day)
+            # SH tick 一般有 LocalTime，但防御性处理
+            if "UpdateTime" in df.columns:
+                df["UpdateTime"] = self._parse_time(df["UpdateTime"], trading_day)
+            else:
+                df["UpdateTime"] = df["Time"]
 
             # 设置涨跌停价
             df["HighLimitPrice"] = high_limit
@@ -426,8 +430,8 @@ class TonglanceDataConverter:
                     logger.debug("[SH tick] 列 '%s' 缺失，填充默认值 %s", col, default)
                     df[col] = default
 
-            # 诊断日志：打印原始列名（首次）
-            logger.info("[SH tick] 原始列名(前20): %s", list(raw_data.columns[:20]) if isinstance(raw_data, pd.DataFrame) else "?")
+            # 诊断日志：打印原始列名（所有列）
+            logger.info("[SH tick] 原始列名(%d个): %s", len(raw_data.columns) if isinstance(raw_data, pd.DataFrame) else 0, list(raw_data.columns) if isinstance(raw_data, pd.DataFrame) else "?")
 
             # 类型转换
             df = self._convert_dtypes(df, "tick")
@@ -482,7 +486,12 @@ class TonglanceDataConverter:
 
             # 解析时间
             df["Time"] = self._parse_time(df["Time"], trading_day)
-            df["UpdateTime"] = self._parse_time(df["UpdateTime"], trading_day)
+            # SZ tick 可能没有 LocalTime 列，此时用 Time 作为 UpdateTime
+            if "UpdateTime" in df.columns:
+                df["UpdateTime"] = self._parse_time(df["UpdateTime"], trading_day)
+            else:
+                logger.debug("[SZ tick] 无 LocalTime 列，UpdateTime 复用 Time")
+                df["UpdateTime"] = df["Time"]
 
             # 设置通道和序列号
             df["Channel"] = np.int64(0)
@@ -523,8 +532,8 @@ class TonglanceDataConverter:
                     logger.debug("[SZ tick] 列 '%s' 缺失，填充默认值 %s", col, default)
                     df[col] = default
 
-            # 诊断日志：打印原始列名（首次）
-            logger.info("[SZ tick] 原始列名(前20): %s", list(raw_data.columns[:20]) if isinstance(raw_data, pd.DataFrame) else "?")
+            # 诊断日志：打印原始列名（所有列）
+            logger.info("[SZ tick] 原始列名(%d个): %s", len(raw_data.columns) if isinstance(raw_data, pd.DataFrame) else 0, list(raw_data.columns) if isinstance(raw_data, pd.DataFrame) else "?")
 
             # 类型转换
             df = self._convert_dtypes(df, "tick")
