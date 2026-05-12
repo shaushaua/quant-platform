@@ -373,6 +373,7 @@ class Collector:
 
     def _load_daily_basic(self):
         """从 MySQL 加载 daily_basic 写入 ShmStore，并构建 SECURITY_ID 映射表。"""
+        loaded = False
         try:
             market_count = int(os.environ.get("DAILY_BASIC_MARKET_COUNT", "1"))
             cache = DailyBasicCache(market_count=market_count)
@@ -382,16 +383,34 @@ class Collector:
                 if not df.empty:
                     self._store.update_daily_basic(df)
                     self._daily_basic_cache = cache
-                    # 构建 SECURITY_ID → 股票代码 映射
                     self._build_security_id_map(df)
                     logger.info("[daily_basic] 已加载到 ShmStore: %d 条, 映射表: %d 条",
                                 len(df), len(self._security_id_map))
+                    loaded = True
                 else:
-                    logger.warning("[daily_basic] MySQL 返回空数据")
+                    logger.warning("[daily_basic] %s 无数据，尝试前一天", trade_date)
             else:
-                logger.warning("[daily_basic] 加载失败，继续运行")
+                logger.warning("[daily_basic] load(%s) 失败，尝试前一天", trade_date)
+
+            # 当天无数据时，用前一天构建映射表（ID_QI/SECURITY_ID 映射不随日期变化）
+            if not loaded:
+                from datetime import timedelta
+                for offset in range(1, 10):
+                    prev_day = (self._trading_day - timedelta(days=offset)).strftime("%Y%m%d")
+                    logger.info("[daily_basic] 尝试加载 %s ...", prev_day)
+                    if cache.load(prev_day):
+                        df = cache.get_daily_basic()
+                        if not df.empty:
+                            self._build_security_id_map(df)
+                            logger.info("[daily_basic] 从 %s 恢复映射表: %d 条",
+                                        prev_day, len(self._security_id_map))
+                            loaded = True
+                            break
         except Exception as e:
             logger.warning("[daily_basic] 加载异常: %s", e)
+
+        if not loaded:
+            logger.error("[daily_basic] 所有日期均加载失败，股票代码映射不可用！")
 
     def _build_security_id_map(self, daily_basic: pd.DataFrame) -> None:
         """从 daily_basic 构建 SECURITY_ID → 股票代码 映射表，更新 converter。"""
