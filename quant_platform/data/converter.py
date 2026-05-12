@@ -117,7 +117,7 @@ class TonglanceDataConverter:
             return orders, deals
 
         except Exception as e:
-            logger.error(f"转换上交所合并委托+成交数据失败: {e}")
+            logger.error(f"转换上交所合并委托+成交数据失败: {e}", exc_info=True)
             return (
                 pd.DataFrame(columns=ORDER_COLUMNS),
                 pd.DataFrame(columns=DEAL_COLUMNS),
@@ -177,7 +177,7 @@ class TonglanceDataConverter:
             return df
 
         except Exception as e:
-            logger.error(f"转换上交所委托数据失败: {e}")
+            logger.error(f"转换上交所委托数据失败: {e}", exc_info=True)
             return pd.DataFrame(columns=ORDER_COLUMNS)
 
     def convert_sz_order(self, raw_data, trading_day: datetime) -> pd.DataFrame:
@@ -234,7 +234,7 @@ class TonglanceDataConverter:
             return df
 
         except Exception as e:
-            logger.error(f"转换深交所委托数据失败: {e}")
+            logger.error(f"转换深交所委托数据失败: {e}", exc_info=True)
             return pd.DataFrame(columns=ORDER_COLUMNS)
 
     # ==================== 成交数据转换 ====================
@@ -284,7 +284,7 @@ class TonglanceDataConverter:
             return df
 
         except Exception as e:
-            logger.error(f"转换上交所成交数据失败: {e}")
+            logger.error(f"转换上交所成交数据失败: {e}", exc_info=True)
             return pd.DataFrame(columns=DEAL_COLUMNS)
 
     def convert_sz_deal(self, raw_data, trading_day: datetime) -> pd.DataFrame:
@@ -335,7 +335,7 @@ class TonglanceDataConverter:
             return df
 
         except Exception as e:
-            logger.error(f"转换深交所成交数据失败: {e}")
+            logger.error(f"转换深交所成交数据失败: {e}", exc_info=True)
             return pd.DataFrame(columns=DEAL_COLUMNS)
 
     # ==================== Tick数据转换 ====================
@@ -414,6 +414,21 @@ class TonglanceDataConverter:
             if "OpenPrice" not in df.columns:
                 df["OpenPrice"] = 0.0
 
+            # 补齐可能缺失的汇总列
+            for col, default in [
+                ("TotalAskVolume", 0.0),
+                ("TotalBidVolume", 0.0),
+                ("TradeNum", 0.0),
+                ("AvgBidPrice", 0.0),
+                ("AvgAskPrice", 0.0),
+            ]:
+                if col not in df.columns:
+                    logger.debug("[SH tick] 列 '%s' 缺失，填充默认值 %s", col, default)
+                    df[col] = default
+
+            # 诊断日志：打印原始列名（首次）
+            logger.info("[SH tick] 原始列名(前20): %s", list(raw_data.columns[:20]) if isinstance(raw_data, pd.DataFrame) else "?")
+
             # 类型转换
             df = self._convert_dtypes(df, "tick")
 
@@ -423,7 +438,7 @@ class TonglanceDataConverter:
             return df
 
         except Exception as e:
-            logger.error(f"转换上交所Tick数据失败: {e}")
+            logger.error(f"转换上交所Tick数据失败: {e}", exc_info=True)
             return pd.DataFrame(columns=TICK_COLUMNS)
 
     def convert_sz_tick(self, raw_data, trading_day: datetime) -> pd.DataFrame:
@@ -496,6 +511,21 @@ class TonglanceDataConverter:
             if "LowLimitPrice" not in df.columns:
                 df["LowLimitPrice"] = 0.0
 
+            # 补齐可能缺失的汇总列
+            for col, default in [
+                ("TotalAskVolume", 0.0),
+                ("TotalBidVolume", 0.0),
+                ("TradeNum", 0.0),
+                ("AvgBidPrice", 0.0),
+                ("AvgAskPrice", 0.0),
+            ]:
+                if col not in df.columns:
+                    logger.debug("[SZ tick] 列 '%s' 缺失，填充默认值 %s", col, default)
+                    df[col] = default
+
+            # 诊断日志：打印原始列名（首次）
+            logger.info("[SZ tick] 原始列名(前20): %s", list(raw_data.columns[:20]) if isinstance(raw_data, pd.DataFrame) else "?")
+
             # 类型转换
             df = self._convert_dtypes(df, "tick")
 
@@ -505,7 +535,7 @@ class TonglanceDataConverter:
             return df
 
         except Exception as e:
-            logger.error(f"转换深交所Tick数据失败: {e}")
+            logger.error(f"转换深交所Tick数据失败: {e}", exc_info=True)
             return pd.DataFrame(columns=TICK_COLUMNS)
 
     # ==================== 通用转换 ====================
@@ -543,26 +573,40 @@ class TonglanceDataConverter:
     # ==================== 辅助方法 ====================
 
     def _parse_time(self, time_data, trading_day: datetime) -> pd.Series:
-        """解析时间字段"""
+        """解析时间字段，支持 HH:MM:SS.mmm 字符串和 HHMMSSmmm 整数格式。"""
         if time_data.dtype == object:
             # 字符串格式
             try:
-                # 尝试解析 YYYYMMDDHHMMSSmmm 格式
+                # 尝试解析 HH:MM:SS 格式（含/不含毫秒）
                 return pd.to_datetime(
-                    trading_day.strftime("%Y-%m-%d ") + time_data.astype(str).str[:6],
-                    format="%Y-%m-%d %H%M%S"
+                    trading_day.strftime("%Y-%m-%d ") + time_data.astype(str),
+                    format="mixed",
                 )
-            except:
+            except Exception:
                 try:
-                    # 尝试解析 HH:MM:SS 格式
                     return pd.to_datetime(
                         trading_day.strftime("%Y-%m-%d ") + time_data.astype(str)
                     )
-                except:
+                except Exception:
                     return pd.NaT
         else:
-            # 数值格式
-            return pd.to_datetime(time_data, unit="ms")
+            # 数值格式：通联 SZ 数据可能是 HHMMSSmmm 整数（如 93000000 = 09:30:00.000）
+            nums = pd.to_numeric(time_data, errors="coerce")
+            if nums.empty:
+                return pd.NaT
+            max_val = nums.max()
+            if pd.notna(max_val) and max_val > 1e12:
+                # 大数值：当作毫秒时间戳
+                return pd.to_datetime(nums, unit="ms")
+            else:
+                # 小数值：HHMMSSmmm 格式
+                # 93000000 → "09:30:00.000"
+                strs = nums.astype(int).astype(str).str.zfill(9)
+                time_strs = strs.str[:2] + ":" + strs.str[2:4] + ":" + strs.str[4:6] + "." + strs.str[6:]
+                return pd.to_datetime(
+                    trading_day.strftime("%Y-%m-%d ") + time_strs,
+                    format="mixed",
+                )
 
     def _convert_dtypes(self, df: pd.DataFrame, data_type: str) -> pd.DataFrame:
         """转换数据类型"""
