@@ -30,31 +30,15 @@ class TonglanceDataConverter:
     将通联原始数据转换为标准格式
     """
 
-    def __init__(self, security_id_map: Optional[Dict[int, str]] = None):
-        """
-        Args:
-            security_id_map: SECURITY_ID → 股票代码 映射表。
-                例: {2: "000001.XSHE", 102: "600030.XSHG"}
-                如果为 None，则回退到 zfill(6) 的旧行为（不推荐）。
-        """
+    def __init__(self):
         self.price_precision = 100  # 价格精度（除以100）
         self._sh_pattern = re.compile(r'^[6]\d{5}\.XSHG$')
         self._sz_pattern = re.compile(r'^[03]\d{5}\.XSHE$')
-        self._security_id_map = security_id_map or {}
 
     def _map_codes(self, df: pd.DataFrame, market: str) -> pd.DataFrame:
-        """将 SecurityID（日频主键）映射为正确的股票代码。
-
-        使用 _security_id_map 查表；找不到的回退到 zfill(6)。
-        """
-        if self._security_id_map:
-            raw_ids = pd.to_numeric(df["Code"], errors="coerce").astype("Int64")
-            df["Code"] = raw_ids.map(self._security_id_map).fillna(
-                df["Code"].astype(str).str.zfill(6) + f".{market}"
-            )
-        else:
-            suffix = ".XSHG" if market == "SH" else ".XSHE"
-            df["Code"] = df["Code"].astype(str).str.zfill(6) + suffix
+        """将 SecurityID（股票代码）格式化为标准格式。"""
+        suffix = ".XSHG" if market == "SH" else ".XSHE"
+        df["Code"] = df["Code"].astype(str).str.zfill(6) + suffix
         return df
 
     # ==================== 上交所合并委托+成交 (mdl_4_24_0) ====================
