@@ -24,6 +24,9 @@ spec:
           operator: Equal
           value: live-trading
           effect: NoSchedule
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       hostNetwork: true
       dnsPolicy: Default
       containers:

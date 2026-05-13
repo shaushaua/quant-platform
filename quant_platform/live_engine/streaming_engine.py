@@ -291,9 +291,10 @@ class StreamingEngine:
                     result["_chunk_ts"] = state.last_chunk_ts
                     result["_consume_ts"] = state.last_update_ts
                     if state.last_chunk_ts > 0:
-                        result["e2e_latency_ms"] = round(
-                            (t0 - state.last_chunk_ts) * 1000, 1
-                        )
+                        latency_ms = round((t0 - state.last_chunk_ts) * 1000, 1)
+                        # 超过 10 分钟视为旧 checkpoint 残留，不纳入统计
+                        if latency_ms < 600_000:
+                            result["e2e_latency_ms"] = latency_ms
                     results.append(result)
             except Exception as exc:
                 logger.warning("[%s] 因子计算失败: %s", code, exc)

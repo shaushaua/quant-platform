@@ -584,21 +584,45 @@ class TonglanceDataConverter:
 
     # ==================== 辅助方法 ====================
 
+    @staticmethod
+    def _normalize_time_str(time_str: str) -> str:
+        """归一化时间字符串，处理秒数 >= 60 的情况。
+        例如 "00:05:60.780" → "00:06:00.780"
+        """
+        try:
+            parts = time_str.split(":")
+            if len(parts) < 3:
+                return time_str
+            h = int(parts[0])
+            m = int(parts[1])
+            sec_parts = parts[2].split(".")
+            s = int(sec_parts[0])
+            ms = int(sec_parts[1].ljust(3, "0")[:3]) if len(sec_parts) > 1 else 0
+            # 归一化：毫秒进位到秒，秒进位到分，分进位到时
+            extra_s, ms = divmod(ms, 1000)
+            s += extra_s
+            extra_m, s = divmod(s, 60)
+            m += extra_m
+            h += m // 60
+            m = m % 60
+            return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+        except Exception:
+            return time_str
+
     def _parse_time(self, time_data, trading_day: datetime) -> pd.Series:
-        """解析时间字段，支持 HH:MM:SS.mmm 字符串和 HHMMSSmmm 整数格式。"""
+        """解析时间字段，支持 HH:MM:SS.mmm 字符串和 HHMMSSmmm 整数格式。
+        通联数据秒数可能 >= 60（如 00:05:60.780），会先归一化再解析。
+        """
         if time_data.dtype == object:
-            # 字符串格式
+            time_strs = time_data.astype(str)
+            # 归一化：秒数 >= 60 时进位到分钟
+            time_strs = time_strs.apply(self._normalize_time_str)
+            combined = trading_day.strftime("%Y-%m-%d ") + time_strs
             try:
-                # 尝试解析 HH:MM:SS 格式（含/不含毫秒）
-                return pd.to_datetime(
-                    trading_day.strftime("%Y-%m-%d ") + time_data.astype(str),
-                    format="mixed",
-                )
+                return pd.to_datetime(combined, format="mixed", errors="coerce")
             except Exception:
                 try:
-                    return pd.to_datetime(
-                        trading_day.strftime("%Y-%m-%d ") + time_data.astype(str)
-                    )
+                    return pd.to_datetime(combined, errors="coerce")
                 except Exception:
                     return pd.NaT
         else:
@@ -613,11 +637,14 @@ class TonglanceDataConverter:
             else:
                 # 小数值：HHMMSSmmm 格式
                 # 93000000 → "09:30:00.000"
+                # 148182540 → "14:81:82.540" → 归一化 → "15:22:22.540"
                 strs = nums.astype(int).astype(str).str.zfill(9)
                 time_strs = strs.str[:2] + ":" + strs.str[2:4] + ":" + strs.str[4:6] + "." + strs.str[6:]
+                time_strs = time_strs.apply(self._normalize_time_str)
                 return pd.to_datetime(
                     trading_day.strftime("%Y-%m-%d ") + time_strs,
                     format="mixed",
+                    errors="coerce",
                 )
 
     def _convert_dtypes(self, df: pd.DataFrame, data_type: str) -> pd.DataFrame:
