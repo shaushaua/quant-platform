@@ -35,13 +35,27 @@ class TonglanceDataConverter:
         self._sh_pattern = re.compile(r'^[6]\d{5}\.XSHG$')
         self._sz_pattern = re.compile(r'^[03]\d{5}\.XSHE$')
 
+    # 股票代码前缀（只处理这些，过滤掉基金/债券/指数等非股票品种）
+    _SH_STOCK_PREFIX = ("6", "9")     # 600xxx, 601xxx, 603xxx, 605xxx, 9xxxxx
+    _SZ_STOCK_PREFIX = ("0", "3")     # 000xxx, 001xxx, 002xxx, 003xxx, 300xxx
+
     def _map_codes(self, df: pd.DataFrame, market: str) -> pd.DataFrame:
-        """将 SecurityID（股票代码）格式化为标准格式。"""
+        """将 SecurityID（股票代码）格式化为标准格式，过滤非股票品种。"""
         # 如果原始列名是 SecurityID，先改为 Code
         if "SecurityID" in df.columns and "Code" not in df.columns:
             df = df.rename(columns={"SecurityID": "Code"})
         suffix = ".XSHG" if market == "SH" else ".XSHE"
         df["Code"] = df["Code"].astype(str).str.zfill(6) + suffix
+        # 只保留股票代码，过滤基金(501xxx/159xxx)、债券(11xxxx)等
+        prefixes = self._SH_STOCK_PREFIX if market == "SH" else self._SZ_STOCK_PREFIX
+        code_prefix = df["Code"].str[0]
+        mask = code_prefix.isin(prefixes)
+        n_before = len(df)
+        df = df[mask].copy()
+        n_filtered = n_before - len(df)
+        if n_filtered > 0:
+            logger.debug("[_map_codes] %s: 过滤 %d/%d 行非股票品种",
+                        market, n_filtered, n_before)
         return df
 
     # ==================== 上交所合并委托+成交 (mdl_4_24_0) ====================
