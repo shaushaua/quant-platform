@@ -636,8 +636,8 @@ class DataAPI:
 
         # 使用 OSS loader 读取文件
         try:
-            bucket = os.getenv("OSS_DATA_BUCKET", "quant-mdl-data")
-            local_cache_path = self._oss._get_cache_path(oss_path)
+            bucket = os.getenv("OSS_RESULT_BUCKET", "stock-mdl-data-result")
+            local_cache_path = self._oss._get_cache_path(f"{bucket}/{oss_path}")
 
             # 先检查本地缓存
             if os.path.exists(local_cache_path):
@@ -699,7 +699,7 @@ class DataAPI:
         import oss2
 
         try:
-            bucket = os.getenv("OSS_DATA_BUCKET", "quant-mdl-data")
+            bucket = os.getenv("OSS_RESULT_BUCKET", "stock-mdl-data-result")
             auth = oss2.Auth(
                 os.getenv("OSS_ACCESS_KEY_ID"),
                 os.getenv("OSS_ACCESS_KEY_SECRET")
