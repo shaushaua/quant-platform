@@ -259,6 +259,11 @@ class StreamingEngine:
                 df = _read_arrow(f)
                 self._update_states(df, data_type, chunk_ts)
                 consumed += 1
+                # 消费后删除 chunk，由计算端控制数据生命周期
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
             # 清理 set 中已被 collector 滚动删除的文件名
             with self._lock:
@@ -390,6 +395,11 @@ class StreamingEngine:
         chunk_ts = _extract_chunk_ts(path.name)
         df = _read_arrow(path)
         self._update_states(df, parent, chunk_ts)
+        # 消费后删除 chunk
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ #
     # 主循环                                                               #

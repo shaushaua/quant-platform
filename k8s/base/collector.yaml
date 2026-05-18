@@ -59,9 +59,9 @@ spec:
               value: "quant-mdl-data"
             - name: COLLECTOR_DISK_OUTPUT
               value: /data/collector_output
-            # 滚动 chunk 保留时长（秒），默认 300 = 5 分钟
+            # 兜底清理窗口（秒），live-engine 正常消费时不会触发
             - name: ROLLING_WINDOW_SECONDS
-              value: "300"
+              value: "1800"
           envFrom:
             - secretRef:
                 name: quant-secrets

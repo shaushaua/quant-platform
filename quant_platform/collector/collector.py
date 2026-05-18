@@ -697,9 +697,9 @@ class Collector:
 
     def _run_loop(self):
         last_cleanup = time.time()
-        last_rolling_cleanup = time.time()
         last_memlog = time.time()
         last_gc = time.time()
+        last_rolling_cleanup = time.time()
         loop_count = 0
         logger.info("[Collector] 启动，监听目录: %s", self._day_dir)
         logger.info("[Collector] 源文件清理: 保留 %d 天", DELETE_SOURCE_AFTER_DAYS)
@@ -748,7 +748,8 @@ class Collector:
                 self._log_memory()
                 last_memlog = now
 
-            # 每 30 秒清理过期的滚动 chunk 文件
+            # 每 30 秒清理过期 chunk（兜底：live-engine 正常消费时会自行删除，
+            # 只有 live-engine 宕机时 chunk 才会堆积超时被清理）
             if now - last_rolling_cleanup > 30:
                 self._store.cleanup_rolling()
                 last_rolling_cleanup = now

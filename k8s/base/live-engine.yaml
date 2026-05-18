@@ -58,7 +58,6 @@ spec:
           volumeMounts:
             - name: shm-store
               mountPath: /dev/shm/quant-store
-              readOnly: true
             - name: factor-output
               mountPath: /data/factors
           resources:
