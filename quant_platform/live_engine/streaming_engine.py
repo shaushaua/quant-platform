@@ -83,7 +83,7 @@ def _time_to_seconds(time_val) -> float:
       - "2025-01-03 09:30:01.000" 字符串
       - 93001000 或 "093001000" 整数/字符串 (HHMMSSmmm)
     """
-    import pandas as pd as _pd
+    import pandas as _pd
 
     # datetime / Timestamp
     if hasattr(time_val, 'hour'):

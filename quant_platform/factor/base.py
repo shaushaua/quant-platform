@@ -129,14 +129,14 @@ class StockState:
     def _update_market_time(self, time_val) -> None:
         """更新最新行情时间（取所有数据类型的最大值）。"""
         t = str(time_val)
-        # 零填充后比较字符串（兼容 HHMMSSmmm 整数和 datetime 字符串）
-        if t.zfill(20) > self._last_market_time_raw.zfill(20):
+        current = getattr(self, '_last_market_time_raw', '')
+        if t.zfill(20) > current.zfill(20):
             self._last_market_time_raw = t
 
     @property
     def last_market_time(self) -> str:
         """所有数据类型中最新的行情时间。"""
-        return self._last_market_time_raw
+        return getattr(self, '_last_market_time_raw', '')
 
     def update_tick(self, df: pd.DataFrame) -> None:
         """从新的 tick chunk 更新状态。"""
