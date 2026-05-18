@@ -178,15 +178,24 @@ class StreamingEngine:
             logger.warning("[checkpoint] 保存失败: %s", exc)
 
     def _load_checkpoint(self) -> None:
-        """从磁盘恢复 StockState。只恢复当天的 checkpoint，跨日丢弃。"""
+        """从磁盘恢复 StockState。开盘前或跨日时丢弃旧 checkpoint。"""
         if not self._checkpoint_path.exists():
             logger.info("[checkpoint] 无历史 checkpoint，冷启动")
+            return
+        now = datetime.now()
+        # 开盘前（09:15 之前）删除残留 checkpoint，确保每天干净启动
+        if now.hour < 9 or (now.hour == 9 and now.minute < 15):
+            logger.info("[checkpoint] 开盘前，删除残留 checkpoint")
+            try:
+                self._checkpoint_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return
         try:
             with open(self._checkpoint_path, "rb") as f:
                 data = pickle.load(f)
             ckpt_day = data.get("trading_day", "")
-            today = datetime.now().strftime("%Y%m%d")
+            today = now.strftime("%Y%m%d")
             if ckpt_day and ckpt_day != today:
                 logger.info("[checkpoint] checkpoint trading_day=%s != 今天=%s，丢弃旧状态",
                             ckpt_day, today)
