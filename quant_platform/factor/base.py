@@ -226,7 +226,7 @@ class StockState:
     @property
     def change_pct(self) -> float:
         """涨跌幅。"""
-        if self.pre_close > 0:
+        if self.pre_close > 0 and self.latest_price > 0:
             return round((self.latest_price - self.pre_close) / self.pre_close * 100, 4)
         return float('nan')
 
