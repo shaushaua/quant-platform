@@ -124,6 +124,19 @@ class StockState:
     # --- 时间（系统时间，用于延迟统计）---
     last_update_ts: float = 0.0     # wall clock of last chunk update
     last_chunk_ts: float = 0.0      # chunk write timestamp (from filename, seconds)
+    _last_market_time_raw: str = ""  # latest Time value across tick/deal/order
+
+    def _update_market_time(self, time_val) -> None:
+        """更新最新行情时间（取所有数据类型的最大值）。"""
+        t = str(time_val)
+        # 零填充后比较字符串（兼容 HHMMSSmmm 整数和 datetime 字符串）
+        if t.zfill(20) > self._last_market_time_raw.zfill(20):
+            self._last_market_time_raw = t
+
+    @property
+    def last_market_time(self) -> str:
+        """所有数据类型中最新的行情时间。"""
+        return self._last_market_time_raw
 
     def update_tick(self, df: pd.DataFrame) -> None:
         """从新的 tick chunk 更新状态。"""
@@ -166,7 +179,9 @@ class StockState:
                 self.bid_volume1 = int(v)
 
         if 'Time' in df.columns:
-            self.last_tick_time = str(df['Time'].iloc[-1])
+            t = df['Time'].iloc[-1]
+            self.last_tick_time = str(t)
+            self._update_market_time(t)
 
     def update_deal(self, df: pd.DataFrame) -> None:
         """从新的 deal chunk 更新状态。"""
@@ -179,7 +194,9 @@ class StockState:
             self.cum_volume += int(df['Volume'].sum())
 
         if 'Time' in df.columns:
-            self.last_deal_time = str(df['Time'].iloc[-1])
+            t = df['Time'].iloc[-1]
+            self.last_deal_time = str(t)
+            self._update_market_time(t)
 
     def update_order(self, df: pd.DataFrame) -> None:
         """从新的 order chunk 更新状态。"""
@@ -188,7 +205,9 @@ class StockState:
         self.order_count += len(df)
 
         if 'Time' in df.columns:
-            self.last_order_time = str(df['Time'].iloc[-1])
+            t = df['Time'].iloc[-1]
+            self.last_order_time = str(t)
+            self._update_market_time(t)
 
     @property
     def vwap(self) -> float:

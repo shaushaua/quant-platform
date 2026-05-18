@@ -38,9 +38,9 @@ spec:
             - --date
             - "20250103"
             - --speed
-            - max
-            - --max-rows
-            - "50000"
+            - "1x"
+            - --data-types
+            - tick,deal,order
           env:
             - name: TZ
               value: Asia/Shanghai

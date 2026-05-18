@@ -75,6 +75,42 @@ def _extract_chunk_ts(filename: str) -> float:
         return 0.0
 
 
+def _time_to_seconds(time_val) -> float:
+    """将 Time 列值转换为自午夜以来的秒数。
+
+    支持格式：
+      - datetime / Timestamp 对象
+      - "2025-01-03 09:30:01.000" 字符串
+      - 93001000 或 "093001000" 整数/字符串 (HHMMSSmmm)
+    """
+    import pandas as pd as _pd
+
+    # datetime / Timestamp
+    if hasattr(time_val, 'hour'):
+        return time_val.hour * 3600 + time_val.minute * 60 + time_val.second + time_val.microsecond / 1e6
+
+    s = str(time_val).strip()
+    # datetime 字符串 "2025-01-03 09:30:01"
+    if '-' in s and ':' in s:
+        try:
+            dt = _pd.Timestamp(s)
+            return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+        except Exception:
+            pass
+
+    # 纯数字 HHMMSSmmm
+    try:
+        raw = s.replace('.', '').replace(':', '')
+        raw = raw.zfill(6)  # 至少 HHMMSS
+        h = int(raw[0:2])
+        m = int(raw[2:4])
+        sec = int(raw[4:6])
+        ms = int(raw[6:9]) if len(raw) >= 9 else 0
+        return h * 3600 + m * 60 + sec + ms / 1000.0
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
     """上传因子结果到 OSS。"""
     try:
@@ -306,15 +342,21 @@ class StreamingEngine:
             try:
                 result = self.factor_calculation(state, code, date_str, end_time)
                 if result is not None:
-                    # 注入延迟统计字段
-                    result["_compute_ts"] = t0
-                    result["_chunk_ts"] = state.last_chunk_ts
-                    result["_consume_ts"] = state.last_update_ts
+                    # 数据延迟：行情时间 → 因子计算时刻
+                    if state.last_market_time:
+                        market_secs = _time_to_seconds(state.last_market_time)
+                        if market_secs > 0:
+                            wall_secs = now.hour * 3600 + now.minute * 60 + now.second
+                            data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
+                            # 只在合理范围内纳入统计（实盘 < 10 分钟）
+                            if abs(data_latency_ms) < 600_000:
+                                result["data_latency_ms"] = data_latency_ms
+
+                    # chunk 写入延迟（ShmStore → 计算）
                     if state.last_chunk_ts > 0:
-                        latency_ms = round((t0 - state.last_chunk_ts) * 1000, 1)
-                        # 超过 10 分钟视为旧 checkpoint 残留，不纳入统计
-                        if latency_ms < 600_000:
-                            result["e2e_latency_ms"] = latency_ms
+                        chunk_latency_ms = round((t0 - state.last_chunk_ts) * 1000, 1)
+                        if chunk_latency_ms < 600_000:
+                            result["chunk_latency_ms"] = chunk_latency_ms
                     results.append(result)
             except Exception as exc:
                 logger.warning("[%s] 因子计算失败: %s", code, exc)
@@ -325,11 +367,11 @@ class StreamingEngine:
         logger.info("[streaming] 计算完成: %d 条结果, 耗时 %.0fms", len(result_df), elapsed_ms)
 
         # 延迟统计
-        if not result_df.empty and "e2e_latency_ms" in result_df.columns:
-            valid = result_df["e2e_latency_ms"].dropna()
+        if not result_df.empty and "data_latency_ms" in result_df.columns:
+            valid = result_df["data_latency_ms"].dropna()
             if not valid.empty:
                 logger.info(
-                    "[streaming] 延迟: avg=%.0fms max=%.0fms min=%.0fms p50=%.0fms",
+                    "[streaming] 数据延迟(行情→计算): avg=%.0fms max=%.0fms min=%.0fms p50=%.0fms",
                     valid.mean(), valid.max(), valid.min(), valid.median(),
                 )
 

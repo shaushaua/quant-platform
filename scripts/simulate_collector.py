@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-模拟 collector：从 OSS 下载历史 parquet，转换 Code 后写入 ShmStore chunk
+模拟 collector：从 OSS 下载历史 parquet，转换 Code 后并行写入 ShmStore chunk
+tick / deal / order 同时写入，模拟实盘 inotify 同时触发。
 
 用法：
-    python simulate_collector.py --date 20250103 --speed max
+    python simulate_collector.py --date 20250103 --speed 1x
     python simulate_collector.py --date 20250103 --speed max --max-rows 50000
 """
 
 import argparse
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -19,7 +21,9 @@ import pyarrow.parquet as pq
 
 SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/quant-store"))
 CHUNK_ROWS = 5000
+
 _seq = 0
+_seq_lock = threading.Lock()
 
 
 def download_from_oss(date_str: str, data_type: str) -> Path:
@@ -71,28 +75,23 @@ def convert_codes(df: pd.DataFrame, code_map: dict) -> pd.DataFrame:
         return df
     df = df.copy()
     df["Code"] = df["Code"].map(code_map)
-    before = len(df)
     df = df.dropna(subset=["Code"])
-    dropped = before - len(df)
-    if dropped > 0 and chunk_count_global % 100 == 0:
-        print(f"[sim] 丢弃 {dropped} 行无映射的 Code")
     return df
 
 
-# 全局计数器（用于 convert_codes 日志）
-chunk_count_global = 0
-
-
 def write_chunk(df: pd.DataFrame, data_type: str) -> Path:
-    """写一个 chunk 到 ShmStore"""
+    """写一个 chunk 到 ShmStore（线程安全）"""
     global _seq
 
     chunk_dir = SHM_BASE / data_type
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = int(time.time() * 1000)
-    _seq += 1
-    path = chunk_dir / f"chunk_{ts}_{_seq:06d}.arrow"
+    with _seq_lock:
+        ts = int(time.time() * 1000)
+        _seq += 1
+        seq = _seq
+
+    path = chunk_dir / f"chunk_{ts}_{seq:06d}.arrow"
 
     table = pa.Table.from_pandas(df, preserve_index=False)
     tmp = path.with_suffix(".tmp")
@@ -102,9 +101,49 @@ def write_chunk(df: pd.DataFrame, data_type: str) -> Path:
     return path
 
 
+def writer_thread(data_type: str, parquet_path: Path, code_map: dict,
+                  speed: str, max_rows: int, results: dict):
+    """单数据类型的写入线程。"""
+    total_rows = 0
+    chunk_count = 0
+
+    pf = pq.ParquetFile(str(parquet_path))
+
+    for batch in pf.iter_batches(batch_size=CHUNK_ROWS):
+        df = batch.to_pandas()
+        if df.empty:
+            continue
+
+        df = convert_codes(df, code_map)
+        if df.empty:
+            continue
+
+        if max_rows > 0 and total_rows >= max_rows:
+            break
+
+        write_chunk(df, data_type)
+        chunk_count += 1
+        total_rows += len(df)
+
+        # 速度控制
+        if speed == "1x":
+            time.sleep(0.1)
+        elif speed not in ("max", "1x"):
+            try:
+                time.sleep(float(speed))
+            except ValueError:
+                pass
+
+        if chunk_count % 500 == 0:
+            print(f"[sim] {data_type}: {chunk_count} chunks, {total_rows} rows")
+
+    results[data_type] = {"chunks": chunk_count, "rows": total_rows}
+    print(f"[sim] {data_type} 完成: {chunk_count} chunks, {total_rows} rows")
+
+
 def simulate(date_str: str, speed: str, data_types: list, max_rows: int):
-    """主循环：下载 → 转换 Code → 分批写入"""
-    global _seq, chunk_count_global
+    """主入口：下载 → 启动多线程并行写入。"""
+    global _seq
     _seq = int(time.time() * 1000)
 
     # 加载代码映射
@@ -112,58 +151,41 @@ def simulate(date_str: str, speed: str, data_types: list, max_rows: int):
 
     t0 = time.time()
 
+    # 下载所有数据
+    parquet_files = {}
     for data_type in data_types:
-        print(f"\n{'='*40}")
-        print(f"[sim] 处理 {data_type}")
-        print(f"{'='*40}")
-
         try:
-            parquet_path = download_from_oss(date_str, data_type)
+            parquet_files[data_type] = download_from_oss(date_str, data_type)
         except Exception as e:
             print(f"[sim] 下载 {data_type} 失败: {e}，跳过")
-            continue
 
-        # 逐批读取写入，避免 OOM
-        pf = pq.ParquetFile(str(parquet_path))
-        total_rows = 0
-        chunk_count = 0
+    if not parquet_files:
+        print("[sim] 没有可用的数据")
+        return
 
-        for batch in pf.iter_batches(batch_size=CHUNK_ROWS):
-            df = batch.to_pandas()
-            if df.empty:
-                continue
+    # 每种数据类型一个线程，并行写入
+    results = {}
+    threads = []
+    for data_type, path in parquet_files.items():
+        t = threading.Thread(
+            target=writer_thread,
+            args=(data_type, path, code_map, speed, max_rows, results),
+            daemon=True,
+        )
+        threads.append(t)
 
-            # 转换 Code 列
-            df = convert_codes(df, code_map)
-            if df.empty:
-                continue
+    print(f"\n[sim] 启动 {len(threads)} 个写入线程: {list(parquet_files.keys())}")
+    for t in threads:
+        t.start()
 
-            if max_rows > 0 and total_rows >= max_rows:
-                break
-
-            write_chunk(df, data_type)
-            chunk_count += 1
-            chunk_count_global = chunk_count
-            total_rows += len(df)
-
-            # 速度控制
-            if speed == "max":
-                pass
-            elif speed == "1x":
-                time.sleep(0.1)
-            else:
-                try:
-                    time.sleep(float(speed))
-                except ValueError:
-                    pass
-
-            if chunk_count % 100 == 0:
-                print(f"[sim] {data_type}: {chunk_count} chunks, {total_rows} rows")
-
-        print(f"[sim] {data_type} 完成: {chunk_count} chunks, {total_rows} total rows")
+    # 等待所有线程完成
+    for t in threads:
+        t.join()
 
     elapsed = time.time() - t0
+    summary = ", ".join(f"{dt}={r['rows']}" for dt, r in results.items())
     print(f"\n[sim] 全部写入完成，耗时 {elapsed:.1f}s")
+    print(f"[sim] 数据量: {summary}")
 
 
 def main():
@@ -171,8 +193,8 @@ def main():
     parser.add_argument("--date", required=True, help="交易日 YYYYMMDD")
     parser.add_argument("--speed", default="max",
                         help="速度: max=最快, 1x=近似实盘, 数字=秒间隔")
-    parser.add_argument("--data-types", default="tick,deal",
-                        help="数据类型 (逗号分隔，默认 tick,deal)")
+    parser.add_argument("--data-types", default="tick,deal,order",
+                        help="数据类型 (逗号分隔，默认 tick,deal,order)")
     parser.add_argument("--max-rows", type=int, default=0,
                         help="每种数据最多读多少行 (0=全部)")
     args = parser.parse_args()

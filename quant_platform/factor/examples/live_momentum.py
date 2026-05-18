@@ -70,7 +70,7 @@ def outfun(date, end_time, result_df):
         print(f"  VWAP 均值: {valid['vwap'].mean():.4f}")
         print(f"  总成交量: {valid['total_vol'].sum():,.0f}")
         print(f"  涨跌幅均值: {valid['change_pct'].mean():.4f}%")
-    if "e2e_latency_ms" in result_df.columns:
-        lat = result_df["e2e_latency_ms"].dropna()
+    if "data_latency_ms" in result_df.columns:
+        lat = result_df["data_latency_ms"].dropna()
         if not lat.empty:
-            print(f"  延迟: avg={lat.mean():.0f}ms max={lat.max():.0f}ms")
+            print(f"  数据延迟(行情→计算): avg={lat.mean():.0f}ms max={lat.max():.0f}ms")
