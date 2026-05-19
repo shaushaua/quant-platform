@@ -161,11 +161,25 @@ class FilePoller:
                 with open(self.path, "r", encoding="utf-8", errors="replace") as f:
                     header_line = f.readline().strip()
                 self._header = header_line.split(",")
+                self._header_count = len(self._header)
 
-            # 如果 offset 从 0 开始，text 本身包含 header 行，用 pd.read_csv
             import io
+            # 通联数据行可能有 trailing comma（尾部逗号），导致字段数比 header 多1
+            # pandas 会将多余字段左移到已有列名上，造成列错位
+            # 修复：strip 每行的尾部逗号，确保字段数与 header 一致
+            n_cols = self._header_count
+            lines = text.split('\n')
+            cleaned = []
+            for line in lines:
+                line = line.rstrip('\r')
+                # 数据行字段数 = 逗号数 + 1；如果有 trailing comma 则逗号数 == n_cols
+                if line.count(',') == n_cols and not line.startswith(self._header[0]):
+                    line = line.rstrip(',').rstrip('\r')
+                cleaned.append(line)
+            text = '\n'.join(cleaned)
+
             if text.startswith(",".join(self._header[:3])):
-                # chunk 包含 header 行
+                # chunk 包含 header 行，直接解析
                 df = pd.read_csv(io.StringIO(text))
             else:
                 # chunk 只有数据行，手动指定 header

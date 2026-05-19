@@ -44,6 +44,11 @@ class TonglanceDataConverter:
         # 如果原始列名是 SecurityID，先改为 Code
         if "SecurityID" in df.columns and "Code" not in df.columns:
             df = df.rename(columns={"SecurityID": "Code"})
+        # 诊断日志：映射前 Code 列样本
+        if "Code" in df.columns:
+            code_samples = df["Code"].astype(str).unique()[:5].tolist()
+            logger.info("[_map_codes] %s: %d行, Code样本=%s",
+                        market, len(df), code_samples)
         suffix = ".XSHG" if market == "SH" else ".XSHE"
         df["Code"] = df["Code"].astype(str).str.zfill(6) + suffix
         # 只保留股票代码，过滤基金(501xxx/159xxx)、债券(11xxxx)等
