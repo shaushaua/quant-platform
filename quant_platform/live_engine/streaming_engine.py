@@ -48,6 +48,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# A 股交易时段（留 5 分钟余量）
+_TRADING_START = (9, 15)   # 09:15
+_TRADING_END = (15, 5)     # 15:05
+
+
+def _is_trading_hours() -> bool:
+    """当前是否在 A 股交易时段内。"""
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    return (h, m) >= _TRADING_START and (h, m) < _TRADING_END
+
 
 def _read_arrow(path: Path) -> Optional[pd.DataFrame]:
     """读取单个 Arrow IPC 文件。"""
@@ -132,7 +143,7 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
 
         year = date_str[:4]
         month = date_str[4:6]
-        key = f"{prefix}/{year}/{year}{month}/{date_str}_{end_time}.json"
+        key = f"{prefix}/{year}/{year}{month}/{date_str}/{end_time}.json"
 
         records = df.to_dict(orient="records")
         payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
@@ -481,16 +492,17 @@ class StreamingEngine:
                     logger.info("[streaming] 轮询消费 %d 个新 chunk", consumed)
                 last_poll_ts = now
 
-            # 定时计算
+            # 定时计算（仅交易时段）
             if now - self._last_output_ts >= self.compute_interval:
-                if self.states:
-                    self._compute_and_output()
-                else:
-                    logger.debug("[streaming] 无股票数据，跳过计算")
+                if _is_trading_hours():
+                    if self.states:
+                        self._compute_and_output()
+                    else:
+                        logger.debug("[streaming] 无股票数据，跳过计算")
                 self._last_output_ts = now
 
-            # 定时 checkpoint：每 30 秒保存一次
-            if now - last_checkpoint_ts >= 30 and self.states:
+            # 定时 checkpoint：仅交易时段保存
+            if now - last_checkpoint_ts >= 30 and self.states and _is_trading_hours():
                 self._save_checkpoint()
                 last_checkpoint_ts = now
 
