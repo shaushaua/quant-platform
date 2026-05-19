@@ -116,6 +116,13 @@ class StockState:
     tick_count: int = 0
     order_count: int = 0
 
+    # --- 委托聚合 ---
+    buy_order_count: int = 0       # 买方委托笔数 (Side=0)
+    sell_order_count: int = 0      # 卖方委托笔数 (Side=1)
+    buy_order_volume: int = 0      # 买方委托总量
+    sell_order_volume: int = 0     # 卖方委托总量
+    cancel_count: int = 0          # 撤单笔数 (OrderType=5)
+
     # --- 时间（数据时间）---
     last_deal_time: str = ""
     last_tick_time: str = ""
@@ -204,6 +211,22 @@ class StockState:
             return
         self.order_count += len(df)
 
+        # 买卖方向统计 (Side: 0=买, 1=卖)
+        if 'Side' in df.columns:
+            buy_mask = df['Side'] == 0
+            sell_mask = df['Side'] == 1
+            self.buy_order_count += int(buy_mask.sum())
+            self.sell_order_count += int(sell_mask.sum())
+
+            # 买卖委托量
+            if 'Volume' in df.columns:
+                self.buy_order_volume += int(df.loc[buy_mask, 'Volume'].sum())
+                self.sell_order_volume += int(df.loc[sell_mask, 'Volume'].sum())
+
+        # 撤单统计 (OrderType: SH=5, SZ暂无撤单类型)
+        if 'OrderType' in df.columns:
+            self.cancel_count += int((df['OrderType'] == 5).sum())
+
         if 'Time' in df.columns:
             t = df['Time'].iloc[-1]
             self.last_order_time = str(t)
@@ -228,6 +251,29 @@ class StockState:
         """涨跌幅。"""
         if self.pre_close > 0 and self.latest_price > 0:
             return round((self.latest_price - self.pre_close) / self.pre_close * 100, 4)
+        return float('nan')
+
+    @property
+    def order_imbalance(self) -> float:
+        """委托不平衡度：买方笔数占比（0~1），>0.5 偏买方。"""
+        total = self.buy_order_count + self.sell_order_count
+        if total > 0:
+            return round(self.buy_order_count / total, 4)
+        return float('nan')
+
+    @property
+    def order_buy_vol_ratio(self) -> float:
+        """买方委托量占比。"""
+        total = self.buy_order_volume + self.sell_order_volume
+        if total > 0:
+            return round(self.buy_order_volume / total, 4)
+        return float('nan')
+
+    @property
+    def cancel_ratio(self) -> float:
+        """撤单率。"""
+        if self.order_count > 0:
+            return round(self.cancel_count / self.order_count, 4)
         return float('nan')
 
     @classmethod
