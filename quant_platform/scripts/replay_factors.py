@@ -94,6 +94,24 @@ def _filter_stock_security_id(raw, id_col="SecurityID"):
     return raw[mask].copy()
 
 
+def _safe_int(val):
+    """安全转 int，处理 NaN。"""
+    try:
+        v = float(val)
+        return 0 if np.isnan(v) else int(v)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _safe_float(val):
+    """安全转 float，处理 NaN。"""
+    try:
+        v = float(val)
+        return 0.0 if np.isnan(v) else v
+    except (ValueError, TypeError):
+        return 0.0
+
+
 # ============================================================
 # 1. 从 OSS 拉实盘因子
 # ============================================================
@@ -189,14 +207,14 @@ def load_tonglance(msg_dir, date_str, nrows):
             code = f"{sid}.XSHG"
             t = str(r["UpdateTime"]).strip()
             tick_records.append((code, t, {
-                "CurrentPrice": float(r.get("LastPrice", 0) or 0),
-                "PreClosePrice": float(r.get("PreCloPrice", 0) or 0),
-                "HighPrice": float(r.get("HighPrice", 0) or 0),
-                "LowPrice": float(r.get("LowPrice", 0) or 0),
-                "AskPrice1": float(r.get("AskPrice1", 0) or 0),
-                "BidPrice1": float(r.get("BidPrice1", 0) or 0),
-                "AskVolume1": int(r.get("AskVolume1", 0) or 0),
-                "BidVolume1": int(r.get("BidVolume1", 0) or 0),
+                "CurrentPrice": _safe_float(r.get("LastPrice", 0)),
+                "PreClosePrice": _safe_float(r.get("PreCloPrice", 0)),
+                "HighPrice": _safe_float(r.get("HighPrice", 0)),
+                "LowPrice": _safe_float(r.get("LowPrice", 0)),
+                "AskPrice1": _safe_float(r.get("AskPrice1", 0)),
+                "BidPrice1": _safe_float(r.get("BidPrice1", 0)),
+                "AskVolume1": _safe_int(r.get("AskVolume1", 0)),
+                "BidVolume1": _safe_int(r.get("BidVolume1", 0)),
             }))
         del raw
         gc.collect()
@@ -214,14 +232,14 @@ def load_tonglance(msg_dir, date_str, nrows):
             code = f"{sid}.XSHE"
             t = str(r["UpdateTime"]).strip()
             tick_records.append((code, t, {
-                "CurrentPrice": float(r.get("LastPrice", 0) or 0),
-                "PreClosePrice": float(r.get("PreCloPrice", 0) or 0),
-                "HighPrice": float(r.get("HighPrice", 0) or 0),
-                "LowPrice": float(r.get("LowPrice", 0) or 0),
-                "AskPrice1": float(r.get("AskPrice1", 0) or 0),
-                "BidPrice1": float(r.get("BidPrice1", 0) or 0),
-                "AskVolume1": int(r.get("AskVolume1", 0) or 0),
-                "BidVolume1": int(r.get("BidVolume1", 0) or 0),
+                "CurrentPrice": _safe_float(r.get("LastPrice", 0)),
+                "PreClosePrice": _safe_float(r.get("PreCloPrice", 0)),
+                "HighPrice": _safe_float(r.get("HighPrice", 0)),
+                "LowPrice": _safe_float(r.get("LowPrice", 0)),
+                "AskPrice1": _safe_float(r.get("AskPrice1", 0)),
+                "BidPrice1": _safe_float(r.get("BidPrice1", 0)),
+                "AskVolume1": _safe_int(r.get("AskVolume1", 0)),
+                "BidVolume1": _safe_int(r.get("BidVolume1", 0)),
             }))
         del raw
         gc.collect()
@@ -240,9 +258,9 @@ def load_tonglance(msg_dir, date_str, nrows):
             t = str(r["TickTime"]).strip()
             ptype = str(r.get("Type", "")).strip()
             side = 0 if str(r.get("TickBSFlag", "")).strip() == "B" else 1
-            price = float(r.get("Price", 0) or 0)
-            vol = int(r.get("Qty", 0) or 0)
-            otype = 5 if ptype == "D" else 2  # D=撤单, A=普通
+            price = _safe_float(r.get("Price", 0))
+            vol = _safe_int(r.get("Qty", 0))
+            otype = 5 if ptype == "D" else 2
 
             if ptype == "T":
                 deal_records.append((code, t, price, vol))
@@ -265,9 +283,8 @@ def load_tonglance(msg_dir, date_str, nrows):
             t = str(r["TransactTime"]).strip()
             side_val = r.get("Side")
             side = 0 if (side_val == 49 or str(side_val) == "49") else 1
-            vol = int(r.get("OrderQty", 0) or 0)
-            otype = 1
-            order_records.append((code, t, side, vol, otype))
+            vol = _safe_int(r.get("OrderQty", 0))
+            order_records.append((code, t, side, vol, 1))
         del raw
         gc.collect()
 
@@ -283,8 +300,8 @@ def load_tonglance(msg_dir, date_str, nrows):
             sid = str(r["SecurityID"]).zfill(6)
             code = f"{sid}.XSHE"
             t = str(r["TransactTime"]).strip()
-            price = float(r.get("LastPx", 0) or 0)
-            vol = int(r.get("LastQty", 0) or 0)
+            price = _safe_float(r.get("LastPx", 0))
+            vol = _safe_int(r.get("LastQty", 0))
             deal_records.append((code, t, price, vol))
         del raw
         gc.collect()
