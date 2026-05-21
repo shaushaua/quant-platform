@@ -34,8 +34,8 @@ spec:
               TODAY=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y%m%d'))")
               python3 -m quant_platform.scripts.replay_factors \
                 --date $TODAY \
-                --stocks 10 \
-                --timepoints 24 \
+                --stocks 3 \
+                --timepoints 12 \
                 2>&1 | tee /data/quant/replay_verify.txt
               echo "=== 完成 ==="
           env:
@@ -49,6 +49,11 @@ spec:
               mountPath: /www/wwwroot/mdl/msg_backup
             - name: output
               mountPath: /data/quant
+          resources:
+            limits:
+              memory: 8Gi
+            requests:
+              memory: 4Gi
       volumes:
         - name: msg-backup
           hostPath:
