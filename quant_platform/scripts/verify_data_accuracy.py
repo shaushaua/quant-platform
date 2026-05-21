@@ -82,51 +82,30 @@ def load_last_factors(date_str):
 def awk_count_deal_sz(csv_path):
     """用 awk 从 SZ deal CSV 统计每只股票的成交量+笔数。
 
-    mdl_6_36_0.csv 列: TransactTime,...,SecurityID,...,LastPx,LastQty,...
-    只统计 SecurityID 以 0/3 开头的（SZ 股票）。
+    mdl_6_36_0.csv 列顺序: ChannelNo,ApplSeqNum,MDStreamID,BidApplSeqNum,
+        OfferApplSeqNum,SecurityID,SecurityIDSource,LastPx,LastQty,ExecType,...
+    SecurityID=第6列, LastQty=第9列
     """
-    awk_script = r'''
-    BEGIN { FS=","; OFS="," }
-    NR==1 {
-        for(i=1; i<=NF; i++) {
-            if ($i=="SecurityID") col_sid=i
-            if ($i=="LastQty") col_qty=i
-        }
-        next
-    }
-    {
-        sid = $col_sid
-        gsub(/^[ \t]+|[ \t]+$/, "", sid)
-        c = substr(sid, 1, 1)
-        if (c=="0" || c=="3") {
-            qty = $col_qty + 0
-            vol[sid] += qty
-            cnt[sid] += 1
-        }
-    }
-    END {
-        for (s in vol) print s, cnt[s], vol[s]
-    }
-    '''
-    print(f"    SZ deal: awk 统计...", end="", flush=True)
+    awk_script = 'NR>1 && substr($6,1,1)~/^[03]/{vol[$6]+=$9; cnt[$6]++} END{for(s in vol) print s,cnt[s],vol[s]}'
+    print(f"    SZ deal ({csv_path.stat().st_size/1024/1024/1024:.1f}GB): awk 统计...", end="", flush=True)
     try:
         result = subprocess.run(
-            ["awk", awk_script, str(csv_path)],
+            ["awk", "-F,", awk_script, str(csv_path)],
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
             print(f" 失败: {result.stderr[:200]}")
             return {}
+        if result.stderr:
+            print(f" stderr: {result.stderr[:200]}")
 
         lines = result.stdout.strip().split("\n")
         stats = {}
         for line in lines:
             parts = line.strip().split()
-            if len(parts) == 3:
+            if len(parts) >= 3:
                 sid = parts[0].zfill(6)
-                count = int(parts[1])
-                vol = float(parts[2])
-                stats[sid] = {"deal_count": count, "total_vol": vol}
+                stats[sid] = {"deal_count": int(parts[1]), "total_vol": float(parts[2])}
         print(f" {len(stats)} 只股票")
         return stats
     except Exception as e:
@@ -137,54 +116,28 @@ def awk_count_deal_sz(csv_path):
 def awk_count_deal_sh(csv_path):
     """用 awk 从 SH order+deal CSV 统计成交数据。
 
-    mdl_4_24_0.csv: Type=="T" 的是成交，TickTime, SecurityID, Price, Qty, ...
-    只统计 SecurityID 以 6/9 开头的（SH 股票）。
+    mdl_4_24_0.csv: Type=="T" 的是成交，SecurityID=第2列, Qty=第6列, Type=第8列
     """
-    awk_script = r'''
-    BEGIN { FS=","; OFS="," }
-    NR==1 {
-        for(i=1; i<=NF; i++) {
-            if ($i=="SecurityID") col_sid=i
-            if ($i=="Qty") col_qty=i
-            if ($i=="Type") col_type=i
-        }
-        next
-    }
-    {
-        sid = $col_sid
-        gsub(/^[ \t]+|[ \t]+$/, "", sid)
-        c = substr(sid, 1, 1)
-        ptype = $col_type
-        gsub(/^[ \t]+|[ \t]+$/, "", ptype)
-        if ((c=="6" || c=="9") && ptype=="T") {
-            qty = $col_qty + 0
-            vol[sid] += qty
-            cnt[sid] += 1
-        }
-    }
-    END {
-        for (s in vol) print s, cnt[s], vol[s]
-    }
-    '''
-    print(f"    SH deal: awk 统计...", end="", flush=True)
+    awk_script = 'NR==1{next} $5=="T" && substr($3,1,1)~/^[69]/{vol[$3]+=$9; cnt[$3]++} END{for(s in vol) print s,cnt[s],vol[s]}'
+    print(f"    SH deal ({csv_path.stat().st_size/1024/1024/1024:.1f}GB): awk 统计...", end="", flush=True)
     try:
         result = subprocess.run(
-            ["awk", awk_script, str(csv_path)],
+            ["awk", "-F,", awk_script, str(csv_path)],
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
             print(f" 失败: {result.stderr[:200]}")
             return {}
+        if result.stderr:
+            print(f" stderr: {result.stderr[:200]}")
 
         lines = result.stdout.strip().split("\n")
         stats = {}
         for line in lines:
             parts = line.strip().split()
-            if len(parts) == 3:
+            if len(parts) >= 3:
                 sid = parts[0].zfill(6)
-                count = int(parts[1])
-                vol = float(parts[2])
-                stats[sid] = {"deal_count": count, "total_vol": vol}
+                stats[sid] = {"deal_count": int(parts[1]), "total_vol": float(parts[2])}
         print(f" {len(stats)} 只股票")
         return stats
     except Exception as e:
