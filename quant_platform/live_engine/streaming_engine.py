@@ -30,6 +30,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from .pipeline_logger import get_streaming_logger
+
 import pandas as pd
 import pyarrow.ipc as ipc
 
@@ -312,7 +314,18 @@ class StreamingEngine:
                         continue  # 已被 inotify 占位，跳过
                     self.processed_chunks[data_type].add(f.name)  # 先占位
                 chunk_ts = _extract_chunk_ts(f.name)
+                chunk_age_ms = round((time.time() - chunk_ts) * 1000, 1) if chunk_ts > 0 else 0
+
+                t0 = time.time()
                 df = _read_arrow(f)
+                read_ms = round((time.time() - t0) * 1000, 1)
+                rows = len(df) if df is not None and not df.empty else 0
+
+                get_streaming_logger().log(
+                    "chunk_read", trigger="poll", data_type=data_type, chunk=f.name,
+                    chunk_age_ms=chunk_age_ms, rows=rows, read_elapsed_ms=read_ms,
+                )
+
                 self._update_states(df, data_type, chunk_ts)
                 consumed += 1
                 # 消费后删除 chunk，由计算端控制数据生命周期
@@ -335,6 +348,7 @@ class StreamingEngine:
 
     def _compute_and_output(self) -> None:
         """遍历所有股票状态，调用因子函数，输出结果。"""
+        pipe_log = get_streaming_logger()
         now = datetime.now()
         date_str = now.strftime("%Y%m%d")
         end_time = now.strftime("%H%M%S")
@@ -378,24 +392,59 @@ class StreamingEngine:
         logger.info("[streaming] 计算完成: %d 条结果, 耗时 %.0fms", len(result_df), elapsed_ms)
 
         # 延迟统计
+        latency_stats = {}
         if not result_df.empty and "data_latency_ms" in result_df.columns:
             valid = result_df["data_latency_ms"].dropna()
             if not valid.empty:
+                latency_stats = {
+                    "data_latency_avg_ms": round(valid.mean(), 1),
+                    "data_latency_max_ms": round(valid.max(), 1),
+                    "data_latency_min_ms": round(valid.min(), 1),
+                    "data_latency_p50_ms": round(valid.median(), 1),
+                }
                 logger.info(
                     "[streaming] 数据延迟(行情→计算): avg=%.0fms max=%.0fms min=%.0fms p50=%.0fms",
                     valid.mean(), valid.max(), valid.min(), valid.median(),
                 )
 
+        # 记录因子计算耗时日志
+        chunk_latency_stats = {}
+        if not result_df.empty and "chunk_latency_ms" in result_df.columns:
+            valid_chunk = result_df["chunk_latency_ms"].dropna()
+            if not valid_chunk.empty:
+                chunk_latency_stats = {
+                    "chunk_latency_avg_ms": round(valid_chunk.mean(), 1),
+                    "chunk_latency_max_ms": round(valid_chunk.max(), 1),
+                }
+
+        pipe_log.log("factor_compute", date=date_str, end_time=end_time,
+                     stocks=len(snapshot), results=len(result_df),
+                     compute_ms=round(elapsed_ms, 1),
+                     **latency_stats, **chunk_latency_stats)
+
         # 写 CSV
+        csv_write_ms = 0
         if self.output_path and not result_df.empty:
+            t_csv = time.time()
             self.output_path.mkdir(parents=True, exist_ok=True)
             out_file = self.output_path / f"{date_str}_{end_time}.csv"
             result_df.to_csv(out_file, index=False)
+            csv_write_ms = round((time.time() - t_csv) * 1000, 1)
             logger.info("[streaming] 已写入 %s", out_file)
 
         # 上传 OSS
+        oss_upload_ms = 0
         if not result_df.empty:
+            t_oss = time.time()
             _upload_to_oss(result_df, date_str, end_time)
+            oss_upload_ms = round((time.time() - t_oss) * 1000, 1)
+
+        # 记录输出日志
+        pipe_log.log("output", date=date_str, end_time=end_time,
+                     file=f"{date_str}_{end_time}.csv" if not result_df.empty else "",
+                     rows=len(result_df),
+                     csv_write_ms=csv_write_ms,
+                     oss_upload_ms=oss_upload_ms)
 
         # 调用 outfun
         if self.outfun is not None:
@@ -454,8 +503,18 @@ class StreamingEngine:
                 return
             self.processed_chunks[parent].add(path.name)  # 立即占位，防 TOCTOU
 
+        pipe_log = get_streaming_logger()
         chunk_ts = _extract_chunk_ts(path.name)
+        chunk_age_ms = round((time.time() - chunk_ts) * 1000, 1) if chunk_ts > 0 else 0
+
+        t0 = time.time()
         df = _read_arrow(path)
+        read_ms = round((time.time() - t0) * 1000, 1)
+        rows = len(df) if df is not None and not df.empty else 0
+
+        pipe_log.log("chunk_read", trigger="inotify", data_type=parent, chunk=path.name,
+                     chunk_age_ms=chunk_age_ms, rows=rows, read_elapsed_ms=read_ms)
+
         self._update_states(df, parent, chunk_ts)
         # 消费后删除 chunk
         try:

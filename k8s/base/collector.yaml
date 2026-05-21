@@ -72,6 +72,8 @@ spec:
               mountPath: /dev/shm/quant-store
             - name: disk-output
               mountPath: /data/collector_output
+            - name: pipeline-logs
+              mountPath: /data/quant/pipeline_logs
           resources:
             requests:
               cpu: "1"
@@ -93,4 +95,8 @@ spec:
         - name: disk-output
           hostPath:
             path: /data/quant/collector_output
+            type: DirectoryOrCreate
+        - name: pipeline-logs
+          hostPath:
+            path: /data/quant/pipeline_logs
             type: DirectoryOrCreate

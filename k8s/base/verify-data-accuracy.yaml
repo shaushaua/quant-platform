@@ -1,4 +1,4 @@
-# 验证实盘因子数据准确性：对比 daily_basic 日线数据
+# 验证实盘因子数据准确性：awk 统计 CSV vs OSS 实盘因子
 # 用法：kubectl apply -f k8s/base/verify-data-accuracy.yaml
 # 结果：cat /data/quant/verify_data_accuracy.txt
 ---
@@ -33,11 +33,6 @@ spec:
               python3 -m quant_platform.scripts.verify_data_accuracy \
                 --date $YESTERDAY \
                 2>&1 | tee /data/quant/verify_data_accuracy.txt
-          volumeMounts:
-            - name: msg-backup
-              mountPath: /www/wwwroot/mdl/msg_backup
-            - name: output
-              mountPath: /data/quant
           env:
             - name: TZ
               value: Asia/Shanghai
@@ -45,6 +40,8 @@ spec:
             - secretRef:
                 name: quant-secrets
           volumeMounts:
+            - name: msg-backup
+              mountPath: /www/wwwroot/mdl/msg_backup
             - name: output
               mountPath: /data/quant
           resources:

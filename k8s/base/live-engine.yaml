@@ -60,6 +60,8 @@ spec:
               mountPath: /dev/shm/quant-store
             - name: factor-output
               mountPath: /data/factors
+            - name: pipeline-logs
+              mountPath: /data/quant/pipeline_logs
           resources:
             requests:
               cpu: "2"
@@ -75,4 +77,8 @@ spec:
         - name: factor-output
           hostPath:
             path: /data/quant/factors
+            type: DirectoryOrCreate
+        - name: pipeline-logs
+          hostPath:
+            path: /data/quant/pipeline_logs
             type: DirectoryOrCreate

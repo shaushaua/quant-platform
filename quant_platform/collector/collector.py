@@ -26,6 +26,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Deque, Dict, Optional, Tuple
 
+from ..live_engine.pipeline_logger import get_collector_logger
+
 import oss2
 import pandas as pd
 
@@ -284,8 +286,32 @@ class DayDirWatcher:
             return  # 未识别的文件类型，跳过
 
         poller, market, data_type = self._pollers[path]
-        df = poller.read_new_rows()
+        detect_ts = time.time()
+
+        with get_collector_logger().timer("csv_parse", file=path.name) as t:
+            df = poller.read_new_rows()
+            if df is not None:
+                t["rows"] = len(df)
+
         if df is not None and not df.empty:
+            # 提取行情时间（取最后一行的时间字段）
+            market_time = ""
+            for col in ("Time", "UpdateTime", "TransactTime", "SendingTime"):
+                if col in df.columns:
+                    market_time = str(df[col].iloc[-1])
+                    break
+
+            get_collector_logger().log(
+                "csv_detect",
+                file=path.name,
+                market=market,
+                data_type=data_type,
+                rows=len(df),
+                market_time=market_time,
+                system_time=datetime.now().strftime("%H%M%S%f")[:-3],
+                latency_detect_ms=round((time.time() - detect_ts) * 1000, 1),
+            )
+
             with self._results_lock:
                 q_len = len(self._results)
                 self._results.append((path, market, data_type, df))
@@ -409,19 +435,32 @@ class Collector:
             if len(self._disk_queue) < MAX_DISK_QUEUE_SIZE:
                 self._disk_queue.append((data_type, df))
 
-    def _write_to_store(self, data_type: str, df: pd.DataFrame):
-        """直接写整个 DataFrame 到 ShmStore（一个 arrow 文件，不做 groupby 拆分）。"""
-        getattr(self._store, f"update_{data_type}")(df)
+    def _write_to_store(self, data_type: str, df: pd.DataFrame) -> Optional[str]:
+        """直接写整个 DataFrame 到 ShmStore（一个 arrow 文件，不做 groupby 拆分）。
+        返回 chunk 文件名。"""
+        t0 = time.time()
+        chunk_name = getattr(self._store, f"update_{data_type}")(df)
+        elapsed_ms = round((time.time() - t0) * 1000, 1)
+
+        get_collector_logger().log("shm_write", data_type=data_type, chunk=chunk_name or "",
+                                   rows=len(df), elapsed_ms=elapsed_ms)
+        return chunk_name
 
     def _handle(self, path: Path, market: str, data_type: str, raw_df: pd.DataFrame):
         """将原始 DataFrame 转换后写入 ShmStore（实时），落盘 parquet 异步执行。"""
+        pipe_log = get_collector_logger()
         try:
             trading_day_dt = pd.Timestamp(self._trading_day)
 
             if data_type == "order_deal":
                 # 上交所合并委托+成交：按 Type 字段拆分
+                t0 = time.time()
                 order_df, deal_df = self._converter.convert_sh_order_deal(raw_df, trading_day_dt)
+                convert_ms = round((time.time() - t0) * 1000, 1)
                 del raw_df  # 立即释放原始数据
+                pipe_log.log("data_convert", file=path.name, market=market, data_type="order_deal",
+                             order_rows=len(order_df), deal_rows=len(deal_df), elapsed_ms=convert_ms)
+
                 if not order_df.empty:
                     self._write_to_store("order", order_df)
                     self._enqueue_disk("order", order_df)
@@ -432,33 +471,45 @@ class Collector:
                     del deal_df
 
             elif data_type == "order":
+                t0 = time.time()
                 if market == "SZ":
                     df = self._converter.convert_sz_order(raw_df, trading_day_dt)
                 else:
                     df = self._converter.convert_sh_order(raw_df, trading_day_dt)
+                convert_ms = round((time.time() - t0) * 1000, 1)
                 del raw_df
+                pipe_log.log("data_convert", file=path.name, market=market, data_type="order",
+                             rows=len(df), elapsed_ms=convert_ms)
                 if not df.empty:
                     self._write_to_store("order", df)
                     self._enqueue_disk("order", df)
                 del df
 
             elif data_type == "deal":
+                t0 = time.time()
                 if market == "SZ":
                     df = self._converter.convert_sz_deal(raw_df, trading_day_dt)
                 else:
                     df = self._converter.convert_sh_deal(raw_df, trading_day_dt)
+                convert_ms = round((time.time() - t0) * 1000, 1)
                 del raw_df
+                pipe_log.log("data_convert", file=path.name, market=market, data_type="deal",
+                             rows=len(df), elapsed_ms=convert_ms)
                 if not df.empty:
                     self._write_to_store("deal", df)
                     self._enqueue_disk("deal", df)
                 del df
 
             elif data_type == "tick":
+                t0 = time.time()
                 if market == "SZ":
                     df = self._converter.convert_sz_tick(raw_df, trading_day_dt)
                 else:
                     df = self._converter.convert_sh_tick(raw_df, trading_day_dt)
+                convert_ms = round((time.time() - t0) * 1000, 1)
                 del raw_df
+                pipe_log.log("data_convert", file=path.name, market=market, data_type="tick",
+                             rows=len(df), elapsed_ms=convert_ms)
                 if not df.empty:
                     self._write_to_store("tick", df)
                     self._enqueue_disk("tick", df)

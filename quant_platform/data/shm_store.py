@@ -27,7 +27,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -126,26 +126,32 @@ class ShmStore:
     # 写接口（collector 调用）                                               #
     # ------------------------------------------------------------------ #
 
-    def update_tick(self, df: pd.DataFrame) -> None:
-        """写入新的 tick chunk。"""
+    def update_tick(self, df: pd.DataFrame) -> Optional[str]:
+        """写入新的 tick chunk，返回 chunk 文件名。"""
         with self._locks["tick"]:
             ts = int(time.time() * 1000)
             seq = next(self._seq)
-            self._write_arrow(SHM_BASE / "tick" / f"chunk_{ts}_{seq:06d}.arrow", df)
+            name = f"chunk_{ts}_{seq:06d}.arrow"
+            self._write_arrow(SHM_BASE / "tick" / name, df)
+            return name
 
-    def update_order(self, df: pd.DataFrame) -> None:
-        """写入新的 order chunk。"""
+    def update_order(self, df: pd.DataFrame) -> Optional[str]:
+        """写入新的 order chunk，返回 chunk 文件名。"""
         with self._locks["order"]:
             ts = int(time.time() * 1000)
             seq = next(self._seq)
-            self._write_arrow(SHM_BASE / "order" / f"chunk_{ts}_{seq:06d}.arrow", df)
+            name = f"chunk_{ts}_{seq:06d}.arrow"
+            self._write_arrow(SHM_BASE / "order" / name, df)
+            return name
 
-    def update_deal(self, df: pd.DataFrame) -> None:
-        """写入新的 deal chunk。"""
+    def update_deal(self, df: pd.DataFrame) -> Optional[str]:
+        """写入新的 deal chunk，返回 chunk 文件名。"""
         with self._locks["deal"]:
             ts = int(time.time() * 1000)
             seq = next(self._seq)
-            self._write_arrow(SHM_BASE / "deal" / f"chunk_{ts}_{seq:06d}.arrow", df)
+            name = f"chunk_{ts}_{seq:06d}.arrow"
+            self._write_arrow(SHM_BASE / "deal" / name, df)
+            return name
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
         with self._locks["kline"]:
