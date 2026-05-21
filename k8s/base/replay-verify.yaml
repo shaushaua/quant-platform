@@ -30,12 +30,11 @@ spec:
             - /bin/sh
             - -c
             - |
-              echo "=== 开始回放对比 ==="
-              TODAY=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y%m%d'))")
+              echo "=== 开始全市场回放对比 ==="
+              YESTERDAY=$(python3 -c "from datetime import datetime, timedelta; print((datetime.now()-timedelta(days=1)).strftime('%Y%m%d'))")
               python3 -m quant_platform.scripts.replay_factors \
-                --date $TODAY \
-                --stocks 3 \
-                --timepoints 12 \
+                --date $YESTERDAY \
+                --minutes 1 \
                 2>&1 | tee /data/quant/replay_verify.txt
               echo "=== 完成 ==="
           env:
