@@ -13,6 +13,8 @@ spec:
   ttlSecondsAfterFinished: 3600
   template:
     spec:
+      hostNetwork: true
+      dnsPolicy: Default
       nodeSelector:
         role: live-trading
       tolerations:
@@ -29,8 +31,9 @@ spec:
             - -c
             - |
               echo "=== 开始回放对比 ==="
-              python3 scripts/replay_factors.py \
-                --date $(date +%Y%m%d) \
+              YESTERDAY=$(python3 -c "from datetime import datetime, timedelta; print((datetime.now()-timedelta(days=1)).strftime('%Y%m%d'))")
+              python3 -m quant_platform.scripts.replay_factors \
+                --date $YESTERDAY \
                 --stocks 10 \
                 --timepoints 24 \
                 2>&1 | tee /data/quant/replay_verify.txt

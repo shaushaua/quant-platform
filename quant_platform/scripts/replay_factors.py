@@ -26,9 +26,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
 from quant_platform.data.converter import TonglanceDataConverter
 from quant_platform.factor.base import StockState
 from quant_platform.factor.examples.live_momentum import factor_calculation
