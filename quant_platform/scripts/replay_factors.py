@@ -155,7 +155,7 @@ def load_live_factors_from_oss(date_str, max_minutes):
         cutoff_h += cutoff_m // 60
         cutoff_m = cutoff_m % 60
     cutoff_str = f"{cutoff_h:02d}{cutoff_m:02d}00"
-    target_times = [t for t in all_times if t <= cutoff_str]
+    target_times = [t for t in all_times if "093000" <= t <= cutoff_str]
     if not target_times:
         target_times = all_times[:max_minutes]
 

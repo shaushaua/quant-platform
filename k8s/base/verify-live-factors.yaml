@@ -1,12 +1,12 @@
-# 一次性 Job：回放因子计算并对比实盘结果
-# 用法：kubectl apply -f k8s/base/replay-verify.yaml
-# 查看结果：cat /data/quant/replay_verify.txt
-# 清理：kubectl delete job replay-verify -n quant
+# 一次性 Job：实盘因子数据完整性验证
+# 用法：kubectl apply -f k8s/base/verify-live-factors.yaml
+# 查看结果：cat /data/quant/verify_live_factors.txt
+# 清理：kubectl delete job verify-live-factors -n quant
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: replay-verify
+  name: verify-live-factors
   namespace: quant
 spec:
   backoffLimit: 2
@@ -24,19 +24,17 @@ spec:
           effect: NoSchedule
       restartPolicy: Never
       containers:
-        - name: replay
+        - name: verify
           image: 172.24.99.176:5000/quant-platform/backtest-base:latest
           command:
             - /bin/sh
             - -c
             - |
-              echo "=== 开始全市场回放对比 ==="
+              echo "=== 实盘因子数据完整性验证 ==="
               YESTERDAY=$(python3 -c "from datetime import datetime, timedelta; print((datetime.now()-timedelta(days=1)).strftime('%Y%m%d'))")
-              python3 -m quant_platform.scripts.replay_factors \
+              python3 -m quant_platform.scripts.verify_live_factors \
                 --date $YESTERDAY \
-                --minutes 1 \
-                --nrows 2000000 \
-                2>&1 | tee /data/quant/replay_verify.txt
+                2>&1 | tee /data/quant/verify_live_factors.txt
               echo "=== 完成 ==="
           env:
             - name: TZ
@@ -45,20 +43,14 @@ spec:
             - secretRef:
                 name: quant-secrets
           volumeMounts:
-            - name: msg-backup
-              mountPath: /www/wwwroot/mdl/msg_backup
             - name: output
               mountPath: /data/quant
           resources:
             limits:
-              memory: 8Gi
-            requests:
               memory: 4Gi
+            requests:
+              memory: 2Gi
       volumes:
-        - name: msg-backup
-          hostPath:
-            path: /www/wwwroot/mdl/msg_backup
-            type: DirectoryOrCreate
         - name: output
           hostPath:
             path: /data/quant
