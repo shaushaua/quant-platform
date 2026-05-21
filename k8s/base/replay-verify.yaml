@@ -31,9 +31,9 @@ spec:
             - -c
             - |
               echo "=== 开始回放对比 ==="
-              YESTERDAY=$(python3 -c "from datetime import datetime, timedelta; print((datetime.now()-timedelta(days=1)).strftime('%Y%m%d'))")
+              TODAY=$(python3 -c "from datetime import datetime; print(datetime.now().strftime('%Y%m%d'))")
               python3 -m quant_platform.scripts.replay_factors \
-                --date $YESTERDAY \
+                --date $TODAY \
                 --stocks 10 \
                 --timepoints 24 \
                 2>&1 | tee /data/quant/replay_verify.txt

@@ -122,7 +122,7 @@ def load_tonglance(msg_dir: str, date_str: str, target_codes: list):
     all_ticks, all_deals, all_orders = [], [], []
 
     def _read(label, filename, fn):
-        p = day_dir / f"{date_str}_{filename}"
+        p = day_dir / filename
         if not p.exists():
             print(f"    {label}: 不存在")
             return
