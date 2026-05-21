@@ -35,6 +35,7 @@ spec:
               python3 -m quant_platform.scripts.replay_factors \
                 --date $YESTERDAY \
                 --minutes 1 \
+                --nrows 200000 \
                 2>&1 | tee /data/quant/replay_verify.txt
               echo "=== 完成 ==="
           env:
