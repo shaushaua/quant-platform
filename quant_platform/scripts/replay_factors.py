@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-因子计算全市场对比验证
+因子计算全市场对比验证（严谨版）
 
-从 OSS 拉取实盘因子结果，从通联 CSV 回放因子计算，全市场对比。
-只处理前几分钟，不过滤具体股票。
-
-优化：只读因子计算需要的列（usecols），节省内存。
+先用 awk 预过滤通联 CSV（只保留股票 SecurityID），
+再读入 Python 做因子计算和对比。
 
 用法：
     python3 -m quant_platform.scripts.replay_factors --date 20260521
@@ -17,7 +15,10 @@ import argparse
 import gc
 import json
 import os
+import subprocess
 import sys
+import tempfile
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -41,7 +42,6 @@ COMPARE_FIELDS = [
     "order_imbalance", "order_buy_vol_ratio", "cancel_ratio", "order_count",
 ]
 
-# 只读因子计算需要的列（而不是全部 104 列）
 SH_TICK_COLS = [
     "UpdateTime", "SecurityID",
     "PreCloPrice", "LastPrice", "HighPrice", "LowPrice",
@@ -71,31 +71,19 @@ SZ_DEAL_COLS = [
     "ExecType",
 ]
 
-# 股票 SecurityID 范围
-SH_STOCK_PREFIX = ("6", "9")
-SZ_STOCK_PREFIX = ("0", "3")
-
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--date", required=True)
     p.add_argument("--msg-dir", default="/www/wwwroot/mdl/msg_backup")
     p.add_argument("--minutes", type=int, default=1,
-                   help="只处理开盘后前几分钟（默认1）")
-    p.add_argument("--nrows", type=int, default=5_000_000,
-                   help="每个 CSV 读前多少行（默认5M）")
+                   help="对比开盘后前几分钟（默认1）")
+    p.add_argument("--tmp-dir", default="/data/quant/tmp_replay",
+                   help="awk 过滤临时文件目录")
     return p.parse_args()
 
 
-def _filter_stock_security_id(raw, id_col="SecurityID"):
-    """过滤只保留股票 SecurityID（6开头/9开头=SH，0开头/3开头=SZ）。"""
-    ids = raw[id_col].astype(str).str.strip().str.zfill(6)
-    mask = ids.str[0].isin(list(SH_STOCK_PREFIX) + list(SZ_STOCK_PREFIX))
-    return raw[mask].copy()
-
-
 def _safe_int(val):
-    """安全转 int，处理 NaN。"""
     try:
         v = float(val)
         return 0 if np.isnan(v) else int(v)
@@ -104,7 +92,6 @@ def _safe_int(val):
 
 
 def _safe_float(val):
-    """安全转 float，处理 NaN。"""
     try:
         v = float(val)
         return 0.0 if np.isnan(v) else v
@@ -112,8 +99,60 @@ def _safe_float(val):
         return 0.0
 
 
+def _time_to_str(t):
+    s = str(t).strip()
+    if ":" in s:
+        parts = s.split(":")
+        return parts[0] + parts[1] + parts[2][:2]
+    s = s.replace(".", "").ljust(9, "0")
+    return s[:6]
+
+
+def _time_le(t, cutoff_str):
+    return _time_to_str(t) <= cutoff_str
+
+
 # ============================================================
-# 1. 从 OSS 拉实盘因子
+# awk 预过滤：只保留股票 SecurityID 的行
+# ============================================================
+
+def _awk_filter_csv(src_path, dst_path, sid_col_idx, stock_prefixes):
+    """用 awk 过滤 CSV，只保留 SecurityID 以指定前缀开头的行。
+
+    sid_col_idx: SecurityID 列的索引（0-based）
+    stock_prefixes: 如 ["6", "9", "0", "3"]
+    """
+    # 构建 awk 条件: substr($col,1,1)=="6" || substr($col,1,1)=="9" || ...
+    conditions = " || ".join(
+        f'substr(${sid_col_idx},1,1)=="{p}"' for p in stock_prefixes
+    )
+    awk_script = f'BEGIN{{OFS=","}} NR==1 || {conditions} {{print}}'
+
+    print(f"      awk 过滤...", end="", flush=True)
+    try:
+        result = subprocess.run(
+            ["awk", "-F", ",", awk_script, str(src_path)],
+            stdout=open(dst_path, "w"),
+            stderr=subprocess.PIPE,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            print(f" 失败: {result.stderr.decode()[:200]}")
+            return False
+
+        out_size = Path(dst_path).stat().st_size / 1024 / 1024
+        # 统计行数
+        wc = subprocess.run(["wc", "-l", dst_path], capture_output=True, text=True)
+        n_lines = int(wc.stdout.strip().split()[0]) if wc.returncode == 0 else 0
+        print(f" {n_lines:,}行 ({out_size:.0f}MB)")
+        return True
+    except Exception as e:
+        print(f" 失败: {e}")
+        return False
+
+
+# ============================================================
+# OSS 因子加载
 # ============================================================
 
 def load_live_factors_from_oss(date_str, max_minutes):
@@ -148,7 +187,6 @@ def load_live_factors_from_oss(date_str, max_minutes):
     all_times.sort()
     print(f"  OSS 上共 {len(all_times)} 个时间点")
 
-    # 只取开盘后 max_minutes 分钟内
     cutoff_h = 9
     cutoff_m = 30 + max_minutes
     if cutoff_m >= 60:
@@ -166,8 +204,7 @@ def load_live_factors_from_oss(date_str, max_minutes):
         key = f"{search_prefix}{ts}.json"
         try:
             data = bucket.get_object(key).read()
-            records = json.loads(data)
-            all_records.extend(records)
+            all_records.extend(json.loads(data))
         except oss2.exceptions.NoSuchKey:
             print(f"    {ts}.json 不存在")
         except Exception as e:
@@ -182,31 +219,64 @@ def load_live_factors_from_oss(date_str, max_minutes):
 
 
 # ============================================================
-# 2. 读通联 CSV（只读需要的列，省内存）
+# 读通联 CSV（awk 预过滤后）
 # ============================================================
 
-def load_tonglance(msg_dir, date_str, nrows):
-    """读通联 CSV 前 nrows 行，只读因子计算需要的列，返回按 Code 分组的数据。"""
+def load_tonglance(msg_dir, date_str, tmp_dir, cutoff_time_str):
+    """用 awk 预过滤 CSV 只保留股票行，然后 Python 读取并转换。"""
     day_dir = Path(msg_dir) / date_str
-    trading_day = datetime.strptime(date_str, "%Y%m%d")
+    tmp = Path(tmp_dir)
+    tmp.mkdir(parents=True, exist_ok=True)
 
-    tick_records = []  # list of (code, time_str, price_dict)
-    deal_records = []  # list of (code, time_str, price, volume)
-    order_records = []  # list of (code, time_str, side, volume, order_type)
+    tick_records = []
+    deal_records = []
+    order_records = []
 
-    # --- SH tick ---
-    p = day_dir / TL_FILES["sh_tick"]
-    if p.exists():
-        mb = p.stat().st_size / 1024 / 1024
-        print(f"    SH tick ({mb:.0f}MB) 读前{nrows:,}行...", end="", flush=True)
-        raw = pd.read_csv(p, nrows=nrows, usecols=SH_TICK_COLS)
-        raw = _filter_stock_security_id(raw)
-        print(f" {len(raw):,}行股票")
+    # SH tick: SecurityID 在第2列 (idx=2), 股票前缀 6,9
+    # 加上时间过滤：只保留 <= cutoff 的行
+    def _process(label, src_file, filter_prefixes, sid_col_idx,
+                 usecols, process_fn, is_order_deal=False,
+                 time_col_idx=None, time_cutoff=None):
+        src = day_dir / src_file
+        if not src.exists():
+            print(f"    {label}: 不存在")
+            return
+
+        mb = src.stat().st_size / 1024 / 1024
+        print(f"    {label} ({mb:.0f}MB):")
+
+        # awk 预过滤：只保留股票行
+        filtered = tmp / f"{label.replace(' ', '_').replace('+', '_')}.csv"
+        ok = _awk_filter_csv(src, filtered, sid_col_idx, filter_prefixes)
+        if not ok or not filtered.exists() or filtered.stat().st_size == 0:
+            print(f"      过滤结果为空")
+            return
+
+        # Python 读取过滤后的文件
+        print(f"      Python 读取...", end="", flush=True)
+        try:
+            raw = pd.read_csv(filtered, usecols=usecols)
+            print(f" {len(raw):,}行")
+            if raw.empty:
+                return
+
+            process_fn(raw, tick_records, deal_records, order_records)
+        except Exception as e:
+            print(f" 失败: {e}")
+        finally:
+            # 清理临时文件
+            try:
+                filtered.unlink()
+            except OSError:
+                pass
+
+    # SH tick 处理函数
+    def process_sh_tick(raw, ticks, deals, orders):
         for _, r in raw.iterrows():
             sid = str(r["SecurityID"]).zfill(6)
             code = f"{sid}.XSHG"
             t = str(r["UpdateTime"]).strip()
-            tick_records.append((code, t, {
+            ticks.append((code, t, {
                 "CurrentPrice": _safe_float(r.get("LastPrice", 0)),
                 "PreClosePrice": _safe_float(r.get("PreCloPrice", 0)),
                 "HighPrice": _safe_float(r.get("HighPrice", 0)),
@@ -216,22 +286,14 @@ def load_tonglance(msg_dir, date_str, nrows):
                 "AskVolume1": _safe_int(r.get("AskVolume1", 0)),
                 "BidVolume1": _safe_int(r.get("BidVolume1", 0)),
             }))
-        del raw
-        gc.collect()
 
-    # --- SZ tick ---
-    p = day_dir / TL_FILES["sz_tick"]
-    if p.exists():
-        mb = p.stat().st_size / 1024 / 1024
-        print(f"    SZ tick ({mb:.0f}MB) 读前{nrows:,}行...", end="", flush=True)
-        raw = pd.read_csv(p, nrows=nrows, usecols=SZ_TICK_COLS)
-        raw = _filter_stock_security_id(raw)
-        print(f" {len(raw):,}行股票")
+    # SZ tick 处理函数
+    def process_sz_tick(raw, ticks, deals, orders):
         for _, r in raw.iterrows():
             sid = str(r["SecurityID"]).zfill(6)
             code = f"{sid}.XSHE"
             t = str(r["UpdateTime"]).strip()
-            tick_records.append((code, t, {
+            ticks.append((code, t, {
                 "CurrentPrice": _safe_float(r.get("LastPrice", 0)),
                 "PreClosePrice": _safe_float(r.get("PreCloPrice", 0)),
                 "HighPrice": _safe_float(r.get("HighPrice", 0)),
@@ -241,17 +303,9 @@ def load_tonglance(msg_dir, date_str, nrows):
                 "AskVolume1": _safe_int(r.get("AskVolume1", 0)),
                 "BidVolume1": _safe_int(r.get("BidVolume1", 0)),
             }))
-        del raw
-        gc.collect()
 
-    # --- SH order+deal ---
-    p = day_dir / TL_FILES["sh_order_deal"]
-    if p.exists():
-        mb = p.stat().st_size / 1024 / 1024
-        print(f"    SH order+deal ({mb:.0f}MB) 读前{nrows:,}行...", end="", flush=True)
-        raw = pd.read_csv(p, nrows=nrows, usecols=SH_ORDER_DEAL_COLS)
-        raw = _filter_stock_security_id(raw)
-        print(f" {len(raw):,}行股票")
+    # SH order+deal 处理函数
+    def process_sh_order_deal(raw, ticks, deals, orders):
         for _, r in raw.iterrows():
             sid = str(r["SecurityID"]).zfill(6)
             code = f"{sid}.XSHG"
@@ -261,22 +315,13 @@ def load_tonglance(msg_dir, date_str, nrows):
             price = _safe_float(r.get("Price", 0))
             vol = _safe_int(r.get("Qty", 0))
             otype = 5 if ptype == "D" else 2
-
             if ptype == "T":
-                deal_records.append((code, t, price, vol))
+                deals.append((code, t, price, vol))
             else:
-                order_records.append((code, t, side, vol, otype))
-        del raw
-        gc.collect()
+                orders.append((code, t, side, vol, otype))
 
-    # --- SZ order ---
-    p = day_dir / TL_FILES["sz_order"]
-    if p.exists():
-        mb = p.stat().st_size / 1024 / 1024
-        print(f"    SZ order ({mb:.0f}MB) 读前{nrows:,}行...", end="", flush=True)
-        raw = pd.read_csv(p, nrows=nrows, usecols=SZ_ORDER_COLS)
-        raw = _filter_stock_security_id(raw)
-        print(f" {len(raw):,}行股票")
+    # SZ order 处理函数
+    def process_sz_order(raw, ticks, deals, orders):
         for _, r in raw.iterrows():
             sid = str(r["SecurityID"]).zfill(6)
             code = f"{sid}.XSHE"
@@ -284,59 +329,48 @@ def load_tonglance(msg_dir, date_str, nrows):
             side_val = r.get("Side")
             side = 0 if (side_val == 49 or str(side_val) == "49") else 1
             vol = _safe_int(r.get("OrderQty", 0))
-            order_records.append((code, t, side, vol, 1))
-        del raw
-        gc.collect()
+            orders.append((code, t, side, vol, 1))
 
-    # --- SZ deal ---
-    p = day_dir / TL_FILES["sz_deal"]
-    if p.exists():
-        mb = p.stat().st_size / 1024 / 1024
-        print(f"    SZ deal ({mb:.0f}MB) 读前{nrows:,}行...", end="", flush=True)
-        raw = pd.read_csv(p, nrows=nrows, usecols=SZ_DEAL_COLS)
-        raw = _filter_stock_security_id(raw)
-        print(f" {len(raw):,}行股票")
+    # SZ deal 处理函数
+    def process_sz_deal(raw, ticks, deals, orders):
         for _, r in raw.iterrows():
             sid = str(r["SecurityID"]).zfill(6)
             code = f"{sid}.XSHE"
             t = str(r["TransactTime"]).strip()
             price = _safe_float(r.get("LastPx", 0))
             vol = _safe_int(r.get("LastQty", 0))
-            deal_records.append((code, t, price, vol))
-        del raw
-        gc.collect()
+            deals.append((code, t, price, vol))
+
+    # 执行：SH tick (SecurityID 在第2列, 股票前缀 6,9)
+    print(f"  读 SH tick:")
+    _process("SH tick", TL_FILES["sh_tick"], ["6", "9"], 2,
+             SH_TICK_COLS, process_sh_tick)
+
+    print(f"  读 SZ tick:")
+    _process("SZ tick", TL_FILES["sz_tick"], ["0", "3"], 3,
+             SZ_TICK_COLS, process_sz_tick)
+
+    print(f"  读 SH order+deal:")
+    _process("SH order+deal", TL_FILES["sh_order_deal"], ["6", "9"], 2,
+             SH_ORDER_DEAL_COLS, process_sh_order_deal)
+
+    print(f"  读 SZ order:")
+    _process("SZ order", TL_FILES["sz_order"], ["0", "3"], 2,
+             SZ_ORDER_COLS, process_sz_order)
+
+    print(f"  读 SZ deal:")
+    _process("SZ deal", TL_FILES["sz_deal"], ["0", "3"], 2,
+             SZ_DEAL_COLS, process_sz_deal)
 
     print(f"  合计: tick={len(tick_records):,} deal={len(deal_records):,} order={len(order_records):,}")
-
     return tick_records, deal_records, order_records
 
 
 # ============================================================
-# 3. 回放因子
+# 回放因子
 # ============================================================
 
-def _time_to_str(t):
-    """时间字符串统一为 HHMMSS 格式。"""
-    s = str(t).strip()
-    if ":" in s:
-        # "09:30:00.000" -> "093000"
-        parts = s.split(":")
-        return parts[0] + parts[1] + parts[2][:2]
-    # 纯数字
-    s = s.replace(".", "").ljust(9, "0")
-    return s[:6]
-
-
-def _time_le(t1, cutoff_str):
-    """判断时间 t1 是否 <= cutoff (HHMMSS 格式)。"""
-    t1s = _time_to_str(t1)
-    return t1s <= cutoff_str
-
-
 def replay_all_stocks(tick_records, deal_records, order_records, date_str, target_times):
-    """模拟实盘引擎，全市场回放。"""
-    # 按 code 分组
-    from collections import defaultdict
     tick_by_code = defaultdict(list)
     deal_by_code = defaultdict(list)
     order_by_code = defaultdict(list)
@@ -360,11 +394,9 @@ def replay_all_stocks(tick_records, deal_records, order_records, date_str, targe
         for code in all_codes:
             state = StockState(code=code)
 
-            # tick
             for t, data in tick_by_code.get(code, []):
                 if not _time_le(t, ts):
                     continue
-                # 手动更新 StockState（不走完整 converter）
                 price = data["CurrentPrice"]
                 if price > 0:
                     if state.open == 0.0:
@@ -383,7 +415,6 @@ def replay_all_stocks(tick_records, deal_records, order_records, date_str, targe
                 state.bid_volume1 = data["BidVolume1"]
                 state.tick_count += 1
 
-            # deal
             for t, price, vol in deal_by_code.get(code, []):
                 if not _time_le(t, ts):
                     continue
@@ -392,7 +423,6 @@ def replay_all_stocks(tick_records, deal_records, order_records, date_str, targe
                     state.cum_volume += vol
                 state.deal_count += 1
 
-            # order
             for t, side, vol, otype in order_by_code.get(code, []):
                 if not _time_le(t, ts):
                     continue
@@ -421,7 +451,7 @@ def replay_all_stocks(tick_records, deal_records, order_records, date_str, targe
 
 
 # ============================================================
-# 4. 对比
+# 对比（修复 NaN 处理）
 # ============================================================
 
 def compare(live_df, replay_df):
@@ -446,11 +476,9 @@ def compare(live_df, replay_df):
     if merged.empty:
         print(f"\n  实盘 code 样本: {live_df['code'].head(5).tolist()}")
         print(f"  回放 code 样本: {replay_df['code'].head(5).tolist()}")
-        print(f"  实盘 end_time: {sorted(live_df['end_time'].unique())[:5]}")
-        print(f"  回放 end_time: {sorted(replay_df['end_time'].unique())[:5]}")
         return
 
-    # 字段级对比
+    # 字段级对比（修复：任一方为 NaN 都排除）
     print(f"\n{'字段':<25s} {'匹配率':>8s} {'avg_diff':>10s} {'max_diff':>10s}")
     print("-" * 60)
 
@@ -461,17 +489,35 @@ def compare(live_df, replay_df):
             continue
         lv = pd.to_numeric(merged[lc], errors="coerce")
         rv = pd.to_numeric(merged[rc], errors="coerce")
-        valid = ~(lv.isna() & rv.isna())
+        # 修复：排除任一方为 NaN 的行
+        valid = lv.notna() & rv.notna()
         n = valid.sum()
         if n == 0:
+            print(f"  {field:<25s} 无有效对比数据")
             continue
+
         lv, rv = lv[valid], rv[valid]
+        # 排除双方都为 0 的行（不算匹配率）
+        both_zero = (lv == 0) & (rv == 0)
+        nonzero = ~both_zero
+        n_nonzero = nonzero.sum()
+
         abs_diff = (lv - rv).abs()
         denom = lv.abs().replace(0, np.nan)
-        rel = (abs_diff / denom * 100).fillna(0)
-        rate = (rel < 1.0).sum() / n * 100
+        rel = (abs_diff / denom * 100)
+        rel = rel.fillna(0)
+
+        if n_nonzero > 0:
+            rate = (rel[nonzero] < 1.0).sum() / n_nonzero * 100
+            avg_diff = rel[nonzero].mean()
+            max_diff = rel[nonzero].max()
+        else:
+            rate = 100.0
+            avg_diff = 0.0
+            max_diff = 0.0
+
         tag = "OK" if rate > 95 else ("WARN" if rate > 80 else "BAD")
-        print(f"  {field:<25s} {rate:>6.1f}% {rel.mean():>9.2f}% {rel.max():>9.2f}%  [{tag}]")
+        print(f"  {field:<25s} {rate:>6.1f}% {avg_diff:>9.2f}% {max_diff:>9.2f}%  [{tag}] ({n}条, 非零{n_nonzero}条)")
         field_stats.append((field, rate))
 
     if field_stats:
@@ -487,29 +533,35 @@ def compare(live_df, replay_df):
         if lc in sub.columns and rc in sub.columns:
             lv = pd.to_numeric(sub[lc], errors="coerce")
             rv = pd.to_numeric(sub[rc], errors="coerce")
-            valid = ~(lv.isna() & rv.isna())
-            total = valid.sum()
+            valid = lv.notna() & rv.notna()
+            nonzero = valid & ~((lv == 0) & (rv == 0))
+            total = nonzero.sum()
             if total > 0:
-                diff = (lv[valid] - rv[valid]).abs()
-                denom = lv[valid].abs().replace(0, np.nan)
+                diff = (lv[nonzero] - rv[nonzero]).abs()
+                denom = lv[nonzero].abs().replace(0, np.nan)
                 rel = (diff / denom * 100).fillna(0)
                 prices_ok = (rel < 0.1).sum()
         print(f"  {ts}: {len(sub)} 只, 价格匹配={prices_ok}/{total}")
 
-    # 抽样
-    print(f"\n抽样对比（前5只）:")
-    for code in merged["code"].unique()[:5]:
-        sub = merged[merged["code"] == code].sort_values("end_time")
-        for _, row in sub.head(1).iterrows():
-            parts = []
-            for field in ["latest_price", "change_pct", "vwap", "total_vol"]:
-                lv = row.get(f"{field}_live")
-                rv = row.get(f"{field}_replay")
-                if pd.notna(lv) and pd.notna(rv):
-                    diff = abs(float(lv) - float(rv))
-                    ok = "OK" if diff < 0.01 else "!!"
-                    parts.append(f"{field}={float(lv):.4f}/{float(rv):.4f}({ok})")
-            print(f"  {code} {row.get('end_time','?')}  {' | '.join(parts)}")
+    # 抽样（排除零价）
+    print(f"\n抽样对比（有价格的股票前10只）:")
+    sample = merged[
+        (pd.to_numeric(merged.get("latest_price_live", 0), errors="coerce") > 0) &
+        (pd.to_numeric(merged.get("latest_price_replay", 0), errors="coerce") > 0)
+    ]
+    for code in sample["code"].unique()[:10]:
+        row = sample[sample["code"] == code].iloc[0]
+        parts = []
+        for field in ["latest_price", "change_pct", "vwap", "total_vol"]:
+            lv = row.get(f"{field}_live")
+            rv = row.get(f"{field}_replay")
+            if pd.notna(lv) and pd.notna(rv):
+                lv_f, rv_f = float(lv), float(rv)
+                diff = abs(lv_f - rv_f)
+                ok = "OK" if diff < 0.01 else "!!"
+                parts.append(f"{field}={lv_f:.4f}/{rv_f:.4f}({ok})")
+        ts = row.get("end_time", "?")
+        print(f"  {code} {ts}  {' | '.join(parts)}")
 
 
 def main():
@@ -517,20 +569,23 @@ def main():
     date_str = args.date
     minutes = args.minutes
 
+    cutoff_time_str = f"{9 + (30 + minutes) // 60:02d}{(30 + minutes) % 60:02d}00"
+
     print("=" * 70)
     print(f"因子全市场对比验证 — {date_str}")
-    print(f"对比范围: 开盘后前 {minutes} 分钟, 每文件读前 {args.nrows:,} 行")
+    print(f"对比范围: 09:30 ~ {cutoff_time_str} (前{minutes}分钟)")
+    print("方法: awk 预过滤 CSV → Python 读取 → 因子计算 → 对比")
     print("=" * 70)
 
     print(f"\n[1/3] 从 OSS 拉实盘因子:")
     live_df, target_times = load_live_factors_from_oss(date_str, minutes)
     if live_df.empty:
-        print("实盘因子为空，无法继续")
+        print("实盘因子为空")
         sys.exit(1)
 
-    print(f"\n[2/3] 读通联数据:")
+    print(f"\n[2/3] 读通联数据 (awk 预过滤):")
     tick_records, deal_records, order_records = load_tonglance(
-        args.msg_dir, date_str, args.nrows
+        args.msg_dir, date_str, args.tmp_dir, cutoff_time_str
     )
 
     print(f"\n[3/3] 回放因子:")
@@ -539,6 +594,12 @@ def main():
 
     compare(live_df, replay_df)
     print("\n" + "=" * 70)
+
+    # 清理临时目录
+    tmp = Path(args.tmp_dir)
+    if tmp.exists():
+        for f in tmp.glob("*.csv"):
+            f.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
