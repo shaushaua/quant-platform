@@ -52,10 +52,10 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--date", required=True)
     p.add_argument("--msg-dir", default="/www/wwwroot/mdl/msg_backup")
-    p.add_argument("--minutes", type=int, default=5,
-                   help="只处理开盘后前几分钟（默认5）")
-    p.add_argument("--chunk-size", type=int, default=500_000,
-                   help="通联 CSV 每次读取行数")
+    p.add_argument("--minutes", type=int, default=1,
+                   help="只处理开盘后前几分钟（默认1）")
+    p.add_argument("--nrows", type=int, default=1_000_000,
+                   help="每个 CSV 读前多少行（通联按时间排序，前几分钟就在开头）")
     return p.parse_args()
 
 
@@ -135,13 +135,14 @@ def load_live_factors_from_oss(date_str, max_minutes):
 
 
 # ============================================================
-# 2. 流式读通联 CSV + 转换
+# 2. 读通联 CSV（只读前 nrows 行，通联按时间排序）
 # ============================================================
 
-def load_tonglance_streaming(msg_dir, date_str, cutoff_time, chunk_size):
-    """流式读取通联 CSV，只读到 cutoff_time 为止，返回转换后的 tick/deal/order DataFrames。
+def load_tonglance_head(msg_dir, date_str, nrows):
+    """读取通联 CSV 前 nrows 行，转换后返回 tick/deal/order DataFrames。
 
-    cutoff_time: datetime，如 2026-05-21 09:35:00
+    通联 CSV 按时间排序，前几分钟的数据就在文件开头，
+    直接用 nrows 读前面部分即可，不需要流式扫整个文件。
     """
     day_dir = Path(msg_dir) / date_str
     trading_day = datetime.strptime(date_str, "%Y%m%d")
@@ -149,106 +150,70 @@ def load_tonglance_streaming(msg_dir, date_str, cutoff_time, chunk_size):
 
     all_ticks, all_deals, all_orders = [], [], []
 
-    def _read_streaming(label, filename, convert_fn, is_order_deal=False):
+    def _read_head(label, filename, convert_fn, is_order_deal=False):
         p = day_dir / filename
         if not p.exists():
             print(f"    {label}: 不存在")
             return
 
         mb = p.stat().st_size / 1024 / 1024
-        print(f"    {label}: {p.name} ({mb:.0f}MB) 流式读取...", end="", flush=True)
+        print(f"    {label}: {p.name} ({mb:.0f}MB) 读前{nrows:,}行...", end="", flush=True)
 
-        total_rows = 0
-        matched_rows = 0
-        done = False
+        try:
+            raw = pd.read_csv(p, nrows=nrows)
+            print(f" {len(raw):,}行", end="", flush=True)
 
-        for chunk in pd.read_csv(p, chunksize=chunk_size, dtype=str, low_memory=False):
-            if done:
-                break
-            total_rows += len(chunk)
+            if raw.empty:
+                print()
+                return
 
-            # 用 UpdateTime 判断是否超过 cutoff
-            if "UpdateTime" in chunk.columns:
-                # 只取 <= cutoff_time 的行
-                # UpdateTime 格式: "09:30:00.000" 或 "HHMMSSmmm"
-                times = chunk["UpdateTime"].astype(str).str.strip()
-                # 简单按字符串前5字符 (HH:MM 或 HHMM) 比较
-                time_prefix = cutoff_time.strftime("%H:%M")
-                # 兼容两种格式: "09:30:xx" 或 "0930xxxxx"
-                mask = times.str[:5] <= time_prefix
-                if not mask.any():
-                    # 当前 chunk 全部超过 cutoff，检查是否有刚好在边界的数据
-                    # 如果 chunk 第一行就超过，可以停了
-                    if (times.str[:5] > time_prefix).all():
-                        done = True
-                        break
-                chunk = chunk[mask]
-                if chunk.empty:
-                    continue
-
-            matched_rows += len(chunk)
-
-            try:
-                if is_order_deal:
-                    orders, deals = convert_fn(chunk, trading_day)
-                    if not orders.empty:
-                        all_orders.append(orders)
-                    if not deals.empty:
-                        all_deals.append(deals)
+            if is_order_deal:
+                orders, deals = convert_fn(raw, trading_day)
+                del raw
+                if not orders.empty:
+                    all_orders.append(orders)
+                if not deals.empty:
+                    all_deals.append(deals)
+                print(f" -> orders={len(orders):,} deals={len(deals):,}")
+            else:
+                result = convert_fn(raw, trading_day)
+                del raw
+                if result is not None and not result.empty:
+                    if isinstance(result, tuple):
+                        orders, deals = result
+                        if not orders.empty:
+                            all_orders.append(orders)
+                        if not deals.empty:
+                            all_deals.append(deals)
+                        print(f" -> orders={len(orders):,} deals={len(deals):,}")
+                    else:
+                        all_ticks.append(result)
+                        print(f" -> {len(result):,}行")
                 else:
-                    result = convert_fn(chunk, trading_day)
-                    if result is not None and not result.empty:
-                        if isinstance(result, tuple):
-                            # 不应该到这里，但防御性处理
-                            pass
-                        elif "CurrentPrice" in result.columns or "TradeNum" in result.columns:
-                            all_ticks.append(result)
-                        elif "SaleOrderID" in result.columns:
-                            all_deals.append(result)
-                        else:
-                            all_orders.append(result)
-            except Exception as e:
-                print(f"\n      转换失败: {e}")
-
-            # 进度
-            print(f"\r    {label}: {p.name} ({mb:.0f}MB) 已读{total_rows:,}行 匹配{matched_rows:,}行", end="", flush=True)
-
-            # 如果当前 chunk 全部在 cutoff 之前，继续读下一个
-            # 如果最后一个 UpdateTime 已经远超 cutoff，可以停了
-            if "UpdateTime" in chunk.columns:
-                last_time = chunk["UpdateTime"].astype(str).str.strip().iloc[-1][:5]
-                cutoff_prefix = cutoff_time.strftime("%H:%M")
-                # 给一点余量：如果最后时间比 cutoff 超过 2 分钟就停
-                try:
-                    last_m = int(last_time[:2]) * 60 + int(last_time[3:5])
-                    cut_m = cutoff_time.hour * 60 + cutoff_time.minute
-                    if last_m > cut_m + 2:
-                        done = True
-                except (ValueError, IndexError):
-                    pass
-
-        print(f"\r    {label}: {p.name} ({mb:.0f}MB) 读完 {total_rows:,} 行, 匹配 {matched_rows:,} 行")
+                    print(" -> 空")
+        except Exception as e:
+            print(f" 失败: {e}")
 
     print(f"  读 SH tick:")
-    _read_streaming("SH tick", TL_FILES["sh_tick"],
-                    lambda r, d: converter.convert_sh_tick(r, d))
+    _read_head("SH tick", TL_FILES["sh_tick"],
+               lambda r, d: converter.convert_sh_tick(r, d))
 
     print(f"  读 SZ tick:")
-    _read_streaming("SZ tick", TL_FILES["sz_tick"],
-                    lambda r, d: converter.convert_sz_tick(r, d))
+    _read_head("SZ tick", TL_FILES["sz_tick"],
+               lambda r, d: converter.convert_sz_tick(r, d))
 
     print(f"  读 SH order+deal:")
-    _read_streaming("SH order+deal", TL_FILES["sh_order_deal"],
-                    lambda r, d: converter.convert_sh_order_deal(r, d),
-                    is_order_deal=True)
+    _read_head("SH order+deal", TL_FILES["sh_order_deal"],
+               lambda r, d: converter.convert_sh_order_deal(r, d),
+               is_order_deal=True)
 
     print(f"  读 SZ order:")
-    _read_streaming("SZ order", TL_FILES["sz_order"],
-                    lambda r, d: converter.convert_sz_order(r, d))
+    _read_head("SZ order", TL_FILES["sz_order"],
+               lambda r, d: converter.convert_sz_order(r, d))
 
     print(f"  读 SZ deal:")
-    _read_streaming("SZ deal", TL_FILES["sz_deal"],
-                    lambda r, d: converter.convert_sz_deal(r, d))
+    _read_head("SZ deal", TL_FILES["sz_deal"],
+               lambda r, d: converter.convert_sz_deal(r, d))
 
     tick_df  = pd.concat(all_ticks,  ignore_index=True) if all_ticks  else pd.DataFrame()
     deal_df  = pd.concat(all_deals,  ignore_index=True) if all_deals  else pd.DataFrame()
@@ -256,7 +221,6 @@ def load_tonglance_streaming(msg_dir, date_str, cutoff_time, chunk_size):
 
     print(f"  合计: tick={len(tick_df):,} deal={len(deal_df):,} order={len(order_df):,}")
 
-    # 释放中间列表
     del all_ticks, all_deals, all_orders
     gc.collect()
 
@@ -480,19 +444,16 @@ def main():
 
     # 1. 从 OSS 拉实盘因子
     print(f"\n[1/3] 从 OSS 拉实盘因子:")
-    cutoff_time = datetime.strptime(date_str, "%Y%m%d").replace(
-        hour=9, minute=30 + minutes, second=0
-    )
     live_df, target_times = load_live_factors_from_oss(date_str, minutes)
 
     if live_df.empty:
         print("实盘因子为空，无法继续")
         sys.exit(1)
 
-    # 2. 读通联数据（流式，只读前几分钟）
-    print(f"\n[2/3] 读通联数据（流式，到 {cutoff_time.strftime('%H:%M')}）:")
-    tick_df, deal_df, order_df = load_tonglance_streaming(
-        args.msg_dir, date_str, cutoff_time, args.chunk_size
+    # 2. 读通联数据（前 nrows 行，包含前几分钟所有股票）
+    print(f"\n[2/3] 读通联数据（前{args.nrows:,}行）:")
+    tick_df, deal_df, order_df = load_tonglance_head(
+        args.msg_dir, date_str, args.nrows
     )
 
     # 3. 回放 + 对比
