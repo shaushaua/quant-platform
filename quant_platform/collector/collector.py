@@ -106,22 +106,39 @@ class FilePoller:
     处理通联追加写入时文件可能不完整的情况（末尾行不含换行则跳过）。
     """
 
-    # 单次读取最大字节数（~5MB），降低单次处理延迟
-    # 5MB CSV 解析为 DataFrame 后约占 15-25MB 内存
-    # 更小的块 = 更快的单次处理 = 更低的端到端延迟
-    _MAX_CHUNK_BYTES = 5 * 1024 * 1024
+    # 单次读取最大字节数（50MB），减少解析次数以提升吞吐
+    # 5MB 在高行情时跟不上写入速度，导致数据积压
+    _MAX_CHUNK_BYTES = 50 * 1024 * 1024
+
+    # 每种文件类型的 SecurityID 列索引和有效股票前缀
+    # 用于预过滤：只保留股票行，跳过基金/债券/指数等
+    _FILE_FILTERS = {
+        "mdl_6_36_0.csv":  (5, ("0", "3")),       # SZ deal: SecurityID=col6(index5)
+        "mdl_6_33_0.csv":  (5, ("0", "3")),       # SZ order
+        "mdl_6_28_0.csv":  (2, ("0", "3")),       # SZ tick: SecurityID=col3(index2)
+        "mdl_4_24_0.csv":  (2, ("6", "9")),       # SH order_deal: SecurityID=col3(index2)
+        "mdl_4_19_0.csv":  (2, ("6", "9")),       # SH order
+        "mdl_4_4_0.csv":   (1, ("6", "9")),       # SH tick: SecurityID=col2(index1)
+    }
 
     def __init__(self, path: Path, skip_existing: bool = True):
         self.path = path
         self._offset = path.stat().st_size if skip_existing else 0
         self._header: Optional[list] = None
         self._last_read_time = 0.0
+        # 预计算该文件的过滤参数
+        self._filter = self._FILE_FILTERS.get(path.name)
 
     def read_new_rows(self) -> Optional[pd.DataFrame]:
         """
         读取自上次以来的新增行，返回 DataFrame。
         如果没有新数据或读取失败返回 None。
         单次最多读取 _MAX_CHUNK_BYTES，剩余下次再读。
+
+        性能优化（相比原始 pandas read_csv）：
+        1. 50MB 大 chunk 减少 10x 解析次数
+        2. 按 SecurityID 预过滤，跳过 50-70% 非股票行
+        3. dtype=str 跳过 pandas 类型推断（最慢的部分）
         """
         try:
             current_size = self.path.stat().st_size
@@ -131,11 +148,7 @@ class FilePoller:
         if current_size <= self._offset:
             return None
 
-        # 限制单次读取量，避免 OOM
         bytes_to_read = min(current_size - self._offset, self._MAX_CHUNK_BYTES)
-
-        logger.debug("[read] %s size=%d offset=%d 本次读取=%d bytes",
-                    self.path.name, current_size, self._offset, bytes_to_read)
 
         with open(self.path, "rb") as f:
             f.seek(self._offset)
@@ -144,48 +157,89 @@ class FilePoller:
         if not chunk:
             return None
 
-        # 保证只处理完整行：截断到最后一个换行符
+        # 截断到最后一个换行符（只处理完整行）
         last_newline = chunk.rfind(b"\n")
         if last_newline == -1:
-            # 没有完整行，等下次
             return None
 
         complete_chunk = chunk[: last_newline + 1]
         self._offset += last_newline + 1
         self._last_read_time = time.time()
 
-        # 解码并解析 CSV
         try:
             text = complete_chunk.decode("utf-8", errors="replace")
 
+            # 首次读取：从文件头获取列名
             if self._header is None:
-                # 第一次读取，需要从文件头获取列名
                 with open(self.path, "r", encoding="utf-8", errors="replace") as f:
                     header_line = f.readline().strip()
                 self._header = header_line.split(",")
                 self._header_count = len(self._header)
 
             import io
-            # 通联数据行可能有 trailing comma（尾部逗号），导致字段数比 header 多1
-            # pandas 会将多余字段左移到已有列名上，造成列错位
-            # 修复：strip 每行的尾部逗号，确保字段数与 header 一致
             n_cols = self._header_count
-            lines = text.split('\n')
-            cleaned = []
-            for line in lines:
-                line = line.rstrip('\r')
-                # 数据行字段数 = 逗号数 + 1；如果有 trailing comma 则逗号数 == n_cols
-                if line.count(',') == n_cols and not line.startswith(self._header[0]):
-                    line = line.rstrip(',').rstrip('\r')
-                cleaned.append(line)
-            text = '\n'.join(cleaned)
+            header_first = self._header[0]
 
-            if text.startswith(",".join(self._header[:3])):
-                # chunk 包含 header 行，直接解析
-                df = pd.read_csv(io.StringIO(text))
+            # ---- 预过滤：只保留股票行 ----
+            # 遍历每行，检查 SecurityID 前缀，过滤掉基金/债券/指数
+            sid_col, sid_prefixes = self._filter if self._filter else (-1, ())
+            sid_prefix_set = set(sid_prefixes)  # set 查找比 tuple 快
+
+            lines = text.split('\n')
+            filtered = []
+            has_header = False
+
+            for line in lines:
+                if not line or line == '\r':
+                    continue
+                line = line.rstrip('\r')
+
+                # trailing comma 处理
+                comma_count = line.count(',')
+                if comma_count == n_cols and not line.startswith(header_first):
+                    line = line.rstrip(',')
+
+                # 检查是否为 header 行
+                if line.startswith(header_first):
+                    has_header = True
+                    filtered.append(line)
+                    continue
+
+                # 预过滤：按 SecurityID 列快速检查
+                if sid_col >= 0 and sid_prefix_set:
+                    # 快速路径：只 split 到需要的列
+                    if sid_col < comma_count:
+                        # 找到第 sid_col 个逗号的位置
+                        pos = 0
+                        try:
+                            for _ in range(sid_col):
+                                pos = line.index(',', pos) + 1
+                            # SecurityID 从 pos 开始到下一个逗号或行尾
+                            next_comma = line.find(',', pos)
+                            end = next_comma if next_comma >= 0 else len(line)
+                            sid_char = line[pos:end].strip()
+                        except (ValueError, IndexError):
+                            # 解析失败，保守保留该行
+                            filtered.append(line)
+                            continue
+                        if not sid_char or sid_char[0] not in sid_prefix_set:
+                            continue  # 非股票，跳过
+
+                filtered.append(line)
+
+            if not filtered:
+                return None
+
+            text_filtered = '\n'.join(filtered)
+
+            # ---- dtype=str 跳过类型推断 ----
+            # pandas 最慢的部分是对每列做 int→float→date 推断
+            # 全部读为 str，后续 TonglanceDataConverter 只对需要的列做 to_numeric
+            if has_header:
+                df = pd.read_csv(io.StringIO(text_filtered), dtype=str)
             else:
-                # chunk 只有数据行，手动指定 header
-                df = pd.read_csv(io.StringIO(text), header=None, names=self._header)
+                df = pd.read_csv(io.StringIO(text_filtered), header=None,
+                                 names=self._header, dtype=str)
 
             return df if not df.empty else None
         except Exception as e:
@@ -301,6 +355,21 @@ class DayDirWatcher:
                     market_time = str(df[col].iloc[-1])
                     break
 
+            # 计算 数据行情时间 vs 系统时间的延迟
+            latency_ms = round((time.time() - detect_ts) * 1000, 1)
+            now_str = datetime.now().strftime("%H%M%S%f")[:-3]
+            # 行情时间截取到秒（支持 "09:30:15.123" 和 "093015123" 两种格式）
+            mt_short = market_time.replace(":", "")[:6] if market_time else "?"
+            now_short = now_str[:6]
+            try:
+                if len(mt_short) == 6 and mt_short.isdigit():
+                    data_delay_ms = (int(now_short) - int(mt_short))
+                    delay_str = f"+{data_delay_ms}s" if data_delay_ms >= 0 else f"{data_delay_ms}s"
+                else:
+                    delay_str = "?"
+            except Exception:
+                delay_str = "?"
+
             get_collector_logger().log(
                 "csv_detect",
                 file=path.name,
@@ -308,8 +377,9 @@ class DayDirWatcher:
                 data_type=data_type,
                 rows=len(df),
                 market_time=market_time,
-                system_time=datetime.now().strftime("%H%M%S%f")[:-3],
-                latency_detect_ms=round((time.time() - detect_ts) * 1000, 1),
+                system_time=now_str,
+                latency_detect_ms=latency_ms,
+                delay_vs_market=delay_str,
             )
 
             with self._results_lock:
@@ -317,7 +387,9 @@ class DayDirWatcher:
                 self._results.append((path, market, data_type, df))
             if q_len > 10:
                 logger.warning("[积压] 队列=%d 文件=%s（处理速度跟不上写入速度）", q_len, path.name)
-            logger.info("[%s][%s] %s +%d 行 队列=%d", market, data_type, path.name, len(df), q_len)
+            logger.info("[%s][%s] %s +%d 行 队列=%d 行情时间=%s 系统时间=%s 延迟%s",
+                        market, data_type, path.name, len(df), q_len,
+                        mt_short, now_short, delay_str)
 
     def start(self):
         """启动监听（使用 inotify 或轮询）。"""

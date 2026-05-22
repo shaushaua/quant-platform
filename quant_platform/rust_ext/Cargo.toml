@@ -1,0 +1,11 @@
+[package]
+name = "fast-csv"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fast_csv"
+crate-type = ["cdylib"]      # 编译为 .so 动态库
+
+[dependencies]
+libc = "0.2"
