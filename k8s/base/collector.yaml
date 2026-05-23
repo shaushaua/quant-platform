@@ -8,6 +8,8 @@ metadata:
     app: collector
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: collector
@@ -41,7 +43,7 @@ spec:
             - name: MDL_IO_THREADS
               value: "4"
             - name: MDL_CALLBACK_MULTITHREAD
-              value: "true"
+              value: "false"
             - name: MDL_ENCODING
               value: "1"
             - name: MDL_ENABLE_MERGE
@@ -80,11 +82,11 @@ spec:
               mountPath: /data/quant/mdl_logs
           resources:
             requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
               cpu: "4"
               memory: 8Gi
-            limits:
-              cpu: "8"
-              memory: 16Gi
       volumes:
         # hostPath 替代 emptyDir：允许 collector 和 live-engine CronJob
         # 作为独立 Pod 运行，同时共享宿主机 /dev/shm 内的同一目录

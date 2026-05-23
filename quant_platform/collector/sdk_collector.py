@@ -36,6 +36,7 @@ class SDKCollector:
         self._trading_day = date.today()
         self._io_man = None
         self._subscriber = None
+        self._callback = None
         self._flush_thread = threading.Thread(target=self._flush_loop, name="sdk-flush", daemon=True)
         self._stats: Dict[str, int] = defaultdict(int)
         self._last_rolling_cleanup = 0.0
@@ -77,8 +78,8 @@ class SDKCollector:
         except Exception as exc:
             logger.warning("[sdk] EnableLog failed: %s", exc)
 
-        callback = create_callback(pymdl, self.queue, self.trading_day, self.tracker)
-        self._subscriber = self._io_man.CreateSubscriber(callback, self.config.callback_multithread)
+        self._callback = create_callback(pymdl, self.queue, self.trading_day, self.tracker)
+        self._subscriber = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
         self._subscriber.SetServerAddress(self.config.server)
         self._subscriber.SetMessageEncoding(self.config.encoding)
         self._subscriber.EnableMergeMessage(self.config.enable_merge)
