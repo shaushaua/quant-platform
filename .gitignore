@@ -19,6 +19,9 @@ test_*.py
 *.parquet
 .env
 
+# Local vendor binaries
+/vendor/pymdl/*.tar.gz
+
 # IDE
 .idea/
 .vscode/
