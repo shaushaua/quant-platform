@@ -40,6 +40,7 @@ class SDKCollector:
         self._flush_thread = threading.Thread(target=self._flush_loop, name="sdk-flush", daemon=True)
         self._stats: Dict[str, int] = defaultdict(int)
         self._last_rolling_cleanup = 0.0
+        self._last_pipeline_status_log = 0.0
         self._last_minute_stat_log = time.time()
         self._minute_write_stats: Dict[tuple[int, int, str, str], int] = defaultdict(int)
         self._minute_stat_lock = threading.Lock()
@@ -106,7 +107,7 @@ class SDKCollector:
                 self._write_batch(batch)
             now = time.time()
             if now - last_log >= 5:
-                self._log_status()
+                self._log_status(now)
                 last_log = now
             if now - self._last_rolling_cleanup >= 30:
                 self.store.cleanup_rolling()
@@ -180,7 +181,7 @@ class SDKCollector:
                 **_latency_summary("market_to_receive", market_to_receive_ms[kind]),
             )
 
-    def _log_status(self) -> None:
+    def _log_status(self, now: float) -> None:
         qsize = self.queue.qsize()
         if qsize > self.config.queue_warn_size:
             logger.warning("[sdk] queue backlog=%d warn=%d", qsize, self.config.queue_warn_size)
@@ -192,6 +193,19 @@ class SDKCollector:
             self._stats.get("written_order", 0),
             self._stats.get("written_deal", 0),
             snap["gaps"],
+        )
+        if now - self._last_pipeline_status_log < 30:
+            return
+        self._last_pipeline_status_log = now
+        get_collector_logger().log(
+            "sdk_status",
+            queue_size=qsize,
+            written_tick=self._stats.get("written_tick", 0),
+            written_order=self._stats.get("written_order", 0),
+            written_deal=self._stats.get("written_deal", 0),
+            seq_received=snap["received"],
+            seq_gaps=snap["gaps"],
+            seq_gap_size=snap["gap_size"],
         )
 
     def _log_minute_write_stats(self, force: bool = False) -> None:
