@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Dict, Optional, Tuple
 
+from ..live_engine.pipeline_logger import get_collector_logger
 from . import sdk_mapper
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,13 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
             try:
                 msg = pymdl.mdl_sys_msg.Read(hd.MessageID, buf)
                 logger.info("[sdk-sys] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg)
+                get_collector_logger().log(
+                    "sdk_system_message",
+                    service_id=int(hd.ServiceID),
+                    message_id=int(hd.MessageID),
+                    sequence_id=int(hd.SequenceID),
+                    message=str(msg),
+                )
             except Exception as exc:
                 logger.warning("[sdk-sys] parse failed: %s", exc)
 

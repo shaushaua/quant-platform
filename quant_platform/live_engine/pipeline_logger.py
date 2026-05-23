@@ -9,6 +9,8 @@
   csv_parse     → CSV 行解析
   data_convert  → 通联格式转换
   shm_write     → 写入 ShmStore
+  sdk_connected → SDK 已连接通联客户端
+  sdk_system_message → SDK 系统消息/订阅回包
   sdk_shm_write → SDK 接收后写入 ShmStore
   sdk_minute_write → SDK 写入 ShmStore 的行情分钟计数
   chunk_read    → StreamingEngine 读取 chunk

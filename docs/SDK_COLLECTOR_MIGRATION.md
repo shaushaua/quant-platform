@@ -577,6 +577,12 @@ minute, source, sid, mid, data_type, row_count, unique_code_count, min_seq, max_
 # SDK 写入 ShmStore 的分钟计数
 grep '"stage": "sdk_minute_write"' /data/quant/pipeline_logs/pipeline_YYYYMMDD.log
 
+# SDK 是否连上通联客户端
+grep '"stage": "sdk_connected"' /data/quant/pipeline_logs/pipeline_YYYYMMDD.log
+
+# SDK 系统消息/订阅回包，ReturnCode=0 且 MessageStatus=0 表示订阅被接受
+grep '"stage": "sdk_system_message"' /data/quant/pipeline_logs/pipeline_YYYYMMDD.log
+
 # live-engine 已消费进 StockState 的分钟计数
 grep '"stage": "stream_minute_consume"' /data/quant/pipeline_logs/pipeline_YYYYMMDD.log
 

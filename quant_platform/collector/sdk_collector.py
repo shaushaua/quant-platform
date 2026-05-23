@@ -97,6 +97,15 @@ class SDKCollector:
                 err = err.decode("GBK", errors="replace")
             raise RuntimeError(f"MDL Connect failed: {err}")
         logger.info("[sdk] connected to %s", self.config.server)
+        get_collector_logger().log(
+            "sdk_connected",
+            server=self.config.server,
+            subs=[f"{service_id}.{message_id}" for service_id, message_id in self.config.subs],
+            io_threads=self.config.io_threads,
+            callback_multithread=self.config.callback_multithread,
+            encoding=self.config.encoding,
+            enable_merge=self.config.enable_merge,
+        )
 
     def _flush_loop(self) -> None:
         interval = max(self.config.flush_interval_ms, 1) / 1000.0
