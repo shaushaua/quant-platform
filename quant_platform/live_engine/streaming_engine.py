@@ -88,6 +88,15 @@ def _extract_chunk_ts(filename: str) -> float:
         return 0.0
 
 
+def _market_minute_counts(values: pd.Series) -> Dict[str, int]:
+    ts = pd.to_datetime(values, errors="coerce")
+    if ts.empty:
+        return {}
+    minutes = ts.dt.strftime("%Y-%m-%d %H:%M")
+    counts = minutes.dropna().value_counts()
+    return {str(minute): int(rows) for minute, rows in counts.items()}
+
+
 def _time_to_seconds(time_val) -> float:
     """将 Time 列值转换为自午夜以来的秒数。
 
@@ -177,6 +186,9 @@ class StreamingEngine:
         self._trading_day: str = ""
         self._last_output_ts: float = 0
         self._stopped = False
+        self._last_minute_stat_log = time.time()
+        self._minute_consume_stats: Dict[tuple[str, str], int] = {}
+        self._minute_stat_lock = threading.Lock()
 
         # 因子模块
         module_path = os.environ.get("FACTOR_MODULE", "")
@@ -271,6 +283,7 @@ class StreamingEngine:
         """将 DataFrame 按 Code 分组更新到对应的 StockState。线程安全。"""
         if df is None or df.empty or "Code" not in df.columns:
             return
+        self._record_minute_consume(data_type, df)
         now = time.time()
         # groupby 在锁外完成（CPU 密集，不涉及共享数据）
         groups = list(df.groupby("Code"))
@@ -341,6 +354,34 @@ class StreamingEngine:
                     self.processed_chunks[data_type] -= stale
 
         return consumed
+
+    def _record_minute_consume(self, data_type: str, df: pd.DataFrame) -> None:
+        if "Time" not in df.columns:
+            return
+        for market_minute, rows in _market_minute_counts(df["Time"]).items():
+            key = (data_type, market_minute)
+            with self._minute_stat_lock:
+                self._minute_consume_stats[key] = self._minute_consume_stats.get(key, 0) + rows
+
+    def _log_minute_consume_stats(self, force: bool = False) -> None:
+        pipe_log = get_streaming_logger()
+        current_minute = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with self._minute_stat_lock:
+            ready = [
+                (key, rows)
+                for key, rows in sorted(self._minute_consume_stats.items())
+                if force or key[1] < current_minute
+            ]
+            for key, _ in ready:
+                self._minute_consume_stats.pop(key, None)
+        for key, rows in ready:
+            data_type, market_minute = key
+            pipe_log.log(
+                "stream_minute_consume",
+                data_type=data_type,
+                market_minute=market_minute,
+                rows=rows,
+            )
 
     # ------------------------------------------------------------------ #
     # 因子计算与输出                                                        #
@@ -560,6 +601,10 @@ class StreamingEngine:
                         logger.debug("[streaming] 无股票数据，跳过计算")
                 self._last_output_ts = now
 
+            if now - self._last_minute_stat_log >= 60:
+                self._log_minute_consume_stats()
+                self._last_minute_stat_log = now
+
             # 定时 checkpoint：仅交易时段保存
             if now - last_checkpoint_ts >= 30 and self.states and _is_trading_hours():
                 self._save_checkpoint()
@@ -573,6 +618,7 @@ class StreamingEngine:
     def stop(self) -> None:
         """停止引擎，保存 checkpoint。"""
         self._stopped = True
+        self._log_minute_consume_stats(force=True)
         if self.states:
             self._save_checkpoint()
         if hasattr(self, '_observer'):

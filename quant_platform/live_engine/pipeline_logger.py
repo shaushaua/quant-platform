@@ -9,12 +9,23 @@
   csv_parse     → CSV 行解析
   data_convert  → 通联格式转换
   shm_write     → 写入 ShmStore
+  sdk_shm_write → SDK 接收后写入 ShmStore
+  sdk_minute_write → SDK 写入 ShmStore 的行情分钟计数
   chunk_read    → StreamingEngine 读取 chunk
+  stream_minute_consume → StreamingEngine 消费进 StockState 的行情分钟计数
   factor_compute → 因子计算
   output        → CSV 写入 + OSS 上传
 
+关键延迟字段：
+  market_to_receive_*_ms → 通联行情交易时间到 SDK 回调接收时间
+  receive_to_write_*_ms  → SDK 回调接收时间到 ShmStore 写入时间
+  chunk_age_ms           → ShmStore 写入到 live-engine 读取时间
+  data_latency_*_ms      → 行情交易时间到因子计算时间
+  compute_ms             → 本轮因子计算总耗时
+
 环境变量：
   PIPELINE_LOG_DIR     日志目录（默认 /data/quant/pipeline_logs）
+  PIPELINE_LOG_FALLBACK_DIR 主目录不可写时的兜底目录（默认 /tmp/quant_pipeline_logs）
   PIPELINE_LOG_ENABLED 开关（默认 true）
 """
 
@@ -31,6 +42,7 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 _LOG_DIR = Path(os.environ.get("PIPELINE_LOG_DIR", "/data/quant/pipeline_logs"))
+_FALLBACK_LOG_DIR = Path(os.environ.get("PIPELINE_LOG_FALLBACK_DIR", "/tmp/quant_pipeline_logs"))
 _ENABLED = os.environ.get("PIPELINE_LOG_ENABLED", "true").lower() == "true"
 
 
@@ -46,6 +58,13 @@ class PipelineLogger:
         self._lock = threading.Lock()
         self._current_day: str = ""
         self._file = None
+        self._active_dir: Optional[Path] = None
+        self._fallback_warned = False
+
+    def _open_log_file(self, log_dir: Path, today: str):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"pipeline_{today}.log"
+        return open(log_path, "a", encoding="utf-8")
 
     def _ensure_file(self) -> None:
         """确保日志文件已打开，按天切换。"""
@@ -58,10 +77,25 @@ class PipelineLogger:
                 self._file.close()
             except Exception:
                 pass
-        # 打开新文件
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = _LOG_DIR / f"pipeline_{today}.log"
-        self._file = open(log_path, "a", encoding="utf-8")
+        # 打开新文件：优先使用 hostPath，失败时落到容器本地 /tmp，避免静默丢链路日志。
+        try:
+            self._file = self._open_log_file(_LOG_DIR, today)
+            self._active_dir = _LOG_DIR
+        except Exception as primary_exc:
+            try:
+                self._file = self._open_log_file(_FALLBACK_LOG_DIR, today)
+                self._active_dir = _FALLBACK_LOG_DIR
+                if not self._fallback_warned:
+                    logger.warning(
+                        "[pipeline_logger] 主日志目录不可写，已切到兜底目录: primary=%s fallback=%s error=%s",
+                        _LOG_DIR, _FALLBACK_LOG_DIR, primary_exc,
+                    )
+                    self._fallback_warned = True
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"pipeline log open failed: primary={_LOG_DIR} error={primary_exc}; "
+                    f"fallback={_FALLBACK_LOG_DIR} error={fallback_exc}"
+                ) from fallback_exc
         self._current_day = today
 
     def log(self, stage: str, **kwargs) -> None:
@@ -75,6 +109,7 @@ class PipelineLogger:
         """
         if not _ENABLED:
             return
+        line = ""
         try:
             record = {
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
@@ -89,7 +124,11 @@ class PipelineLogger:
                 self._file.write(line + "\n")
                 self._file.flush()
         except Exception as exc:
-            logger.debug("[pipeline_logger] 写入失败: %s", exc)
+            logger.warning("[pipeline_logger] 写入失败，改打到容器日志: %s", exc)
+            try:
+                logger.warning("[pipeline_record] %s", line)
+            except Exception:
+                pass
 
     @contextmanager
     def timer(self, stage: str, **extra):
@@ -121,6 +160,7 @@ class PipelineLogger:
                     pass
                 self._file = None
                 self._current_day = ""
+                self._active_dir = None
 
 
 # 全局单例（按 source 区分）
