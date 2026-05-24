@@ -298,6 +298,45 @@ def main():
 
     _logger.info("worker done", elapsed_seconds=elapsed)
 
+    # 上传日志到 OSS
+    _upload_log()
+
+
+def _upload_log():
+    """将 worker 日志上传到 OSS，路径: {TASK_ID}/logs/shard_{SHARD_INDEX}.log"""
+    log_path = os.environ.get("WORKER_LOG_FILE")
+    if not log_path or not os.path.exists(log_path):
+        return
+    try:
+        bucket = _get_bucket()
+        key = f"{TASK_ID}/logs/shard_{SHARD_INDEX}.log"
+        bucket.put_object_from_file(key, log_path)
+        print(f"[worker] log uploaded to oss://{RESULT_BUCKET}/{key}")
+    except Exception as e:
+        print(f"[worker] WARNING: log upload failed: {e}")
+
 
 if __name__ == "__main__":
+    # 同时写 stdout 和日志文件，以便上传到 OSS
+    import io
+
+    _log_file = f"/tmp/worker_shard_{SHARD_INDEX}.log"
+    os.environ["WORKER_LOG_FILE"] = _log_file
+
+    class _Tee:
+        """同时写入多个流"""
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+
+    _fh = open(_log_file, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, _fh)
+    sys.stderr = _Tee(sys.__stderr__, _fh)
+
     main()

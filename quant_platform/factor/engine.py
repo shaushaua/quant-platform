@@ -160,7 +160,11 @@ def calc_factors_by_date_range(
 
                 for batch_idx, batch_codes in enumerate(batches):
                     logger.info("处理批次 %d/%d：%d 只股票", batch_idx+1, len(batches), len(batch_codes))
+                    import time as _time
+                    _t_load = _time.time()
                     bundle = _load_day_bundle(date, factor_info, api, batch_codes)
+                    _load_elapsed = _time.time() - _t_load
+                    logger.info("[Perf] batch %d/%d _load_day_bundle=%.2fs", batch_idx+1, len(batches), _load_elapsed)
                     if not is_explicit_list:
                         bundle.market = daily_basic
 
@@ -191,7 +195,12 @@ def calc_factors_by_date_range(
 
                             stock_data = _build_stock_data(bundle, code, date, end_time, factor_info, api, hist_bundles)
                             if _calc_fn is not None:
+                                import time as _time
+                                _t_calc = _time.time()
                                 res = _calc_fn(stock_data, code, date, end_time)
+                                _calc_elapsed = _time.time() - _t_calc
+                                if _calc_elapsed > 1.0:
+                                    logger.info("[Perf] %s factor_calculation=%.2fs", code, _calc_elapsed)
                                 if res is not None:
                                     all_res.append(res)
                         except Exception as e:
