@@ -259,8 +259,9 @@ def main():
             if not _db.empty and "ID_QI" in _db.columns:
                 all_stocks = sorted(_db["ID_QI"].tolist())
             else:
-                _logger.error("无法获取全市场股票列表用于分片")
-                sys.exit(1)
+                _logger.info("当日无交易数据，跳过（非交易日）", date=START_DATE)
+                _upload_log()
+                sys.exit(0)  # 正常退出，非交易日不算失败
             _logger.info("全市场股票列表获取完成", total=len(all_stocks))
 
         my_stocks = [s for i, s in enumerate(all_stocks) if i % STOCK_SHARDS == STOCK_SHARD_INDEX]
