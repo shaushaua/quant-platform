@@ -53,6 +53,7 @@ def _require_env(key: str) -> str:
 START_DATE   = _require_env("START_DATE").replace("-", "")   # YYYYMMDD
 END_DATE     = _require_env("END_DATE").replace("-", "")     # YYYYMMDD
 TASK_ID      = _require_env("TASK_ID")
+STRATEGY_NAME = os.environ.get("STRATEGY_NAME", TASK_ID)  # OSS路径用策略名
 SHARD_INDEX  = int(os.environ.get("SHARD_INDEX", "0"))
 STOCK_SHARDS = int(os.environ.get("STOCK_SHARDS", "1"))
 STOCK_SHARD_INDEX = int(os.environ.get("STOCK_SHARD_INDEX", "0"))
@@ -156,7 +157,7 @@ def _write_daily_result(date: str, records: list[dict]) -> None:
     year = date[:4]
     month = date[4:6]
     suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
-    key = f"{TASK_ID}/{year}/{year}{month}/{date}{suffix}.json"
+    key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}{suffix}.json"
     bucket = _get_bucket()
     payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
     bucket.put_object(key, payload)
@@ -309,7 +310,7 @@ def _upload_log():
         return
     try:
         bucket = _get_bucket()
-        key = f"{TASK_ID}/logs/shard_{SHARD_INDEX}.log"
+        key = f"{STRATEGY_NAME}/logs/shard_{SHARD_INDEX}.log"
         bucket.put_object_from_file(key, log_path)
         print(f"[worker] log uploaded to oss://{RESULT_BUCKET}/{key}")
     except Exception as e:
