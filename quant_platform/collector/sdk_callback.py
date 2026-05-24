@@ -89,13 +89,17 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
         def OnMDLSysMessage(self, hd, buf):
             try:
                 msg = pymdl.mdl_sys_msg.Read(hd.MessageID, buf)
+                msg_text = str(msg)
+                if int(hd.MessageID) == 4 and "Reversed" in msg_text:
+                    logger.debug("[sdk-sys-heartbeat] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg)
+                    return
                 logger.info("[sdk-sys] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg)
                 get_collector_logger().log(
                     "sdk_system_message",
                     service_id=int(hd.ServiceID),
                     message_id=int(hd.MessageID),
                     sequence_id=int(hd.SequenceID),
-                    message=str(msg),
+                    message=msg_text,
                 )
             except Exception as exc:
                 logger.warning("[sdk-sys] parse failed: %s", exc)
