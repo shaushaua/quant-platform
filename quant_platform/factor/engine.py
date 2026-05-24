@@ -584,18 +584,21 @@ def _build_stock_data(
             len(l2_order_hist), len(l2_deal_hist), len(l1_tick_hist),
         )
 
+    # 深拷贝所有 DataFrame，策略代码可能使用链式赋值修改数据，
+    # pandas 2.x CoW 下链式赋值修改的是临时副本，导致结果全 NaN。
+    # 给策略独立副本避免此问题。
     return StockData(
         code=code,
         date=date,
         end_time=end_time,
-        l2_order=l2_order_data,
-        l2_deal=l2_deal_data,
-        l1_tick=l1_tick_data,
-        market=market_data,
-        daily_basic=market_data,  # 别名，与 market 相同
-        l2_order_hist=l2_order_hist,
-        l2_deal_hist=l2_deal_hist,
-        l1_tick_hist=l1_tick_hist,
+        l2_order=l2_order_data.copy(),
+        l2_deal=l2_deal_data.copy(),
+        l1_tick=l1_tick_data.copy(),
+        market=market_data.copy(),
+        daily_basic=market_data.copy(),
+        l2_order_hist=[df.copy() for df in l2_order_hist],
+        l2_deal_hist=[df.copy() for df in l2_deal_hist],
+        l1_tick_hist=[df.copy() for df in l1_tick_hist],
     )
 
 
