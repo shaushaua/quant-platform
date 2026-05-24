@@ -54,6 +54,8 @@ START_DATE   = _require_env("START_DATE").replace("-", "")   # YYYYMMDD
 END_DATE     = _require_env("END_DATE").replace("-", "")     # YYYYMMDD
 TASK_ID      = _require_env("TASK_ID")
 SHARD_INDEX  = int(os.environ.get("SHARD_INDEX", "0"))
+STOCK_SHARDS = int(os.environ.get("STOCK_SHARDS", "1"))
+STOCK_SHARD_INDEX = int(os.environ.get("STOCK_SHARD_INDEX", "0"))
 DATA_PATH    = os.environ.get("DATA_PATH", "/data")
 RESULT_BUCKET = os.environ.get("RESULT_BUCKET", "stock-mdl-data-result")
 PROCESSES    = int(os.environ.get("WORKERS", "1"))
@@ -153,7 +155,8 @@ def _write_daily_result(date: str, records: list[dict]) -> None:
     """
     year = date[:4]
     month = date[4:6]
-    key = f"{TASK_ID}/{year}/{year}{month}/{date}.json"
+    suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
+    key = f"{TASK_ID}/{year}/{year}{month}/{date}{suffix}.json"
     bucket = _get_bucket()
     payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
     bucket.put_object(key, payload)
@@ -241,6 +244,32 @@ def main():
                  need_tick=factor_info.get("need_l1_tick", False),
                  need_order=factor_info.get("need_l2_order", False),
                  need_deal=factor_info.get("need_l2_deal", False))
+
+    # ---- 股票分片：按 STOCK_SHARDS / STOCK_SHARD_INDEX 过滤 ----
+    if STOCK_SHARDS > 1:
+        if securities:
+            # 策略指定了股票列表，直接按排序取模分片
+            all_stocks = sorted(securities)
+        else:
+            # 全市场模式：从 daily_basic 获取全量股票列表
+            from quant_platform.data.api import DataAPI
+            _api = DataAPI(mode="backtest", oss_base_path=DATA_PATH)
+            _db = _api.get_daily_data(START_DATE, "daily_basic")
+            if not _db.empty and "ID_QI" in _db.columns:
+                all_stocks = sorted(_db["ID_QI"].tolist())
+            else:
+                _logger.error("无法获取全市场股票列表用于分片")
+                sys.exit(1)
+            _logger.info("全市场股票列表获取完成", total=len(all_stocks))
+
+        my_stocks = [s for i, s in enumerate(all_stocks) if i % STOCK_SHARDS == STOCK_SHARD_INDEX]
+        securities = my_stocks
+        _logger.info("股票分片过滤",
+                     stock_shards=STOCK_SHARDS,
+                     stock_shard_index=STOCK_SHARD_INDEX,
+                     total_stocks=len(all_stocks),
+                     my_stocks=len(my_stocks),
+                     sample=my_stocks[:5])
 
     daily_outfun, stats = _make_daily_outfun(user_outfun)
 
