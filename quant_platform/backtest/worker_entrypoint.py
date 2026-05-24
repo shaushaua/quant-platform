@@ -28,9 +28,6 @@ from typing import Optional
 import oss2
 import pandas as pd
 
-# 禁用 pandas 2.x Copy-on-Write，避免策略代码中链式赋值静默失败导致结果全 NaN
-pd.options.mode.copy_on_write = False
-
 # 让 engine/loader 的 logging 输出到 stdout（kubectl logs 可见）
 logging.basicConfig(
     level=logging.INFO,

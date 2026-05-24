@@ -11,6 +11,9 @@ RUN mkdir -p /app/strategy
 # 把包路径加入 PYTHONPATH，无需构建
 ENV PYTHONPATH=/app
 
+# 降级 pandas 到 2.x（pandas 3.0 强制启用 CoW，策略代码的链式赋值会静默失败）
+RUN pip install "pandas>=2.0,<3.0" --no-cache-dir
+
 # 安装 SLS Python SDK
 RUN pip install aliyun-log-python-sdk --no-cache-dir
 
