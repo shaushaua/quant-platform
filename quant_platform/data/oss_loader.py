@@ -145,7 +145,7 @@ class OSSDataLoader:
         month = date_str[4:6]
         day = date_str[6:8]
         file_suffix = self.DATA_TYPES.get(data_type, data_type)
-        return f"{self.base_path}/{year}{month}/{year}{month}{day}/{year}{month}{day}_{file_suffix}.parquet"
+        return f"{year}/{year}{month}/{year}{month}{day}/{year}{month}{day}_{file_suffix}.parquet"
 
     def _s3_url(self, key: str) -> str:
         # DuckDB 与阿里云 OSS 兼容性测试
@@ -398,7 +398,8 @@ class OSSDataLoader:
         current = start_dt.replace(day=1)
         while current <= end_dt:
             year_month = current.strftime("%Y%m")
-            prefix = f"{self.base_path}/{year_month}/"
+            year = year_month[:4]
+            prefix = f"{year}/{year_month}/"
             keys = self._list_keys_with_prefix(prefix)
             for key in keys:
                 if "daily_basic_data" not in key:
