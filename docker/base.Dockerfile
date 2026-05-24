@@ -5,6 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
+# Use a China Debian mirror on the build machine.
+RUN rm -rf /etc/apt/sources.list.d/* \
+    && echo 'deb https://mirrors.tuna.tsinghua.edu.cn/debian trixie main contrib non-free non-free-firmware' > /etc/apt/sources.list \
+    && echo 'deb https://mirrors.tuna.tsinghua.edu.cn/debian trixie-updates main contrib non-free non-free-firmware' >> /etc/apt/sources.list \
+    && echo 'deb https://mirrors.tuna.tsinghua.edu.cn/debian-security trixie-security main contrib non-free non-free-firmware' >> /etc/apt/sources.list
+
 # Common native libraries used by pandas/pyarrow/duckdb and optional ML packages.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
