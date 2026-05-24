@@ -228,20 +228,36 @@ class OSSDataLoader:
             return pd.DataFrame()
 
         try:
-            # 1. 检查本地缓存，存在则跳过下载
+            # 1. 检查本地缓存
             cache_filename = hashlib.md5(key.encode()).hexdigest() + ".parquet"
             cached_path = os.path.join(self._local_cache_dir, cache_filename)
+
+            # 校验已有缓存是否为有效 parquet（检查末尾 magic bytes PAR1）
             if os.path.exists(cached_path):
-                logger.info(f"命中本地缓存，跳过下载: {key} -> {cached_path}")
-                tmp_path = cached_path
-            else:
-                # 下载到缓存目录（持久化，下次复用）
+                valid = False
+                try:
+                    with open(cached_path, 'rb') as f:
+                        f.seek(-4, 2)
+                        valid = (f.read(4) == b'PAR1')
+                except Exception:
+                    pass
+                if valid:
+                    logger.info(f"命中本地缓存: {key} -> {cached_path}")
+                else:
+                    logger.warning(f"缓存文件损坏，重新下载: {cached_path}")
+                    os.remove(cached_path)
+
+            # 缓存不存在或已清理，重新下载
+            if not os.path.exists(cached_path):
                 os.makedirs(self._local_cache_dir, exist_ok=True)
-                tmp_path = cached_path
-                logger.info(f"开始下载 {key} 到本地缓存 {tmp_path}")
-                self._oss_bucket.get_object_to_file(key, tmp_path)
-                file_size = os.path.getsize(tmp_path)
+                download_tmp = cached_path + f".{os.getpid()}.tmp"
+                logger.info(f"开始下载 {key} 到本地缓存 {cached_path}")
+                self._oss_bucket.get_object_to_file(key, download_tmp)
+                file_size = os.path.getsize(download_tmp)
+                os.rename(download_tmp, cached_path)
                 logger.info(f"下载完成: {key} ({file_size:,} bytes)")
+
+            tmp_path = cached_path
 
             # 2. DuckDB 读取本地文件并用 WHERE Code IN 过滤
             # tick/deal 文件中的 Code 列即为 SECURITY_ID
