@@ -157,7 +157,7 @@ def _write_daily_result(date: str, records: list[dict]) -> None:
     year = date[:4]
     month = date[4:6]
     suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
-    key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}{suffix}.json"
+    key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}/{date}{suffix}.json"
     bucket = _get_bucket()
     payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
     bucket.put_object(key, payload)
