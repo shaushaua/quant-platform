@@ -84,9 +84,12 @@ class ShmStore:
         """将 DataFrame 原子写为 Arrow IPC 文件。"""
         table = pa.Table.from_pandas(df, preserve_index=False)
         tmp = path.with_suffix(".tmp")
-        with ipc.new_file(str(tmp), table.schema) as writer:
-            writer.write_table(table)
-        tmp.replace(path)
+        try:
+            with ipc.new_file(str(tmp), table.schema) as writer:
+                writer.write_table(table)
+            tmp.replace(path)
+        finally:
+            del table
 
     def _read_arrow(self, path: Path) -> Optional[pd.DataFrame]:
         """读取 Arrow IPC 文件。"""

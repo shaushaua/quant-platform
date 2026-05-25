@@ -286,23 +286,22 @@ class StreamingEngine:
             return
         self._record_minute_consume(data_type, df)
         now = time.time()
-        # groupby 在锁外完成（CPU 密集，不涉及共享数据）
-        # 注意：必须 copy 每个 group，否则 CoW 下 group 是 df 的视图，
-        # 持有原始大 DataFrame 的 buffer 引用，导致内存无法释放
-        groups = [(str(code), group.copy()) for code, group in df.groupby("Code")]
-        # 锁内：只做新增 StockState
-        with self._lock:
-            for code_str, _ in groups:
-                if code_str not in self.states:
-                    self.states[code_str] = StockState(code=code_str)
-        # 锁外：更新已有状态（GIL 保护单对象属性写入）
-        for code_str, group in groups:
-            state = self.states.get(code_str)
-            if state is not None:
-                getattr(state, f"update_{data_type}")(group)
+        # 逐组处理，避免一次性复制整个 chunk 的所有分组造成内存峰值。
+        for code, group in df.groupby("Code", sort=False):
+            code_str = str(code)
+            with self._lock:
+                state = self.states.get(code_str)
+                if state is None:
+                    state = StockState(code=code_str)
+                    self.states[code_str] = state
+            group_copy = group.copy()
+            try:
+                getattr(state, f"update_{data_type}")(group_copy)
                 state.last_update_ts = now
                 if chunk_ts > 0:
                     state.last_chunk_ts = chunk_ts
+            finally:
+                del group_copy
 
     def _consume_new_chunks(self) -> int:
         """扫描 ShmStore 中未处理的 chunk，增量更新 per-stock 状态。返回新处理数量。"""
@@ -341,8 +340,11 @@ class StreamingEngine:
                     chunk_age_ms=chunk_age_ms, rows=rows, read_elapsed_ms=read_ms,
                 )
 
-                self._update_states(df, data_type, chunk_ts)
-                consumed += 1
+                try:
+                    self._update_states(df, data_type, chunk_ts)
+                    consumed += 1
+                finally:
+                    del df
                 # 消费后删除 chunk，由计算端控制数据生命周期
                 try:
                     f.unlink()
@@ -558,7 +560,10 @@ class StreamingEngine:
         pipe_log.log("chunk_read", trigger="inotify", data_type=parent, chunk=path.name,
                      chunk_age_ms=chunk_age_ms, rows=rows, read_elapsed_ms=read_ms)
 
-        self._update_states(df, parent, chunk_ts)
+        try:
+            self._update_states(df, parent, chunk_ts)
+        finally:
+            del df
         # 消费后删除 chunk
         try:
             path.unlink()

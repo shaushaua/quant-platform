@@ -168,35 +168,40 @@ class SDKCollector:
                 key = (item.service_id, item.message_id, item.kind, market_minute)
                 batch_minute_stats[key] += 1
 
-        frames = {
-            "tick": sdk_mapper.frame(by_kind["tick"], TICK_COLUMNS),
-            "order": sdk_mapper.frame(by_kind["order"], ORDER_COLUMNS),
-            "deal": sdk_mapper.frame(by_kind["deal"], DEAL_COLUMNS),
+        columns_by_kind = {
+            "tick": TICK_COLUMNS,
+            "order": ORDER_COLUMNS,
+            "deal": DEAL_COLUMNS,
         }
-
-        for kind, df in frames.items():
+        for kind, rows_for_kind in by_kind.items():
+            if not rows_for_kind:
+                continue
+            df = sdk_mapper.frame(rows_for_kind, columns_by_kind[kind])
             if df.empty:
                 continue
-            t0 = time.time()
-            chunk_name = getattr(self.store, f"update_{kind}")(df)
-            elapsed_ms = round((time.time() - t0) * 1000, 1)
-            rows = len(df)
-            self._stats[f"written_{kind}"] += rows
-            with self._minute_stat_lock:
-                for key, stat_rows in batch_minute_stats.items():
-                    if key[2] == kind:
-                        self._minute_write_stats[key] += stat_rows
-            pipe_log.log(
-                "sdk_shm_write",
-                data_type=kind,
-                chunk=chunk_name or "",
-                rows=rows,
-                elapsed_ms=elapsed_ms,
-                queue_size=self.queue.qsize(),
-                oldest_queue_age_ms=round(oldest_age_ms, 1),
-                **_latency_summary("receive_to_write", receive_to_write_ms[kind]),
-                **_latency_summary("market_to_receive", market_to_receive_ms[kind]),
-            )
+            try:
+                t0 = time.time()
+                chunk_name = getattr(self.store, f"update_{kind}")(df)
+                elapsed_ms = round((time.time() - t0) * 1000, 1)
+                rows = len(df)
+                self._stats[f"written_{kind}"] += rows
+                with self._minute_stat_lock:
+                    for key, stat_rows in batch_minute_stats.items():
+                        if key[2] == kind:
+                            self._minute_write_stats[key] += stat_rows
+                pipe_log.log(
+                    "sdk_shm_write",
+                    data_type=kind,
+                    chunk=chunk_name or "",
+                    rows=rows,
+                    elapsed_ms=elapsed_ms,
+                    queue_size=self.queue.qsize(),
+                    oldest_queue_age_ms=round(oldest_age_ms, 1),
+                    **_latency_summary("receive_to_write", receive_to_write_ms[kind]),
+                    **_latency_summary("market_to_receive", market_to_receive_ms[kind]),
+                )
+            finally:
+                del df
 
     def _log_status(self, now: float) -> None:
         qsize = self.queue.qsize()
