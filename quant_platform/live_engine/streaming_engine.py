@@ -19,6 +19,7 @@
 """
 
 import importlib
+import gc
 import json
 import logging
 import os
@@ -613,6 +614,15 @@ class StreamingEngine:
 
             # 日切检查
             self._check_day_rollover()
+
+            # 定期释放未使用内存（Python GC + Arrow 内存池）
+            if now - last_poll_ts >= 30:
+                gc.collect()
+                try:
+                    import pyarrow as pa
+                    pa.default_memory_pool().release_unused()
+                except Exception:
+                    pass
 
             time.sleep(0.01)  # 10ms
 
