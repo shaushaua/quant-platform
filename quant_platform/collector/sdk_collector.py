@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime
+import gc
 import logging
 import os
 import queue
@@ -40,6 +41,9 @@ class SDKCollector:
         self._flush_thread = threading.Thread(target=self._flush_loop, name="sdk-flush", daemon=True)
         self._stats: Dict[str, int] = defaultdict(int)
         self._last_rolling_cleanup = 0.0
+        self._rolling_cleanup_interval = max(float(os.getenv("SHM_CLEANUP_INTERVAL_SECONDS", "5")), 1.0)
+        self._last_allocator_release = 0.0
+        self._allocator_release_interval = max(float(os.getenv("ARROW_RELEASE_INTERVAL_SECONDS", "30")), 1.0)
         self._last_pipeline_status_log = 0.0
         self._last_minute_stat_log = time.time()
         self._minute_write_stats: Dict[tuple[int, int, str, str], int] = defaultdict(int)
@@ -118,9 +122,12 @@ class SDKCollector:
             if now - last_log >= 5:
                 self._log_status(now)
                 last_log = now
-            if now - self._last_rolling_cleanup >= 30:
+            if now - self._last_rolling_cleanup >= self._rolling_cleanup_interval:
                 self.store.cleanup_rolling()
                 self._last_rolling_cleanup = now
+            if now - self._last_allocator_release >= self._allocator_release_interval:
+                _release_unused_memory()
+                self._last_allocator_release = now
             if now - self._last_minute_stat_log >= 60:
                 self._log_minute_write_stats()
                 self._last_minute_stat_log = now
@@ -241,6 +248,8 @@ class SDKCollector:
 
     def start(self) -> None:
         logger.info("[sdk] collector starting config=%s", self.config)
+        if os.getenv("SHM_CLEAR_ON_START", "true").lower() in ("1", "true", "yes", "on"):
+            self.store.clear_rolling()
         self._load_daily_basic()
         self._flush_thread.start()
         self._connect()
@@ -276,6 +285,18 @@ def _market_to_receive_ms(market_time, receive_ts: float) -> float | None:
         return round((receive_ts - dt.timestamp()) * 1000, 1)
     except Exception:
         return None
+
+
+def _release_unused_memory() -> None:
+    try:
+        gc.collect()
+        try:
+            import pyarrow as pa
+            pa.default_memory_pool().release_unused()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _market_minute(market_time) -> str | None:

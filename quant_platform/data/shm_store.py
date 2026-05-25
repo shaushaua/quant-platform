@@ -39,6 +39,7 @@ SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
 
 # 滚动窗口时长（秒），默认 5 分钟
 ROLLING_WINDOW_SECONDS = int(os.environ.get("ROLLING_WINDOW_SECONDS", "300"))
+SHM_MAX_TOTAL_BYTES = int(os.environ.get("SHM_MAX_TOTAL_BYTES", "0"))
 
 # 需要滚动 chunk 的数据类型
 _ROLLING_TYPES = {"tick", "order", "deal"}
@@ -203,9 +204,67 @@ class ShmStore:
                     except OSError:
                         pass
 
+        if SHM_MAX_TOTAL_BYTES > 0:
+            cleaned += self._cleanup_by_total_size(SHM_MAX_TOTAL_BYTES)
+
         if cleaned:
             logger.info("[滚动清理] 已删除 %d 个过期 chunk 文件（窗口=%ds）",
                         cleaned, ROLLING_WINDOW_SECONDS)
+        return cleaned
+
+    def _cleanup_by_total_size(self, max_total_bytes: int) -> int:
+        files = []
+        total = 0
+        for data_type in _ROLLING_TYPES:
+            chunk_dir = SHM_BASE / data_type
+            if not chunk_dir.exists():
+                continue
+            for f in chunk_dir.glob("chunk_*.arrow"):
+                try:
+                    stat = f.stat()
+                except OSError:
+                    continue
+                total += stat.st_size
+                files.append((stat.st_mtime, stat.st_size, data_type, f))
+
+        if total <= max_total_bytes:
+            return 0
+
+        cleaned = 0
+        files.sort()
+        for _, size, data_type, f in files:
+            if total <= max_total_bytes:
+                break
+            try:
+                with self._locks[data_type]:
+                    f.unlink()
+                total -= size
+                cleaned += 1
+            except OSError:
+                pass
+        if cleaned:
+            logger.warning(
+                "[滚动清理] chunk 总大小超过上限，按大小删除 %d 个旧文件（剩余约 %.1fMB，上限 %.1fMB）",
+                cleaned, total / 1024 / 1024, max_total_bytes / 1024 / 1024,
+            )
+        return cleaned
+
+    def clear_rolling(self) -> int:
+        """清空 tick/order/deal rolling chunk，保留 daily_basic/quote/kline。"""
+        cleaned = 0
+        for data_type in _ROLLING_TYPES:
+            chunk_dir = SHM_BASE / data_type
+            if not chunk_dir.exists():
+                continue
+            with self._locks[data_type]:
+                for f in chunk_dir.glob("chunk_*.arrow"):
+                    try:
+                        f.unlink()
+                        cleaned += 1
+                    except OSError:
+                        pass
+        if cleaned:
+            logger.info("[滚动清理] 启动清空 rolling chunk 文件 %d 个", cleaned)
         return cleaned
 
     # ------------------------------------------------------------------ #
