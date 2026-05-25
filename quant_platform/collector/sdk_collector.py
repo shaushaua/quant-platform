@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime
 import gc
+import ctypes
 import logging
 import os
 import queue
@@ -293,6 +294,10 @@ def _release_unused_memory() -> None:
         try:
             import pyarrow as pa
             pa.default_memory_pool().release_unused()
+        except Exception:
+            pass
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
     except Exception:

@@ -583,6 +583,7 @@ class StreamingEngine:
         # 轮询/计算/checkpoint 时间戳
         last_poll_ts = time.time()
         last_checkpoint_ts = time.time()
+        last_memory_release_ts = time.time()
 
         while not self._stopped:
             now = time.time()
@@ -616,13 +617,14 @@ class StreamingEngine:
             self._check_day_rollover()
 
             # 定期释放未使用内存（Python GC + Arrow 内存池）
-            if now - last_poll_ts >= 30:
+            if now - last_memory_release_ts >= 30:
                 gc.collect()
                 try:
                     import pyarrow as pa
                     pa.default_memory_pool().release_unused()
                 except Exception:
                     pass
+                last_memory_release_ts = now
 
             time.sleep(0.01)  # 10ms
 
