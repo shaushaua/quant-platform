@@ -286,16 +286,17 @@ class StreamingEngine:
         self._record_minute_consume(data_type, df)
         now = time.time()
         # groupby 在锁外完成（CPU 密集，不涉及共享数据）
-        groups = list(df.groupby("Code"))
+        # 注意：必须 copy 每个 group，否则 CoW 下 group 是 df 的视图，
+        # 持有原始大 DataFrame 的 buffer 引用，导致内存无法释放
+        groups = [(str(code), group.copy()) for code, group in df.groupby("Code")]
         # 锁内：只做新增 StockState
         with self._lock:
-            for code, _ in groups:
-                code_str = str(code)
+            for code_str, _ in groups:
                 if code_str not in self.states:
                     self.states[code_str] = StockState(code=code_str)
         # 锁外：更新已有状态（GIL 保护单对象属性写入）
-        for code, group in groups:
-            state = self.states.get(str(code))
+        for code_str, group in groups:
+            state = self.states.get(code_str)
             if state is not None:
                 getattr(state, f"update_{data_type}")(group)
                 state.last_update_ts = now

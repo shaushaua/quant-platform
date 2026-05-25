@@ -121,6 +121,7 @@ class ShmStore:
             return pd.DataFrame()
 
         result = pd.concat(dfs, ignore_index=True)
+        del dfs  # 立即释放中间 DataFrame 列表
         return result
 
     # ------------------------------------------------------------------ #
