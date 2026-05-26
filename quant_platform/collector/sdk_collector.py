@@ -43,10 +43,9 @@ class SDKCollector:
         self._stats: Dict[str, int] = defaultdict(int)
         self._last_rolling_cleanup = 0.0
         self._rolling_cleanup_interval = max(float(os.getenv("SHM_CLEANUP_INTERVAL_SECONDS", "5")), 1.0)
-        self._last_allocator_release = 0.0
-        self._allocator_release_interval = max(float(os.getenv("ARROW_RELEASE_INTERVAL_SECONDS", "30")), 1.0)
         self._last_pipeline_status_log = 0.0
         self._last_minute_stat_log = time.time()
+        self._last_gc = time.time()
         self._minute_write_stats: Dict[tuple[int, int, str, str], int] = defaultdict(int)
         self._minute_stat_lock = threading.Lock()
 
@@ -126,12 +125,12 @@ class SDKCollector:
             if now - self._last_rolling_cleanup >= self._rolling_cleanup_interval:
                 self.store.cleanup_rolling()
                 self._last_rolling_cleanup = now
-            if now - self._last_allocator_release >= self._allocator_release_interval:
-                _release_unused_memory()
-                self._last_allocator_release = now
             if now - self._last_minute_stat_log >= 60:
                 self._log_minute_write_stats()
                 self._last_minute_stat_log = now
+            if now - self._last_gc >= 60:
+                _release_unused_memory()
+                self._last_gc = now
 
     def _drain_batch(self, interval: float) -> List[MappedMessage]:
         batch: List[MappedMessage] = []
@@ -199,12 +198,10 @@ class SDKCollector:
                 )
             finally:
                 del record_batch
-        # 每次写入后立即释放 Arrow 内存池
+                rows_for_kind.clear()
+        # 每次写入后立即释放 Arrow 内存池 + malloc_trim 归还堆内存
         if wrote:
-            try:
-                pa.default_memory_pool().release_unused()
-            except Exception:
-                pass
+            _quick_release()
 
     def _log_status(self, now: float) -> None:
         qsize = self.queue.qsize()
@@ -296,17 +293,23 @@ def _market_to_receive_ms(market_time, receive_ts: float) -> float | None:
         return None
 
 
+def _quick_release() -> None:
+    """Lightweight memory release after each write batch — no GC, just Arrow pool + malloc_trim."""
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _release_unused_memory() -> None:
+    """Full memory cleanup — GC + Arrow pool + malloc_trim. Called periodically."""
     try:
         gc.collect()
-        try:
-            pa.default_memory_pool().release_unused()
-        except Exception:
-            pass
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        _quick_release()
     except Exception:
         pass
 
