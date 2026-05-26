@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from typing import Dict, List
+import resource
 
 from ..data.mysql_loader import DailyBasicCache
 from ..data.shm_store import ShmStore
@@ -216,9 +217,18 @@ class SDKCollector:
             self._stats.get("written_deal", 0),
             snap["gaps"],
         )
+        # 每 30 秒输出一次内存详情
         if now - self._last_pipeline_status_log < 30:
             return
         self._last_pipeline_status_log = now
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        arrow_pool_bytes = pa.default_memory_pool().bytes_allocated()
+        arrow_pool_mb = arrow_pool_bytes / 1024 / 1024
+        obj_count = len(gc.get_objects())
+        logger.warning(
+            "[mem] RSS=%.0fMB ArrowPool=%.1fMB (alloc) PyObjects=%d q=%d",
+            rss_mb, arrow_pool_mb, obj_count, qsize,
+        )
         get_collector_logger().log(
             "sdk_status",
             queue_size=qsize,
@@ -228,6 +238,9 @@ class SDKCollector:
             seq_received=snap["received"],
             seq_gaps=snap["gaps"],
             seq_gap_size=snap["gap_size"],
+            rss_mb=round(rss_mb, 1),
+            arrow_pool_mb=round(arrow_pool_mb, 1),
+            py_object_count=obj_count,
         )
 
     def _log_minute_write_stats(self, force: bool = False) -> None:
