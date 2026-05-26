@@ -37,7 +37,7 @@ def list_daily_results(bucket: oss2.Bucket, task_id: str) -> list[str]:
     for obj in oss2.ObjectIterator(bucket, prefix=prefix):
         # 只取日期文件: {task_id}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
         key = obj.key
-        if key.endswith(".json") and key.count("/") == 3:
+        if key.endswith(".json") and key.count("/") == 4:
             keys.append(key)
     return sorted(keys)
 
@@ -76,7 +76,7 @@ def merge_daily_shards(bucket: oss2.Bucket, task_id: str, daily_keys: list[str])
         # 写合并后的文件: {task_id}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
         year = date_str[:4]
         month = date_str[4:6]
-        merged_key = f"{task_id}/{year}/{year}{month}/{date_str}.json"
+        merged_key = f"{task_id}/{year}/{year}{month}/{date_str}/{date_str}.json"
         payload = json.dumps(merged_records, ensure_ascii=False, default=str).encode("utf-8")
         bucket.put_object(merged_key, payload)
         print(f"[aggregator] merged {len(keys)} shards -> {merged_key} ({len(merged_records)} records)")
