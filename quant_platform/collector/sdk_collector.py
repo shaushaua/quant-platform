@@ -221,7 +221,7 @@ class SDKCollector:
         if now - self._last_pipeline_status_log < 30:
             return
         self._last_pipeline_status_log = now
-        rss_mb = _get_rss_mb()
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         arrow_pool_bytes = pa.default_memory_pool().bytes_allocated()
         arrow_pool_mb = arrow_pool_bytes / 1024 / 1024
         obj_count = len(gc.get_objects())
@@ -229,15 +229,6 @@ class SDKCollector:
             "[mem] RSS=%.0fMB ArrowPool=%.1fMB (alloc) PyObjects=%d q=%d",
             rss_mb, arrow_pool_mb, obj_count, qsize,
         )
-        # pymdl SDK C 层内存泄漏，RSS 超阈值自动重启
-        rss_limit_mb = int(os.getenv("RSS_LIMIT_MB", "8192"))
-        if rss_mb > rss_limit_mb:
-            logger.warning(
-                "[mem] RSS=%.0fMB 超过阈值 %dMB，触发优雅重启",
-                rss_mb, rss_limit_mb,
-            )
-            self.stop()
-            return
         get_collector_logger().log(
             "sdk_status",
             queue_size=qsize,
@@ -313,18 +304,6 @@ def _market_to_receive_ms(market_time, receive_ts: float) -> float | None:
         return round((receive_ts - dt.timestamp()) * 1000, 1)
     except Exception:
         return None
-
-
-def _get_rss_mb() -> float:
-    """Read RSS from /proc/self/status (Linux) or resource module (fallback)."""
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024
-    except Exception:
-        pass
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def _quick_release() -> None:
