@@ -90,10 +90,11 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
             try:
                 msg = pymdl.mdl_sys_msg.Read(hd.MessageID, buf)
                 msg_text = str(msg)
+                del msg
                 if int(hd.MessageID) == 4 and "Reversed" in msg_text:
-                    logger.debug("[sdk-sys-heartbeat] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg)
+                    logger.debug("[sdk-sys-heartbeat] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg_text)
                     return
-                logger.info("[sdk-sys] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg)
+                logger.info("[sdk-sys] sid=%s mid=%s msg=%s", hd.ServiceID, hd.MessageID, msg_text)
                 get_collector_logger().log(
                     "sdk_system_message",
                     service_id=int(hd.ServiceID),
@@ -117,6 +118,7 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
                     order_row, deal_row = sdk_mapper.map_sh_ngts_tick(msg, trading_day)
                     self._put(_mapped("order", order_row, hd, receive_ts))
                     self._put(_mapped("deal", deal_row, hd, receive_ts))
+                del msg
             except Exception as exc:
                 logger.warning(
                     "[sdk-callback] SHL2 parse/map failed sid=%s mid=%s seq=%s: %s",
@@ -139,6 +141,7 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2:
                     row = sdk_mapper.map_sz_deal(msg, trading_day)
                     self._put(_mapped("deal", row, hd, receive_ts))
+                del msg
             except Exception as exc:
                 logger.warning(
                     "[sdk-callback] SZL2 parse/map failed sid=%s mid=%s seq=%s: %s",
