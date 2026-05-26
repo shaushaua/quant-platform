@@ -8,8 +8,9 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import pyarrow as pa
 
-from ..core.constants import ORDER_COLUMNS, DEAL_COLUMNS, TICK_COLUMNS
+from ..core.constants import ORDER_COLUMNS, DEAL_COLUMNS, TICK_COLUMNS, ARROW_SCHEMA_BY_KIND
 
 
 def _f(value: Any) -> float:
@@ -260,3 +261,22 @@ def frame(rows: List[Dict[str, Any]], columns: List[str]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns)
+
+
+def frame_arrow(rows: List[Dict[str, Any]], kind: str) -> Optional[pa.RecordBatch]:
+    """Build Arrow RecordBatch directly from row dicts, skipping pandas entirely."""
+    if not rows:
+        return None
+    schema = ARROW_SCHEMA_BY_KIND[kind]
+    arrays = []
+    for field in schema:
+        col_name = field.name
+        col_type = field.type
+        values = [r.get(col_name) for r in rows]
+        try:
+            arr = pa.array(values, type=col_type)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+            # fallback: coerce via safe cast
+            arr = pa.array(values).cast(col_type, safe=False)
+        arrays.append(arr)
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)

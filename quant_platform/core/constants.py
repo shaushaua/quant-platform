@@ -5,6 +5,7 @@
 """
 
 import numpy as np
+import pyarrow as pa
 
 # ==================== 逐笔委托列定义 ====================
 ORDER_COLUMNS = [
@@ -124,6 +125,35 @@ TICK_DTYPE = TICK_DTYPE_COMMON.copy()
 for col in TICK_COLUMNS:
     if col not in TICK_DTYPE:
         TICK_DTYPE[col] = np.dtype('float64')
+
+# ==================== Arrow Schema（collector 热路径直写，跳过 pandas） ====================
+
+def _build_arrow_schema(columns: list, dtype_map: dict) -> pa.Schema:
+    _ARROW_TYPE_MAP = {
+        np.dtype('object'): pa.string(),
+        np.dtype('datetime64[ns]'): pa.timestamp('ns'),
+        np.dtype('float64'): pa.float64(),
+        np.dtype('int64'): pa.int64(),
+        np.dtype('int32'): pa.int32(),
+        np.dtype('int16'): pa.int16(),
+    }
+    fields = []
+    for col in columns:
+        arrow_type = _ARROW_TYPE_MAP.get(dtype_map[col], pa.float64())
+        fields.append(pa.field(col, arrow_type))
+    return pa.schema(fields)
+
+
+ORDER_ARROW_SCHEMA = _build_arrow_schema(ORDER_COLUMNS, ORDER_DTYPE)
+DEAL_ARROW_SCHEMA = _build_arrow_schema(DEAL_COLUMNS, DEAL_DTYPE)
+TICK_ARROW_SCHEMA = _build_arrow_schema(TICK_COLUMNS, TICK_DTYPE)
+
+# schema by kind，方便 collector 按类型查找
+ARROW_SCHEMA_BY_KIND = {
+    "tick": TICK_ARROW_SCHEMA,
+    "order": ORDER_ARROW_SCHEMA,
+    "deal": DEAL_ARROW_SCHEMA,
+}
 
 # ==================== 日频基础数据列定义 ====================
 DAILY_BASIC_COLUMNS = [

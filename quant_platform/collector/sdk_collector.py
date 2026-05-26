@@ -8,6 +8,7 @@ from datetime import date, datetime
 import gc
 import ctypes
 import logging
+import pyarrow as pa
 import os
 import queue
 import signal
@@ -16,7 +17,6 @@ import threading
 import time
 from typing import Dict, List
 
-from ..core.constants import ORDER_COLUMNS, DEAL_COLUMNS, TICK_COLUMNS
 from ..data.mysql_loader import DailyBasicCache
 from ..data.shm_store import ShmStore
 from ..live_engine.pipeline_logger import get_collector_logger
@@ -168,23 +168,20 @@ class SDKCollector:
                 key = (item.service_id, item.message_id, item.kind, market_minute)
                 batch_minute_stats[key] += 1
 
-        columns_by_kind = {
-            "tick": TICK_COLUMNS,
-            "order": ORDER_COLUMNS,
-            "deal": DEAL_COLUMNS,
-        }
+        wrote = False
         for kind, rows_for_kind in by_kind.items():
             if not rows_for_kind:
                 continue
-            df = sdk_mapper.frame(rows_for_kind, columns_by_kind[kind])
-            if df.empty:
+            record_batch = sdk_mapper.frame_arrow(rows_for_kind, kind)
+            if record_batch is None or record_batch.num_rows == 0:
                 continue
             try:
                 t0 = time.time()
-                chunk_name = getattr(self.store, f"update_{kind}")(df)
+                chunk_name = getattr(self.store, f"update_{kind}")(record_batch)
                 elapsed_ms = round((time.time() - t0) * 1000, 1)
-                rows = len(df)
+                rows = record_batch.num_rows
                 self._stats[f"written_{kind}"] += rows
+                wrote = True
                 with self._minute_stat_lock:
                     for key, stat_rows in batch_minute_stats.items():
                         if key[2] == kind:
@@ -201,7 +198,13 @@ class SDKCollector:
                     **_latency_summary("market_to_receive", market_to_receive_ms[kind]),
                 )
             finally:
-                del df
+                del record_batch
+        # 每次写入后立即释放 Arrow 内存池
+        if wrote:
+            try:
+                pa.default_memory_pool().release_unused()
+            except Exception:
+                pass
 
     def _log_status(self, now: float) -> None:
         qsize = self.queue.qsize()
@@ -297,7 +300,6 @@ def _release_unused_memory() -> None:
     try:
         gc.collect()
         try:
-            import pyarrow as pa
             pa.default_memory_pool().release_unused()
         except Exception:
             pass

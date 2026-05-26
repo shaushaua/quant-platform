@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
+from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,13 @@ class ShmStore:
         finally:
             del table
 
+    def _write_batch(self, path: Path, batch: pa.RecordBatch) -> None:
+        """将 Arrow RecordBatch 原子写为 Arrow IPC 文件（热路径，跳过 pandas）。"""
+        tmp = path.with_suffix(".tmp")
+        with ipc.new_file(str(tmp), batch.schema) as writer:
+            writer.write_batch(batch)
+        tmp.replace(path)
+
     def _read_arrow(self, path: Path) -> Optional[pd.DataFrame]:
         """读取 Arrow IPC 文件。"""
         if not path.exists():
@@ -131,31 +139,43 @@ class ShmStore:
     # 写接口（collector 调用）                                               #
     # ------------------------------------------------------------------ #
 
-    def update_tick(self, df: pd.DataFrame) -> Optional[str]:
-        """写入新的 tick chunk，返回 chunk 文件名。"""
+    def update_tick(self, data: Union[pd.DataFrame, pa.RecordBatch]) -> Optional[str]:
+        """写入新的 tick chunk，返回 chunk 文件名。支持 DataFrame 和 RecordBatch。"""
         with self._locks["tick"]:
             ts = int(time.time() * 1000)
             seq = next(self._seq)
             name = f"chunk_{ts}_{seq:06d}.arrow"
-            self._write_arrow(SHM_BASE / "tick" / name, df)
+            path = SHM_BASE / "tick" / name
+            if isinstance(data, pa.RecordBatch):
+                self._write_batch(path, data)
+            else:
+                self._write_arrow(path, data)
             return name
 
-    def update_order(self, df: pd.DataFrame) -> Optional[str]:
-        """写入新的 order chunk，返回 chunk 文件名。"""
+    def update_order(self, data: Union[pd.DataFrame, pa.RecordBatch]) -> Optional[str]:
+        """写入新的 order chunk，返回 chunk 文件名。支持 DataFrame 和 RecordBatch。"""
         with self._locks["order"]:
             ts = int(time.time() * 1000)
             seq = next(self._seq)
             name = f"chunk_{ts}_{seq:06d}.arrow"
-            self._write_arrow(SHM_BASE / "order" / name, df)
+            path = SHM_BASE / "order" / name
+            if isinstance(data, pa.RecordBatch):
+                self._write_batch(path, data)
+            else:
+                self._write_arrow(path, data)
             return name
 
-    def update_deal(self, df: pd.DataFrame) -> Optional[str]:
-        """写入新的 deal chunk，返回 chunk 文件名。"""
+    def update_deal(self, data: Union[pd.DataFrame, pa.RecordBatch]) -> Optional[str]:
+        """写入新的 deal chunk，返回 chunk 文件名。支持 DataFrame 和 RecordBatch。"""
         with self._locks["deal"]:
             ts = int(time.time() * 1000)
             seq = next(self._seq)
             name = f"chunk_{ts}_{seq:06d}.arrow"
-            self._write_arrow(SHM_BASE / "deal" / name, df)
+            path = SHM_BASE / "deal" / name
+            if isinstance(data, pa.RecordBatch):
+                self._write_batch(path, data)
+            else:
+                self._write_arrow(path, data)
             return name
 
     def update_kline(self, period: str, df: pd.DataFrame) -> None:
