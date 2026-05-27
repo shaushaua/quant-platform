@@ -53,6 +53,10 @@ class SDKCollector:
         self._rolling_cleanup_interval = max(float(os.getenv("SHM_CLEANUP_INTERVAL_SECONDS", "5")), 1.0)
         self._last_pipeline_status_log = 0.0
         self._last_gc = time.time()
+        # 内存增长趋势追踪
+        self._prev_rss_mb = 0.0
+        self._prev_obj_count = 0
+        self._start_time = time.time()
 
     def trading_day(self) -> date:
         return self._trading_day
@@ -180,19 +184,47 @@ class SDKCollector:
             self._stats.get("written_deal", 0),
             snap["gaps"],
         )
-        # 每 30 秒输出一次内存详情
+        # 每 30 秒输出一次内存详情（含诊断信息）
         if now - self._last_pipeline_status_log < 30:
             return
         self._last_pipeline_status_log = now
+
         rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         rss_mb = rss_kb / 1024
-        arrow_pool_bytes = pa.default_memory_pool().bytes_allocated()
-        arrow_pool_mb = arrow_pool_bytes / 1024 / 1024
+
+        # RSS 增长速率
+        elapsed_since_start = now - self._start_time
+        rss_delta = rss_mb - self._prev_rss_mb
+        rss_rate = rss_delta / 30.0 if self._prev_rss_mb > 0 else 0.0  # MB/s
+        total_rate = rss_mb / (elapsed_since_start / 60.0) if elapsed_since_start > 0 else 0.0  # MB/min
+
+        # Arrow 内存池
+        arrow_pool = pa.default_memory_pool()
+        arrow_alloc_mb = arrow_pool.bytes_allocated() / 1024 / 1024
+
+        # Python 对象统计
         obj_count = len(gc.get_objects())
+        obj_delta = obj_count - self._prev_obj_count
+
+        # 对象类型 Top 10（定位哪种对象在泄漏）
+        type_counter = defaultdict(int)
+        for obj in gc.get_objects():
+            type_counter[type(obj).__name__] += 1
+        top_types = sorted(type_counter.items(), key=lambda x: -x[1])[:10]
+        top_types_str = " ".join(f"{name}={count}" for name, count in top_types)
+
+        # /dev/shm chunk 文件数和大小
+        shm_info = _shm_store_stats()
+
         logger.warning(
-            "[mem] RSS=%.0fMB ArrowPool=%.1fMB (alloc) PyObjects=%d pending=%s",
-            rss_mb, arrow_pool_mb, obj_count, buf_rows,
+            "[mem] RSS=%.0fMB (+%.1fMB/30s, %.1fMB/min avg) ArrowPool=%.1fMB "
+            "PyObj=%d(+%d) pending=%s",
+            rss_mb, rss_delta, total_rate, arrow_alloc_mb,
+            obj_count, obj_delta, buf_rows,
         )
+        logger.warning("[mem-types] %s", top_types_str)
+        logger.warning("[mem-shm] %s", shm_info)
+
         get_collector_logger().log(
             "sdk_status",
             pending_tick=buf_rows["tick"],
@@ -205,9 +237,18 @@ class SDKCollector:
             seq_gaps_total=sum(snap["gaps"].values()),
             seq_gap_size_total=sum(snap["gap_size"].values()),
             rss_mb=round(rss_mb, 1),
-            arrow_pool_mb=round(arrow_pool_mb, 1),
+            rss_delta_mb=round(rss_delta, 1),
+            rss_rate_mb_per_min=round(total_rate, 1),
+            arrow_pool_mb=round(arrow_alloc_mb, 1),
             py_object_count=obj_count,
+            py_object_delta=obj_delta,
+            top_types=top_types_str,
+            shm_info=shm_info,
         )
+
+        self._prev_rss_mb = rss_mb
+        self._prev_obj_count = obj_count
+
         # RSS 自保护：超限主动退出，K8s 会重启 pod（比 OOM 驱逐更优雅）
         rss_limit_mb = int(os.environ.get("COLLECTOR_RSS_LIMIT_MB", "12288"))
         if rss_mb > rss_limit_mb:
@@ -240,6 +281,27 @@ class SDKCollector:
             except Exception:
                 pass
         logger.info("[sdk] collector stopped")
+
+
+def _shm_store_stats() -> str:
+    """统计 /dev/shm chunk 文件数和大小，辅助定位内存去向。"""
+    from pathlib import Path
+    shm_base = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
+    parts = []
+    total_files = 0
+    total_bytes = 0
+    for dtype in ("tick", "order", "deal", "quote", "kline", "daily_basic"):
+        d = shm_base / dtype
+        if not d.exists():
+            continue
+        files = list(d.glob("*.arrow"))
+        size = sum(f.stat().st_size for f in files) if files else 0
+        total_files += len(files)
+        total_bytes += size
+        if files:
+            parts.append(f"{dtype}={len(files)}files/{size / 1024 / 1024:.1f}MB")
+    parts.append(f"total={total_files}files/{total_bytes / 1024 / 1024:.1f}MB")
+    return " ".join(parts)
 
 
 def _quick_release() -> None:
