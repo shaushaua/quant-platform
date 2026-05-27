@@ -209,7 +209,7 @@ class SDKCollector:
             py_object_count=obj_count,
         )
         # RSS 自保护：超限主动退出，K8s 会重启 pod（比 OOM 驱逐更优雅）
-        rss_limit_mb = int(os.environ.get("COLLECTOR_RSS_LIMIT_MB", "4096"))
+        rss_limit_mb = int(os.environ.get("COLLECTOR_RSS_LIMIT_MB", "12288"))
         if rss_mb > rss_limit_mb:
             logger.error("[mem] RSS=%.0fMB 超过限制 %dMB，主动退出", rss_mb, rss_limit_mb)
             get_collector_logger().log("sdk_oom_self_kill", rss_mb=round(rss_mb, 1), limit_mb=rss_limit_mb)
