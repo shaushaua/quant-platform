@@ -25,7 +25,7 @@ except Exception:
     _USE_TIMESTAMP_BUILDER = False
 
 
-def _make_builder(arrow_type: pa.DataType) -> pa.ArrayBuilder:
+def _make_builder(arrow_type: pa.DataType):
     """Create an Arrow ArrayBuilder for the given type."""
     if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
         return pa.StringBuilder()
@@ -45,7 +45,7 @@ def _make_builder(arrow_type: pa.DataType) -> pa.ArrayBuilder:
     raise ValueError(f"Unsupported Arrow type: {arrow_type}")
 
 
-def _append_val(builder: pa.ArrayBuilder, value, field_type: pa.DataType) -> None:
+def _append_val(builder, value, field_type: pa.DataType) -> None:
     """Append a single value to an Arrow builder with type coercion."""
     if value is None:
         builder.append_null()
@@ -91,7 +91,7 @@ class ArrowBuffer:
     def __init__(self, schema: pa.Schema):
         self.schema = schema
         self.lock = threading.Lock()
-        self._builders: Dict[str, pa.ArrayBuilder] = {}
+        self._builders: Dict[str, object] = {}
         self._n = 0
         self._init_builders()
 
