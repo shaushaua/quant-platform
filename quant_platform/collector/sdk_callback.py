@@ -6,19 +6,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import logging
-import queue
 import threading
 import time
 from typing import Dict, Optional, Tuple
 
 from ..live_engine.pipeline_logger import get_collector_logger
 from . import sdk_mapper
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .arrow_buffer import ArrowBuffer
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class MappedMessage:
+    """Legacy message class — kept for backward compat, no longer used in hot path."""
     kind: str
     row: dict
     service_id: int
@@ -63,13 +66,22 @@ class SequenceTracker:
             }
 
 
-def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: SequenceTracker):
+def create_callback(
+    pymdl,
+    buffers: Dict[str, "ArrowBuffer"],
+    flush_event: threading.Event,
+    trading_day_getter,
+    tracker: SequenceTracker,
+):
     """Create a pymdl.MsgCallback subclass bound to the imported pymdl module."""
 
     class SDKMessageCallback(pymdl.MsgCallback):
-        def _put(self, mapped: Optional[MappedMessage]) -> None:
-            if mapped is not None:
-                out_queue.put(mapped)
+        def _append(self, kind: str, row: Optional[dict]) -> None:
+            """Append row directly to Arrow buffer. No dict stored, no queue."""
+            if row is not None:
+                should_flush = buffers[kind].append_row(row)
+                if should_flush:
+                    flush_event.set()
 
         def _observe(self, hd) -> None:
             gap = tracker.observe(int(hd.ServiceID), int(hd.MessageID), int(hd.SequenceID))
@@ -106,18 +118,17 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
                 logger.warning("[sdk-sys] parse failed: %s", exc)
 
         def OnMDLSHL2Message(self, hd, buf):
-            receive_ts = time.time()
             try:
                 self._observe(hd)
                 msg = pymdl.mdl_shl2_msg.Read(hd.MessageID, buf)
                 trading_day = trading_day_getter()
                 if hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_SHL2MarketData:
                     row = sdk_mapper.map_sh_tick(msg, trading_day, int(hd.SequenceID))
-                    self._put(_mapped("tick", row, hd, receive_ts))
+                    self._append("tick", row)
                 elif hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_NGTSTick:
                     order_row, deal_row = sdk_mapper.map_sh_ngts_tick(msg, trading_day)
-                    self._put(_mapped("order", order_row, hd, receive_ts))
-                    self._put(_mapped("deal", deal_row, hd, receive_ts))
+                    self._append("order", order_row)
+                    self._append("deal", deal_row)
                 del msg
             except Exception as exc:
                 logger.warning(
@@ -127,20 +138,19 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
                 )
 
         def OnMDLSZL2Message(self, hd, buf):
-            receive_ts = time.time()
             try:
                 self._observe(hd)
                 msg = pymdl.mdl_szl2_msg.Read(hd.MessageID, buf)
                 trading_day = trading_day_getter()
                 if hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2:
                     row = sdk_mapper.map_sz_tick(msg, trading_day, int(hd.SequenceID))
-                    self._put(_mapped("tick", row, hd, receive_ts))
+                    self._append("tick", row)
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Order300192_v2:
                     row = sdk_mapper.map_sz_order(msg, trading_day)
-                    self._put(_mapped("order", row, hd, receive_ts))
+                    self._append("order", row)
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2:
                     row = sdk_mapper.map_sz_deal(msg, trading_day)
-                    self._put(_mapped("deal", row, hd, receive_ts))
+                    self._append("deal", row)
                 del msg
             except Exception as exc:
                 logger.warning(
@@ -150,16 +160,3 @@ def create_callback(pymdl, out_queue: queue.Queue, trading_day_getter, tracker: 
                 )
 
     return SDKMessageCallback()
-
-
-def _mapped(kind: str, row: Optional[dict], hd, receive_ts: float) -> Optional[MappedMessage]:
-    if row is None:
-        return None
-    return MappedMessage(
-        kind=kind,
-        row=row,
-        service_id=int(hd.ServiceID),
-        message_id=int(hd.MessageID),
-        sequence_id=int(hd.SequenceID),
-        receive_ts=receive_ts,
-    )
