@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -60,40 +61,9 @@ from .streaming_engine import (
 
 # Re-use sdk_mapper for ArrowBuffer writes and scalar helpers
 from ..collector import sdk_mapper
+from ..collector.sdk_mapper import _f, _i, _code, _is_stock, _side_from_flag
 
 logger = logging.getLogger(__name__)
-
-
-# ================================================================== #
-# Helpers                                                              #
-# ================================================================== #
-
-def _f(value: Any) -> float:
-    if value is None:
-        return 0.0
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
-
-
-def _i(value: Any) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return 0
-
-
-def _code(raw: Any, market: str) -> str:
-    return sdk_mapper._code(raw, market)
-
-
-def _is_stock(raw: Any, market: str) -> bool:
-    return sdk_mapper._is_stock(raw, market)
-
-
-def _side_from_flag(flag: Any) -> int:
-    return sdk_mapper._side_from_flag(flag)
 
 
 def _raw_time(value: Any) -> str:
@@ -306,7 +276,7 @@ class CombinedEngine:
         self._lock = threading.Lock()
         self.states: Dict[str, StockState] = {}
         self._stopped = False
-        self._trading_day: str = ""
+        self._trading_day: date = date.today()
         self._start_time = time.time()
 
         # pymdl SDK config
@@ -358,8 +328,8 @@ class CombinedEngine:
             module_path, self.compute_interval, self._data_window_seconds,
         )
 
-    def trading_day(self) -> str:
-        return self._trading_day or datetime.now().strftime("%Y%m%d")
+    def trading_day(self) -> date:
+        return self._trading_day
 
     # ------------------------------------------------------------------ #
     # pymdl SDK connection                                                 #
@@ -457,14 +427,14 @@ class CombinedEngine:
         if not dfs:
             return pd.DataFrame()
         if len(dfs) == 1:
-            return dfs[0]
+            return dfs[0].copy()
         try:
-            combined = pd.concat(dfs, ignore_index=True, copy=False)
+            combined = pd.concat(dfs, ignore_index=True)
             # Filter by time window
             cutoff = pd.Timestamp.now() - pd.Timedelta(seconds=self._data_window_seconds)
             if "Time" in combined.columns:
                 try:
-                    combined = combined[combined["Time"] >= cutoff]
+                    combined = combined[combined["Time"] >= cutoff].copy()
                 except Exception:
                     pass
             return combined
@@ -483,7 +453,7 @@ class CombinedEngine:
         """Flush buffers, build StockData per stock, compute factors, output."""
         pipe_log = get_streaming_logger()
         now = datetime.now()
-        date_str = now.strftime("%Y%m%d")
+        date_str = self._trading_day.strftime("%Y%m%d")
         end_time = now.strftime("%H%M%S")
 
         # 1. Flush ArrowBuffers → DataFrame, append to sliding window
@@ -615,8 +585,8 @@ class CombinedEngine:
         try:
             with open(self._checkpoint_path, "rb") as f:
                 data = pickle.load(f)
-            ckpt_day = data.get("trading_day", "")
-            today = now.strftime("%Y%m%d")
+            ckpt_day = data.get("trading_day")
+            today = date.today()
             if ckpt_day and ckpt_day != today:
                 return
             self._trading_day = ckpt_day
@@ -626,7 +596,7 @@ class CombinedEngine:
             self.states.clear()
 
     def _check_day_rollover(self) -> None:
-        today = datetime.now().strftime("%Y%m%d")
+        today = date.today()
         with self._lock:
             if self._trading_day and today != self._trading_day:
                 logger.info("[combined] day rollover: %s -> %s", self._trading_day, today)
@@ -675,13 +645,13 @@ class CombinedEngine:
 
     def run(self) -> None:
         logger.info("[combined] engine starting")
-        self._trading_day = datetime.now().strftime("%Y%m%d")
+        self._trading_day = date.today()
 
         # Load daily_basic
         try:
             market_count = int(os.environ.get("DAILY_BASIC_MARKET_COUNT", "1"))
             cache = DailyBasicCache(market_count=market_count)
-            trade_date = self._trading_day
+            trade_date = self._trading_day.strftime("%Y%m%d")
             if cache.load(trade_date):
                 self._daily_basic_df = cache.get_daily_basic()
                 self._market_df = self._daily_basic_df
