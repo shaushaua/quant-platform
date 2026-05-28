@@ -396,6 +396,7 @@ class CombinedEngine:
             sub = self._io_man.CreateSubscriber(callback, True)  # multithread=True per sample
             sub.SetServerAddress(server)
             sub.SetUserName(self.config.token)  # SDK doc: SetUserName sets the 32-char token
+            sub.SetSendMacAuth(True)  # 上证云服务器要求 MAC 地址验证
             sub.SetMessageEncoding(self.config.encoding)
             sub.EnableMergeMessage(self.config.enable_merge)
             sub.SetHeartbeatInterval(self.config.heartbeat_interval)
