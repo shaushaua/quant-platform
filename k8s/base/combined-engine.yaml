@@ -1,5 +1,5 @@
 # combined-engine：合并 collector + live-engine 为单 Pod
-# pymdl 回调直接更新 StockState，无需 Arrow/ShmStore IPC
+# 直接连远程 MDL 云端，无需本机通联客户端，可多副本弹性伸缩
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -20,26 +20,19 @@ spec:
       labels:
         app: combined-engine
     spec:
-      nodeSelector:
-        role: live-trading
       tolerations:
-        - key: role
-          operator: Equal
-          value: live-trading
-          effect: NoSchedule
         - key: node.kubernetes.io/disk-pressure
           operator: Exists
           effect: NoSchedule
-      hostNetwork: true
-      dnsPolicy: Default
       containers:
         - name: combined-engine
           image: 172.24.99.176:5000/quant-platform/combined-engine:latest
           command: ["python", "-m", "quant_platform.live_engine.combined_engine"]
           env:
-            # --- pymdl SDK ---
+            # --- pymdl SDK (remote) ---
             - name: MDL_SERVER
-              value: 127.0.0.1:9012
+              value: "mdl-cloud-sh.datayes.com:19011"
+            # MDL_USERNAME / MDL_PASSWORD 从 secret 注入
             - name: MDL_IO_THREADS
               value: "4"
             - name: MDL_CALLBACK_MULTITHREAD
@@ -65,6 +58,8 @@ spec:
               value: "quant_platform.factor.examples.live_momentum"
             - name: COMPUTE_INTERVAL
               value: "60"
+            - name: DATA_WINDOW_SECONDS
+              value: "300"
             - name: UNIVERSE
               value: ""
             - name: FACTOR_OUTPUT_PATH
@@ -83,8 +78,6 @@ spec:
             # --- 内存保护 ---
             - name: COLLECTOR_MEM_LIMIT_MB
               value: "5120"
-            - name: COLLECTOR_MAX_RUNTIME_MINUTES
-              value: "0"
           envFrom:
             - secretRef:
                 name: quant-secrets

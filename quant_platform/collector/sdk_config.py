@@ -12,6 +12,8 @@ Subscription = Tuple[int, int]
 @dataclass(frozen=True)
 class SDKCollectorConfig:
     server: str = "127.0.0.1:9012"
+    username: str = ""
+    password: str = ""
     io_threads: int = 4
     callback_multithread: bool = True
     encoding: int = 1
@@ -49,6 +51,8 @@ def load_config() -> SDKCollectorConfig:
     default_subs = "4.4,4.24,6.28,6.33,6.36"
     return SDKCollectorConfig(
         server=os.getenv("MDL_SERVER", "127.0.0.1:9012"),
+        username=os.getenv("MDL_USERNAME", os.getenv("TONGLIAN_USERNAME", "")),
+        password=os.getenv("MDL_PASSWORD", os.getenv("TONGLIAN_PASSWORD", "")),
         io_threads=int(os.getenv("MDL_IO_THREADS", "4")),
         callback_multithread=_env_bool("MDL_CALLBACK_MULTITHREAD", True),
         encoding=int(os.getenv("MDL_ENCODING", "1")),

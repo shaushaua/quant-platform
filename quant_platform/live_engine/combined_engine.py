@@ -354,6 +354,10 @@ class CombinedEngine:
         )
         self._subscriber = self._io_man.CreateSubscriber(callback, self.config.callback_multithread)
         self._subscriber.SetServerAddress(self.config.server)
+        if self.config.username:
+            self._subscriber.SetUserName(self.config.username)
+        if self.config.password:
+            self._subscriber.SetPassword(self.config.password)
         self._subscriber.SetMessageEncoding(self.config.encoding)
         self._subscriber.EnableMergeMessage(self.config.enable_merge)
         self._subscriber.SetHeartbeatInterval(self.config.heartbeat_interval)
