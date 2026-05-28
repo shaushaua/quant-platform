@@ -286,7 +286,7 @@ class CombinedEngine:
         # pymdl SDK config
         self.config: SDKCollectorConfig = load_config()
         self._io_man = None
-        self._subscriber = None
+        self._subscribers = []  # multiple subscribers: SH L2 + SZ L2
         self._callback = None
         self.tracker = SequenceTracker()
 
@@ -374,26 +374,35 @@ class CombinedEngine:
         self._callback = create_direct_callback(
             pymdl, self._buffers, self.states, self._lock, self.trading_day, self.tracker,
         )
-        self._subscriber = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
-        self._subscriber.SetServerAddress(self.config.server)
         logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
-        if self.config.token:
-            self._subscriber.SetUserName(self.config.token)
-        self._subscriber.SetMessageEncoding(self.config.encoding)
-        self._subscriber.EnableMergeMessage(self.config.enable_merge)
-        self._subscriber.SetHeartbeatInterval(self.config.heartbeat_interval)
-        self._subscriber.SetHeartbeatTimeout(self.config.heartbeat_timeout)
 
-        for service_id, message_id in self.config.subs:
-            self._subscriber.AddSubscription(service_id, 101, message_id)
-            logger.info("[combined] subscribe %s.%s", service_id, message_id)
+        # Split subscriptions by service group, each gets its own subscriber (TCP connection)
+        # matching the SDK documentation sample pattern
+        sh_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 4]  # SH L2
+        sz_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 6]  # SZ L2
+        groups = [("SH-L2", sh_subs), ("SZ-L2", sz_subs)]
 
-        err = self._subscriber.Connect()
-        if err:
-            if isinstance(err, bytes):
-                err = err.decode("GBK", errors="replace")
-            raise RuntimeError(f"MDL Connect failed: {err}")
-        logger.info("[combined] connected to %s", self.config.server)
+        for label, subs in groups:
+            if not subs:
+                continue
+            sub = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
+            sub.SetServerAddress(self.config.server)
+            if self.config.token:
+                sub.SetUserName(self.config.token)
+            sub.SetMessageEncoding(self.config.encoding)
+            sub.EnableMergeMessage(self.config.enable_merge)
+            sub.SetHeartbeatInterval(self.config.heartbeat_interval)
+            sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
+            for service_id, message_id in subs:
+                sub.AddSubscription(service_id, 101, message_id)
+                logger.info("[combined] subscribe %s.%s (%s)", service_id, message_id, label)
+            err = sub.Connect()
+            if err:
+                if isinstance(err, bytes):
+                    err = err.decode("GBK", errors="replace")
+                raise RuntimeError(f"MDL Connect {label} failed: {err}")
+            self._subscribers.append(sub)
+            logger.info("[combined] %s connected to %s", label, self.config.server)
 
     # ------------------------------------------------------------------ #
     # ArrowBuffer flush → DataFrame                                        #
@@ -985,9 +994,9 @@ class CombinedEngine:
         self._stopped = True
         if self.states:
             self._save_checkpoint()
-        if self._subscriber is not None:
+        for sub in self._subscribers:
             try:
-                self._subscriber.ClearSubscriptions()
+                sub.ClearSubscriptions()
             except Exception:
                 pass
         if self._io_man is not None:
