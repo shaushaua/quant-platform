@@ -63,16 +63,6 @@ echo "[entrypoint] ldd check:"
 ldd /opt/mdl-client/feeder_client 2>&1 || true
 ./feeder_client 2>&1 &
 CLIENT_PID=$!
-sleep 2
-
-# Check if feeder_client is still running
-if ! kill -0 $CLIENT_PID 2>/dev/null; then
-    echo "[entrypoint] ERROR: feeder_client exited immediately"
-    echo "[entrypoint] Checking logs..."
-    cat "${LOG_DIR}/feeder_client.log" 2>/dev/null || echo "No log file found"
-    cat "${LOG_DIR}/feeder_client.trace.log" 2>/dev/null | tail -20 || echo "No trace log found"
-    exit 1
-fi
 
 # Wait for TCP port 9012 to be ready
 echo "[entrypoint] Waiting for feeder_client to listen on 9012..."
@@ -91,7 +81,23 @@ except:
         break
     fi
     if ! kill -0 $CLIENT_PID 2>/dev/null; then
+        # feeder_client may fork to background, check port instead
+        if python -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.connect(('127.0.0.1', 9012))
+    s.close()
+    exit(0)
+except:
+    exit(1)
+" 2>/dev/null; then
+            echo "[entrypoint] feeder_client ready on 9012 (forked)"
+            break
+        fi
         echo "[entrypoint] ERROR: feeder_client exited unexpectedly"
+        echo "[entrypoint] Checking logs..."
+        cat "${LOG_DIR}/feeder_client.log" 2>/dev/null | tail -20 || echo "No log file found"
         exit 1
     fi
     sleep 1
