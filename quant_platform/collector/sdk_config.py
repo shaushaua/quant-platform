@@ -12,8 +12,10 @@ Subscription = Tuple[int, int]
 @dataclass(frozen=True)
 class SDKCollectorConfig:
     # Remote MDL cloud: token-based auth, no password needed
-    # Multiple servers separated by ";" for active-standby failover
+    # SZ L2 server (19012 port)
     server: str = "mdl-cloud-sh.datayes.com:19012"
+    # SH L2 server (different from SZ)
+    server_sh: str = "mdl-sse01.datayes.com:19010"
     token: str = ""
     io_threads: int = 4
     callback_multithread: bool = True
@@ -52,6 +54,7 @@ def load_config() -> SDKCollectorConfig:
     default_subs = "4.4,4.24,6.28,6.33,6.36"
     return SDKCollectorConfig(
         server=os.getenv("MDL_SERVER", "mdl-cloud-sh.datayes.com:19012"),
+        server_sh=os.getenv("MDL_SERVER_SH", "mdl-sse01.datayes.com:19010"),
         token=os.getenv("MDL_TOKEN", ""),
         io_threads=int(os.getenv("MDL_IO_THREADS", "4")),
         callback_multithread=_env_bool("MDL_CALLBACK_MULTITHREAD", True),

@@ -376,27 +376,39 @@ class CombinedEngine:
         )
         logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
 
-        # Use a single subscriber for all subscriptions (token may limit concurrent connections)
-        sub = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
-        sub.SetServerAddress(self.config.server)
-        if self.config.token:
-            sub.SetUserName(self.config.token)
-        sub.SetMessageEncoding(self.config.encoding)
-        sub.EnableMergeMessage(self.config.enable_merge)
-        sub.SetHeartbeatInterval(self.config.heartbeat_interval)
-        sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
+        # SH L2 and SZ L2 use different servers per MDL documentation:
+        # SH L2: mdl-sse01.datayes.com:19010
+        # SZ L2: mdl-cloud-sh.datayes.com:19012
+        sh_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 4]
+        sz_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 6]
 
-        for service_id, message_id in self.config.subs:
-            sub.AddSubscription(service_id, 101, message_id)
-            logger.info("[combined] subscribe %s.%s", service_id, message_id)
+        conn_groups = [
+            ("SH-L2", self.config.server_sh, sh_subs),
+            ("SZ-L2", self.config.server, sz_subs),
+        ]
 
-        err = sub.Connect()
-        if err:
-            if isinstance(err, bytes):
-                err = err.decode("GBK", errors="replace")
-            raise RuntimeError(f"MDL Connect failed: {err}")
-        self._subscribers.append(sub)
-        logger.info("[combined] connected to %s", self.config.server)
+        for label, server, subs in conn_groups:
+            if not subs:
+                continue
+            sub = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
+            sub.SetServerAddress(server)
+            if self.config.token:
+                sub.SetUserName(self.config.token)
+            sub.SetMessageEncoding(self.config.encoding)
+            sub.EnableMergeMessage(self.config.enable_merge)
+            sub.SetHeartbeatInterval(self.config.heartbeat_interval)
+            sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
+            for service_id, message_id in subs:
+                sub.AddSubscription(service_id, 101, message_id)
+                logger.info("[combined] subscribe %s.%s (%s -> %s)", service_id, message_id, label, server)
+            err = sub.Connect()
+            if err:
+                if isinstance(err, bytes):
+                    err = err.decode("GBK", errors="replace")
+                logger.warning("[combined] %s connect to %s failed: %s (continuing without)", label, server, err)
+            else:
+                self._subscribers.append(sub)
+                logger.info("[combined] %s connected to %s", label, server)
 
     # ------------------------------------------------------------------ #
     # ArrowBuffer flush → DataFrame                                        #
