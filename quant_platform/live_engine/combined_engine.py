@@ -395,11 +395,7 @@ class CombinedEngine:
                 continue
             sub = self._io_man.CreateSubscriber(callback, True)  # multithread=True per sample
             sub.SetServerAddress(server)
-            sub.SetMessageEncoding(self.config.encoding)
-            sub.EnableMergeMessage(self.config.enable_merge)
-            sub.SetHeartbeatInterval(self.config.heartbeat_interval)
-            sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
-            sub.SetUserName(self.config.token)  # token after server/encoding per sample
+            sub.SetUserName(self.config.token)  # SDK doc: SetUserName sets the 32-char token
             sub.SetMessageEncoding(self.config.encoding)
             sub.EnableMergeMessage(self.config.enable_merge)
             sub.SetHeartbeatInterval(self.config.heartbeat_interval)
