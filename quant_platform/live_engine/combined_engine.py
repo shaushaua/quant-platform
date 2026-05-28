@@ -23,7 +23,6 @@
     DATA_FLUSH_INTERVAL      数据刷新到 MemoryStore 间隔秒数（默认 0.01 = 10ms）
     FACTOR_OUTPUT_PATH       因子结果输出目录
     RAW_DATA_ARCHIVE_ENABLED 是否落盘并在盘后上传 tick/order/deal 原始数据（默认 true）
-    COLLECTOR_MEM_LIMIT_MB   自保护内存阈值 MB（默认 8192，0=禁用）
 """
 
 from __future__ import annotations
@@ -92,6 +91,9 @@ def create_direct_callback(
             if state is None:
                 state = StockState(code=code)
                 states[code] = state
+            # Wall clock as seconds since midnight (comparable with _time_to_seconds)
+            now = datetime.now()
+            state.last_update_ts = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
             return state
 
         def _observe(self, hd) -> None:
@@ -617,21 +619,67 @@ class CombinedEngine:
 
     def _data_flush_loop(self) -> None:
         """High-frequency flush: ArrowBuffer → group by code → MemoryStore."""
+        log_counter = 0
         while not self._stopped:
             time.sleep(self._data_flush_interval)
             try:
-                self._flush_to_memory_store()
+                t0 = time.time()
+                total_rows = self._flush_to_memory_store()
+                flush_ms = (time.time() - t0) * 1000
+
+                # Every 100 flush cycles (~1s) log latency stats
+                log_counter += 1
+                if log_counter % 100 == 0 and total_rows > 0:
+                    self._log_pipeline_latency(flush_ms, total_rows)
             except Exception as exc:
                 logger.warning("[data-flush] failed: %s", exc)
 
-    def _flush_to_memory_store(self) -> None:
-        """Flush ArrowBuffers, group by Code, write per-code DataFrames to MemoryStore."""
+    def _log_pipeline_latency(self, flush_ms: float, total_rows: int) -> None:
+        """Sample and log SDK→MemoryStore→wall latency for a few stocks."""
+        now = datetime.now()
+        wall_secs = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
+
+        # Pick up to 3 stocks with latest market time
+        samples = []
+        with self._lock:
+            for code, state in list(self.states.items())[:50]:
+                if state.last_market_time:
+                    samples.append((code, state.last_market_time, state.last_update_ts))
+        samples.sort(key=lambda x: x[1], reverse=True)
+        samples = samples[:3]
+
+        if not samples:
+            return
+
+        parts = []
+        for code, mkt_time_str, update_ts in samples:
+            mkt_secs = _time_to_seconds(mkt_time_str)
+            if mkt_secs <= 0:
+                continue
+            sdk_latency_ms = round((update_ts - mkt_secs) * 1000, 1) if update_ts > 0 else -1
+            pipeline_latency_ms = round((wall_secs - mkt_secs) * 1000, 1)
+            parts.append(
+                f"{code}: 行情时间={mkt_time_str} "
+                f"SDK延迟={sdk_latency_ms}ms "
+                f"总延迟={pipeline_latency_ms}ms"
+            )
+
+        logger.info(
+            "[latency] flush=%.1fms rows=%d | %s",
+            flush_ms, total_rows, " | ".join(parts),
+        )
+
+    def _flush_to_memory_store(self) -> int:
+        """Flush ArrowBuffers, group by Code, write per-code DataFrames to MemoryStore.
+        Returns total rows flushed."""
         store = self._memory_store
         archive_day = self._trading_day
+        total_rows = 0
         for kind in ("tick", "deal", "order"):
             df = self._flush_buffer(kind)
             if df.empty:
                 continue
+            total_rows += len(df)
             # Archive to disk (existing logic)
             self._enqueue_raw_archive(archive_day, kind, df)
             # Group by Code → write to MemoryStore
@@ -645,6 +693,7 @@ class CombinedEngine:
             elif kind == "deal":
                 for code, g in groups.items():
                     store.update_deal(code, g)
+        return total_rows
 
     # ------------------------------------------------------------------ #
     # Factor computation                                                   #
@@ -712,6 +761,24 @@ class CombinedEngine:
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info("[combined] computed: %d results in %.0fms", len(result_df), elapsed_ms)
+
+        # Sample factor compute latency
+        if states_snapshot:
+            compute_now = datetime.now()
+            wall_secs = compute_now.hour * 3600 + compute_now.minute * 60 + compute_now.second
+            sample_codes = list(states_snapshot.keys())[:3]
+            latency_parts = []
+            for sc in sample_codes:
+                st = states_snapshot.get(sc)
+                if st and st.last_market_time:
+                    mkt_secs = _time_to_seconds(st.last_market_time)
+                    if mkt_secs > 0:
+                        latency_parts.append(
+                            f"{sc}: 行情={st.last_market_time} "
+                            f"因子计算延迟={round((wall_secs - mkt_secs) * 1000, 1)}ms"
+                        )
+            if latency_parts:
+                logger.info("[latency-factor] %s", " | ".join(latency_parts))
 
         # CSV
         if self.output_path and not result_df.empty:
