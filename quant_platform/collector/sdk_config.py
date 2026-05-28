@@ -11,13 +11,14 @@ Subscription = Tuple[int, int]
 
 @dataclass(frozen=True)
 class SDKCollectorConfig:
-    server: str = "127.0.0.1:9012"
-    username: str = ""
-    password: str = ""
+    # Remote MDL cloud: token-based auth, no password needed
+    # Multiple servers separated by ";" for active-standby failover
+    server: str = "mdl-cloud-sh.datayes.com:19012"
+    token: str = ""
     io_threads: int = 4
     callback_multithread: bool = True
-    encoding: int = 1
-    enable_merge: bool = False
+    encoding: int = 7        # 7=compressed (public network), 1=uncompressed (LAN)
+    enable_merge: bool = True # Enable group encoding for public network
     heartbeat_interval: int = 10
     heartbeat_timeout: int = 30
     flush_interval_ms: int = 10
@@ -50,13 +51,12 @@ def _parse_subs(raw: str) -> Tuple[Subscription, ...]:
 def load_config() -> SDKCollectorConfig:
     default_subs = "4.4,4.24,6.28,6.33,6.36"
     return SDKCollectorConfig(
-        server=os.getenv("MDL_SERVER", "127.0.0.1:9012"),
-        username=os.getenv("MDL_USERNAME", os.getenv("TONGLIAN_USERNAME", "")),
-        password=os.getenv("MDL_PASSWORD", os.getenv("TONGLIAN_PASSWORD", "")),
+        server=os.getenv("MDL_SERVER", "mdl-cloud-sh.datayes.com:19012"),
+        token=os.getenv("MDL_TOKEN", ""),
         io_threads=int(os.getenv("MDL_IO_THREADS", "4")),
         callback_multithread=_env_bool("MDL_CALLBACK_MULTITHREAD", True),
-        encoding=int(os.getenv("MDL_ENCODING", "1")),
-        enable_merge=_env_bool("MDL_ENABLE_MERGE", False),
+        encoding=int(os.getenv("MDL_ENCODING", "7")),
+        enable_merge=_env_bool("MDL_ENABLE_MERGE", True),
         heartbeat_interval=int(os.getenv("MDL_HEARTBEAT_INTERVAL", "10")),
         heartbeat_timeout=int(os.getenv("MDL_HEARTBEAT_TIMEOUT", "30")),
         flush_interval_ms=int(os.getenv("MDL_FLUSH_INTERVAL_MS", "10")),

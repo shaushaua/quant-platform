@@ -1,33 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-合并引擎 v2：pymdl SDK + 因子计算一体化（完整 StockData 支持）。
+合并引擎：pymdl SDK + MemoryStore + DataAPI 统一接口。
 
 数据流：
     pymdl SDK → callback
                   ├─ sdk_mapper.write_*()  → ArrowBuffer（原始数据，columnar numpy）
                   └─ StockState.update_*_scalar() → 累计聚合值
 
-    每 60 秒：
-        1. flush ArrowBuffer → RecordBatch → DataFrame
-        2. 追加到滑动窗口（默认 5 分钟），丢弃过期数据
-        3. 按 Code 分组 → 构建完整 StockData（含 l1_tick/l2_deal/l2_order DataFrame + StockState）
-        4. factor_calculation(stock_data, code, date, end_time) → 结果 → CSV + OSS
+    数据入 MemoryStore（独立线程，每 DATA_FLUSH_INTERVAL 秒）：
+        flush ArrowBuffer → DataFrame → groupby("Code") → MemoryStore.update_*
+        交易员通过 DataAPI(mode="realtime") 实时可查（延迟 ~10ms）
+
+    因子计算（每 COMPUTE_INTERVAL 秒）：
+        MemoryStore.get_tick/get_deal/get_order(code) → StockData → factor_calculation
 
 环境变量：
-    MDL_SERVER             MDL 服务地址（默认 127.0.0.1:9012）
-    MDL_SUBS               订阅配置（默认 4.4,4.24,6.28,6.33,6.36）
-    FACTOR_MODULE          交易员因子模块路径
-    COMPUTE_INTERVAL       计算间隔秒数（默认 60）
-    DATA_WINDOW_SECONDS    滑动窗口秒数（默认 300 = 5 分钟）
-    FACTOR_OUTPUT_PATH     因子结果输出目录
-    COLLECTOR_MEM_LIMIT_MB 自保护内存阈值 MB（默认 8192，0=禁用）
+    MDL_SERVER               MDL 服务地址（默认 mdl-cloud-sh.datayes.com:19012）
+    MDL_TOKEN                MDL 认证 Token（32位，从 secret 注入）
+    MDL_SUBS                 订阅配置（默认 4.4,4.24,6.28,6.33,6.36）
+    FACTOR_MODULE            交易员因子模块路径
+    COMPUTE_INTERVAL         因子计算间隔秒数（默认 60）
+    DATA_FLUSH_INTERVAL      数据刷新到 MemoryStore 间隔秒数（默认 0.01 = 10ms）
+    FACTOR_OUTPUT_PATH       因子结果输出目录
+    RAW_DATA_ARCHIVE_ENABLED 是否落盘并在盘后上传 tick/order/deal 原始数据（默认 true）
+    COLLECTOR_MEM_LIMIT_MB   自保护内存阈值 MB（默认 8192，0=禁用）
 """
 
 from __future__ import annotations
 
 import gc
+import io
 import importlib
-import json
 import logging
 import os
 import pickle
@@ -36,10 +39,10 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -48,12 +51,11 @@ from ..collector.arrow_buffer import ArrowBuffer
 from ..collector.sdk_callback import SequenceTracker
 from ..collector.sdk_config import SDKCollectorConfig, load_config
 from ..core.constants import ARROW_SCHEMA_BY_KIND
+from ..data.memory_store import MemoryStore
 from ..data.mysql_loader import DailyBasicCache
 from ..factor.base import StockData, StockState
 from .pipeline_logger import get_streaming_logger
 from .streaming_engine import (
-    _TRADING_END,
-    _TRADING_START,
     _is_trading_hours,
     _time_to_seconds,
     _upload_to_oss,
@@ -292,12 +294,9 @@ class CombinedEngine:
             "deal": ArrowBuffer(ARROW_SCHEMA_BY_KIND["deal"]),
         }
 
-        # Sliding window: accumulated DataFrames from recent flushes
-        # Key: "tick"/"order"/"deal" → list of DataFrames
-        self._window_dfs: Dict[str, List[pd.DataFrame]] = {
-            "tick": [], "order": [], "deal": [],
-        }
-        self._data_window_seconds = int(os.environ.get("DATA_WINDOW_SECONDS", "300"))
+        # MemoryStore: SDK data → MemoryStore → DataAPI (unified interface)
+        self._memory_store = MemoryStore.get_instance()
+        self._data_flush_interval = float(os.environ.get("DATA_FLUSH_INTERVAL", "0.01"))
 
         # Factor module
         module_path = os.environ.get("FACTOR_MODULE", "")
@@ -317,6 +316,25 @@ class CombinedEngine:
         else:
             self._checkpoint_path = Path("/tmp") / self._CHECKPOINT_NAME
 
+        self._raw_archive_enabled = os.environ.get(
+            "RAW_DATA_ARCHIVE_ENABLED", "true"
+        ).lower() in ("1", "true", "yes", "on")
+        self._disk_output_dir = Path(os.environ.get("COLLECTOR_DISK_OUTPUT", "/data/collector_output"))
+        self._max_disk_queue = int(os.environ.get("COLLECTOR_MAX_DISK_QUEUE", "200"))
+        self._disk_queue: Deque[Tuple[date, str, pd.DataFrame]] = deque()
+        self._disk_queue_lock = threading.Lock()
+        self._disk_active_writes = 0
+        self._disk_chunk_idx: Dict[str, int] = {}
+        self._disk_thread: Optional[threading.Thread] = None
+        self._uploaded_today = False
+        if self._raw_archive_enabled:
+            self._disk_thread = threading.Thread(
+                target=self._disk_writer_loop,
+                name="combined-raw-disk",
+                daemon=True,
+            )
+            self._disk_thread.start()
+
         # daily_basic data (loaded once at startup)
         self._market_df: pd.DataFrame = pd.DataFrame()
         self._daily_basic_df: pd.DataFrame = pd.DataFrame()
@@ -324,8 +342,9 @@ class CombinedEngine:
         self._load_checkpoint()
 
         logger.info(
-            "[combined] init done: module=%s interval=%ds window=%ds",
-            module_path, self.compute_interval, self._data_window_seconds,
+            "[combined] init done: module=%s interval=%ds flush=%.0fms",
+            module_path, self.compute_interval,
+            self._data_flush_interval * 1000,
         )
 
     def trading_day(self) -> date:
@@ -354,10 +373,8 @@ class CombinedEngine:
         )
         self._subscriber = self._io_man.CreateSubscriber(callback, self.config.callback_multithread)
         self._subscriber.SetServerAddress(self.config.server)
-        if self.config.username:
-            self._subscriber.SetUserName(self.config.username)
-        if self.config.password:
-            self._subscriber.SetPassword(self.config.password)
+        if self.config.token:
+            self._subscriber.SetUserName(self.config.token)
         self._subscriber.SetMessageEncoding(self.config.encoding)
         self._subscriber.EnableMergeMessage(self.config.enable_merge)
         self._subscriber.SetHeartbeatInterval(self.config.heartbeat_interval)
@@ -393,125 +410,286 @@ class CombinedEngine:
         return df
 
     # ------------------------------------------------------------------ #
-    # Sliding window management                                            #
+    # Raw data archive: async parquet chunks + after-close OSS upload      #
     # ------------------------------------------------------------------ #
 
-    def _update_window(self, kind: str, new_df: pd.DataFrame) -> None:
-        """Append new flush to window and prune old data."""
-        if new_df.empty:
+    def _enqueue_raw_archive(self, trading_day: date, kind: str, df: pd.DataFrame) -> None:
+        """Persist raw market data without changing the in-memory calculation path."""
+        if not self._raw_archive_enabled or df.empty:
             return
-        self._window_dfs[kind].append(new_df)
-        self._prune_window(kind)
+        with self._disk_queue_lock:
+            if len(self._disk_queue) < self._max_disk_queue:
+                self._disk_queue.append((trading_day, kind, df))
+                return
 
-    def _prune_window(self, kind: str) -> None:
-        """Remove DataFrames whose data is entirely older than window."""
-        cutoff = time.time() - self._data_window_seconds
-        # Keep at least one DataFrame even if it's old
-        while len(self._window_dfs[kind]) > 1:
-            oldest = self._window_dfs[kind][0]
-            if oldest.empty:
-                self._window_dfs[kind].pop(0)
-                continue
-            # Check if the newest row in the oldest df is still within window
-            if "Time" in oldest.columns and not oldest.empty:
-                # Time column has timestamps — check the last row
-                last_time = oldest["Time"].iloc[-1]
-                if hasattr(last_time, "timestamp"):
-                    try:
-                        if last_time.timestamp() < cutoff:
-                            self._window_dfs[kind].pop(0)
-                            continue
-                    except Exception:
-                        pass
-            break
+        logger.warning(
+            "[raw-archive] queue full (%d), writing %s synchronously",
+            self._max_disk_queue,
+            kind,
+        )
+        self._append_raw_to_disk(trading_day, kind, df)
 
-    def _get_window_df(self, kind: str) -> pd.DataFrame:
-        """Concatenate all DataFrames in the window for this kind."""
-        dfs = self._window_dfs[kind]
-        if not dfs:
-            return pd.DataFrame()
-        if len(dfs) == 1:
-            return dfs[0].copy()
-        try:
-            combined = pd.concat(dfs, ignore_index=True)
-            # Filter by time window
-            cutoff = pd.Timestamp.now() - pd.Timedelta(seconds=self._data_window_seconds)
-            if "Time" in combined.columns:
+    def _disk_writer_loop(self) -> None:
+        while not self._stopped:
+            try:
+                with self._disk_queue_lock:
+                    item = self._disk_queue.popleft() if self._disk_queue else None
+                    if item is not None:
+                        self._disk_active_writes += 1
+                if item is None:
+                    time.sleep(0.05)
+                    continue
                 try:
-                    combined = combined[combined["Time"] >= cutoff].copy()
-                except Exception:
-                    pass
-            return combined
-        except Exception:
-            return pd.concat(dfs, ignore_index=True)
+                    trading_day, kind, df = item
+                    self._append_raw_to_disk(trading_day, kind, df)
+                    del df
+                finally:
+                    with self._disk_queue_lock:
+                        self._disk_active_writes -= 1
+            except Exception as exc:
+                logger.warning("[raw-archive] writer failed: %s", exc)
 
-    def _clear_window(self, kind: str) -> None:
-        """Clear all DataFrames from the window."""
-        self._window_dfs[kind].clear()
+    def _append_raw_to_disk(self, trading_day: date, kind: str, df: pd.DataFrame) -> None:
+        try:
+            date_str = trading_day.strftime("%Y%m%d")
+            out_dir = self._disk_output_dir / date_str / kind
+            out_dir.mkdir(parents=True, exist_ok=True)
+            key = f"{date_str}/{kind}"
+            with self._disk_queue_lock:
+                chunk_idx = self._disk_chunk_idx.get(key, 0)
+                self._disk_chunk_idx[key] = chunk_idx + 1
+                chunk_file = out_dir / f"{chunk_idx:06d}.parquet"
+            df.to_parquet(chunk_file, index=False)
+            logger.info("[raw-archive] %s +%d rows -> %s", kind, len(df), chunk_file)
+        except Exception as exc:
+            logger.error("[raw-archive] write %s failed: %s", kind, exc, exc_info=True)
+
+    def _flush_disk_queue(self, timeout_seconds: float = 30.0) -> None:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            with self._disk_queue_lock:
+                pending = len(self._disk_queue)
+                active = self._disk_active_writes
+            if pending == 0 and active == 0:
+                return
+            time.sleep(0.05)
+        logger.warning(
+            "[raw-archive] disk queue not drained after %.0fs pending=%d active=%d",
+            timeout_seconds,
+            pending,
+            active,
+        )
+
+    def _flush_raw_buffers_to_archive(self) -> None:
+        """Flush any buffered SDK rows to disk before upload or shutdown."""
+        archive_day = self._trading_day
+        for kind in ("tick", "deal", "order"):
+            df = self._flush_buffer(kind)
+            self._enqueue_raw_archive(archive_day, kind, df)
+
+    def _flush_raw_buffers_for_day(self, trading_day: date) -> None:
+        """Flush buffered SDK rows and attribute them to a specific trading day."""
+        for kind in ("tick", "deal", "order"):
+            df = self._flush_buffer(kind)
+            self._enqueue_raw_archive(trading_day, kind, df)
+
+    def _get_oss_bucket(self):
+        import oss2
+
+        auth = oss2.Auth(
+            os.environ["OSS_ACCESS_KEY_ID"],
+            os.environ["OSS_ACCESS_KEY_SECRET"],
+        )
+        endpoint = os.environ.get("OSS_ENDPOINT", "")
+        if endpoint and not endpoint.startswith("http"):
+            endpoint = f"https://{endpoint}"
+        bucket_name = os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data")
+        return oss2.Bucket(auth, endpoint, bucket_name)
+
+    @staticmethod
+    def _parse_upload_time(raw: str) -> Tuple[int, int]:
+        if ":" in raw:
+            hour, minute = raw.split(":", 1)
+            return int(hour), int(minute)
+        return int(raw), 0
+
+    def _check_raw_upload_time(self) -> None:
+        if not self._raw_archive_enabled or self._uploaded_today:
+            return
+        upload_hour, upload_minute = self._parse_upload_time(
+            os.environ.get("RAW_DATA_UPLOAD_TIME", os.environ.get("RAW_DATA_UPLOAD_HOUR", "16"))
+        )
+        now = datetime.now()
+        if (now.hour, now.minute) < (upload_hour, upload_minute):
+            return
+        self._flush_raw_buffers_to_archive()
+        self._flush_disk_queue()
+        if self._upload_raw_day_to_oss(self._trading_day):
+            self._uploaded_today = True
+
+    def _upload_raw_day_to_oss(self, trading_day: date) -> bool:
+        """Merge raw parquet chunks, sort like historical data, and upload to OSS."""
+        date_str = trading_day.strftime("%Y%m%d")
+        year = date_str[:4]
+        month = date_str[4:6]
+        prefix = f"{year}/{year}{month}/{date_str}"
+        disk_dir = self._disk_output_dir / date_str
+
+        if not disk_dir.exists():
+            logger.warning("[raw-archive] disk dir missing, skip upload: %s", disk_dir)
+            return False
+
+        try:
+            bucket = self._get_oss_bucket()
+        except Exception as exc:
+            logger.error("[raw-archive] OSS bucket init failed: %s", exc)
+            return False
+
+        try:
+            import duckdb
+        except Exception as exc:
+            logger.error("[raw-archive] duckdb unavailable, cannot merge parquet: %s", exc)
+            return False
+
+        uploaded_any = False
+        had_error = False
+        for kind in ("order", "deal", "tick"):
+            chunk_dir = disk_dir / kind
+            if not chunk_dir.exists():
+                logger.info("[raw-archive] %s has no chunks, skip", kind)
+                continue
+            chunks = sorted(chunk_dir.glob("*.parquet"))
+            if not chunks:
+                continue
+
+            tmp_file = disk_dir / f"tmp_{kind}.parquet"
+            try:
+                tmp_file.unlink(missing_ok=True)
+                con = duckdb.connect(":memory:")
+                con.execute("SET memory_limit='2GB'")
+                con.execute(f"""
+                    COPY (
+                        SELECT * FROM read_parquet('{chunk_dir}/*.parquet')
+                        ORDER BY Code, SeqNum
+                    ) TO '{tmp_file}' (FORMAT PARQUET)
+                """)
+                con.close()
+
+                oss_key = f"{prefix}/{date_str}_{kind}.parquet"
+                bucket.put_object_from_file(oss_key, str(tmp_file))
+                size_mb = tmp_file.stat().st_size / 1024 / 1024
+                logger.info(
+                    "[raw-archive] uploaded %s -> oss://%s/%s (%.1f MB, %d chunks)",
+                    kind,
+                    os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"),
+                    oss_key,
+                    size_mb,
+                    len(chunks),
+                )
+                uploaded_any = True
+                tmp_file.unlink(missing_ok=True)
+                for chunk in chunks:
+                    chunk.unlink()
+            except Exception as exc:
+                had_error = True
+                logger.error("[raw-archive] upload %s failed: %s", kind, exc, exc_info=True)
+                tmp_file.unlink(missing_ok=True)
+
+        if not self._daily_basic_df.empty:
+            try:
+                buffer = io.BytesIO()
+                self._daily_basic_df.to_parquet(buffer, index=False)
+                buffer.seek(0)
+                oss_key = f"{prefix}/{date_str}_daily_basic_data.parquet"
+                bucket.put_object(oss_key, buffer.read())
+                logger.info("[raw-archive] uploaded daily_basic -> %s", oss_key)
+                uploaded_any = True
+            except Exception as exc:
+                had_error = True
+                logger.error("[raw-archive] upload daily_basic failed: %s", exc)
+
+        logger.info("[raw-archive] %s upload finished", date_str)
+        return uploaded_any and not had_error
+
+    # ------------------------------------------------------------------ #
+    # Data flush thread: ArrowBuffer → MemoryStore (every ~10ms)           #
+    # ------------------------------------------------------------------ #
+
+    def _data_flush_loop(self) -> None:
+        """High-frequency flush: ArrowBuffer → group by code → MemoryStore."""
+        while not self._stopped:
+            time.sleep(self._data_flush_interval)
+            try:
+                self._flush_to_memory_store()
+            except Exception as exc:
+                logger.warning("[data-flush] failed: %s", exc)
+
+    def _flush_to_memory_store(self) -> None:
+        """Flush ArrowBuffers, group by Code, write per-code DataFrames to MemoryStore."""
+        store = self._memory_store
+        archive_day = self._trading_day
+        for kind in ("tick", "deal", "order"):
+            df = self._flush_buffer(kind)
+            if df.empty:
+                continue
+            # Archive to disk (existing logic)
+            self._enqueue_raw_archive(archive_day, kind, df)
+            # Group by Code → write to MemoryStore
+            groups = self._group_by_code(df)
+            if kind == "tick":
+                for code, g in groups.items():
+                    store.update_tick(code, g)
+            elif kind == "order":
+                for code, g in groups.items():
+                    store.update_order(code, g)
+            elif kind == "deal":
+                for code, g in groups.items():
+                    store.update_deal(code, g)
 
     # ------------------------------------------------------------------ #
     # Factor computation                                                   #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _group_by_code(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """Split DataFrame into {code: sub-DataFrame} via groupby."""
+        if df.empty or "Code" not in df.columns:
+            return {}
+        return {code: group for code, group in df.groupby("Code", sort=False)}
+
     def _compute_and_output(self) -> None:
-        """Flush buffers, build StockData per stock, compute factors, output."""
+        """Read from MemoryStore, build StockData per stock, compute factors, output."""
         pipe_log = get_streaming_logger()
         now = datetime.now()
         date_str = self._trading_day.strftime("%Y%m%d")
         end_time = now.strftime("%H%M%S")
 
-        # 1. Flush ArrowBuffers → DataFrame, append to sliding window
-        tick_new = self._flush_buffer("tick")
-        deal_new = self._flush_buffer("deal")
-        order_new = self._flush_buffer("order")
-
-        self._update_window("tick", tick_new)
-        self._update_window("deal", deal_new)
-        self._update_window("order", order_new)
-
-        del tick_new, deal_new, order_new
-
-        # 2. Get windowed DataFrames
-        tick_df = self._get_window_df("tick")
-        deal_df = self._get_window_df("deal")
-        order_df = self._get_window_df("order")
-
-        # 3. Snapshot StockState
+        # Snapshot StockState
         with self._lock:
-            self._trading_day = date_str
             states_snapshot = dict(self.states)
 
-        logger.info("[combined] computing: date=%s end_time=%s stocks=%d "
-                     "tick=%d deal=%d order=%d rows",
-                     date_str, end_time, len(states_snapshot),
-                     len(tick_df), len(deal_df), len(order_df))
-
-        # 4. Collect all stock codes
+        # Collect all stock codes from MemoryStore + StockState
+        store = self._memory_store
         all_codes = set(states_snapshot.keys())
-        if not tick_df.empty and "Code" in tick_df.columns:
-            all_codes.update(tick_df["Code"].unique())
-        if not deal_df.empty and "Code" in deal_df.columns:
-            all_codes.update(deal_df["Code"].unique())
-        if not order_df.empty and "Code" in order_df.columns:
-            all_codes.update(order_df["Code"].unique())
+        all_codes.update(store._tick.keys())
+        all_codes.update(store._order.keys())
+        all_codes.update(store._deal.keys())
 
-        # 5. Per-stock computation
+        logger.info("[combined] computing: date=%s end_time=%s stocks=%d",
+                     date_str, end_time, len(all_codes))
+
+        # Per-stock computation
         t0 = time.time()
         results = []
         for code in all_codes:
             try:
-                # Extract per-stock DataFrames
-                stock_tick = tick_df[tick_df["Code"] == code] if not tick_df.empty else pd.DataFrame()
-                stock_deal = deal_df[deal_df["Code"] == code] if not deal_df.empty else pd.DataFrame()
-                stock_order = order_df[order_df["Code"] == code] if not order_df.empty else pd.DataFrame()
-
                 stock_data = StockData(
                     code=code,
                     date=date_str,
                     end_time=end_time,
-                    l1_tick=stock_tick,
-                    l2_deal=stock_deal,
-                    l2_order=stock_order,
+                    l1_tick=store.get_tick(code),
+                    l2_deal=store.get_deal(code),
+                    l2_order=store.get_order(code),
                     market=self._market_df,
                     daily_basic=self._daily_basic_df,
                     state=states_snapshot.get(code),
@@ -557,8 +735,7 @@ class CombinedEngine:
                       stocks=len(all_codes), results=len(result_df),
                       compute_ms=round(elapsed_ms, 1))
 
-        # 6. Release temporary DataFrames
-        del tick_df, deal_df, order_df, result_df
+        del result_df
 
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
@@ -601,17 +778,25 @@ class CombinedEngine:
 
     def _check_day_rollover(self) -> None:
         today = date.today()
+        upload_day: Optional[date] = None
         with self._lock:
             if self._trading_day and today != self._trading_day:
                 logger.info("[combined] day rollover: %s -> %s", self._trading_day, today)
+                if self._raw_archive_enabled and not self._uploaded_today:
+                    upload_day = self._trading_day
                 self.states.clear()
                 self._trading_day = today
-                for kind in ("tick", "order", "deal"):
-                    self._clear_window(kind)
+                self._uploaded_today = False
+                # Reset MemoryStore for new trading day
+                self._memory_store.set_trading_day(today.strftime("%Y%m%d"))
                 try:
                     self._checkpoint_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+        if upload_day is not None:
+            self._flush_raw_buffers_for_day(upload_day)
+            self._flush_disk_queue()
+            self._upload_raw_day_to_oss(upload_day)
 
     # ------------------------------------------------------------------ #
     # Memory diagnostics                                                   #
@@ -629,15 +814,14 @@ class CombinedEngine:
         except Exception:
             rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-        window_rows = {}
-        for kind in ("tick", "order", "deal"):
-            window_rows[kind] = sum(len(df) for df in self._window_dfs[kind])
+        store = self._memory_store
+        mem_info = store.get_memory_usage()
 
         logger.warning(
-            "[mem] RSS=%.0fMB stocks=%d window_rows=tick:%d deal:%d order:%d "
+            "[mem] RSS=%.0fMB stocks=%d store=tick:%.0fMB deal:%.0fMB order:%.0fMB "
             "buffer_rows=tick:%d deal:%d order:%d",
             rss_mb, len(self.states),
-            window_rows["tick"], window_rows["deal"], window_rows["order"],
+            mem_info["tick_mb"], mem_info["deal_mb"], mem_info["order_mb"],
             self._buffers["tick"].row_count,
             self._buffers["deal"].row_count,
             self._buffers["order"].row_count,
@@ -662,6 +846,19 @@ class CombinedEngine:
                 logger.info("[combined] daily_basic loaded: %d rows", len(self._daily_basic_df))
         except Exception as exc:
             logger.warning("[combined] daily_basic load failed: %s", exc)
+
+        # Initialize MemoryStore for DataAPI
+        self._memory_store.set_trading_day(trade_date)
+        if not self._daily_basic_df.empty:
+            self._memory_store.update_daily_basic(self._daily_basic_df)
+            logger.info("[combined] MemoryStore initialized: trading_day=%s", trade_date)
+
+        # Start data flush thread (ArrowBuffer → MemoryStore, every ~10ms)
+        self._data_flush_thread = threading.Thread(
+            target=self._data_flush_loop, name="data-flush", daemon=True,
+        )
+        self._data_flush_thread.start()
+        logger.info("[combined] data flush thread started: interval=%.3fs", self._data_flush_interval)
 
         self._connect()
 
@@ -692,6 +889,8 @@ class CombinedEngine:
                 self._log_mem()
                 last_mem_log = now
 
+            self._check_raw_upload_time()
+
             # GC
             if now - last_gc >= 60:
                 gc.collect()
@@ -704,26 +903,16 @@ class CombinedEngine:
             # Day rollover
             self._check_day_rollover()
 
-            # Self-protection
-            mem_limit_mb = int(os.environ.get("COLLECTOR_MEM_LIMIT_MB", "8192"))
-            if mem_limit_mb > 0:
-                try:
-                    with open("/proc/self/status", "r", encoding="utf-8") as f:
-                        for line in f:
-                            if line.startswith("VmRSS:"):
-                                rss_mb = int(line.split()[1]) / 1024
-                                break
-                        else:
-                            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-                except Exception:
-                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-                if rss_mb > mem_limit_mb:
-                    logger.error("[mem] RSS=%.0fMB exceeds limit %dMB, exiting", rss_mb, mem_limit_mb)
-                    break
-
             time.sleep(0.5)
 
     def stop(self) -> None:
+        # Flush remaining ArrowBuffer data to MemoryStore + disk archive
+        try:
+            self._flush_to_memory_store()
+        except Exception as exc:
+            logger.warning("[combined] final MemoryStore flush failed: %s", exc)
+        if self._raw_archive_enabled:
+            self._flush_disk_queue()
         self._stopped = True
         if self.states:
             self._save_checkpoint()

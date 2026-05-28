@@ -20,6 +20,8 @@ spec:
       labels:
         app: combined-engine
     spec:
+      nodeSelector:
+        quant.lianghua.io/combined-engine: "true"
       tolerations:
         - key: node.kubernetes.io/disk-pressure
           operator: Exists
@@ -31,16 +33,16 @@ spec:
           env:
             # --- pymdl SDK (remote) ---
             - name: MDL_SERVER
-              value: "mdl-cloud-sh.datayes.com:19011"
-            # MDL_USERNAME / MDL_PASSWORD 从 secret 注入
+              value: "mdl-cloud-sh.datayes.com:19012"
+            # MDL_TOKEN 从 secret 注入
             - name: MDL_IO_THREADS
               value: "4"
             - name: MDL_CALLBACK_MULTITHREAD
               value: "false"
             - name: MDL_ENCODING
-              value: "1"
+              value: "7"
             - name: MDL_ENABLE_MERGE
-              value: "false"
+              value: "true"
             - name: MDL_SUBS
               value: "4.4,4.24,6.28,6.33,6.36"
             - name: MDL_FLUSH_INTERVAL_MS
@@ -58,14 +60,23 @@ spec:
               value: "quant_platform.factor.examples.live_momentum"
             - name: COMPUTE_INTERVAL
               value: "60"
-            - name: DATA_WINDOW_SECONDS
-              value: "300"
+            - name: DATA_FLUSH_INTERVAL
+              value: "0.01"
             - name: UNIVERSE
               value: ""
             - name: FACTOR_OUTPUT_PATH
               value: /data/factors
             - name: DAILY_BASIC_MARKET_COUNT
               value: "5"
+            # --- 原始行情归档：内存计算同时落盘，16:00 后上传 OSS ---
+            - name: RAW_DATA_ARCHIVE_ENABLED
+              value: "true"
+            - name: RAW_DATA_UPLOAD_TIME
+              value: "15:40"
+            - name: COLLECTOR_DISK_OUTPUT
+              value: /data/collector_output
+            - name: COLLECTOR_MAX_DISK_QUEUE
+              value: "200"
             # --- 通用 ---
             - name: TZ
               value: Asia/Shanghai
@@ -75,9 +86,6 @@ spec:
               value: /data/quant/pipeline_logs
             - name: PIPELINE_LOG_FALLBACK_DIR
               value: /tmp/quant_pipeline_logs
-            # --- 内存保护 ---
-            - name: COLLECTOR_MEM_LIMIT_MB
-              value: "5120"
           envFrom:
             - secretRef:
                 name: quant-secrets
@@ -88,13 +96,15 @@ spec:
               mountPath: /data/quant/pipeline_logs
             - name: mdl-logs
               mountPath: /data/quant/mdl_logs
+            - name: raw-archive
+              mountPath: /data/collector_output
           resources:
             requests:
-              cpu: "2"
-              memory: 2Gi
-            limits:
               cpu: "4"
-              memory: 6Gi
+              memory: 32Gi
+            limits:
+              cpu: "10"
+              memory: 80Gi
       volumes:
         - name: factor-output
           hostPath:
@@ -107,4 +117,8 @@ spec:
         - name: mdl-logs
           hostPath:
             path: /data/quant/mdl_logs
+            type: DirectoryOrCreate
+        - name: raw-archive
+          hostPath:
+            path: /data/quant/collector_output
             type: DirectoryOrCreate
