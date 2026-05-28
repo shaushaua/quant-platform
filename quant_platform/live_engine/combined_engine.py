@@ -287,6 +287,7 @@ class CombinedEngine:
         self.config: SDKCollectorConfig = load_config()
         self._io_man = None
         self._subscriber = None
+        self._callback = None
         self.tracker = SequenceTracker()
 
         # ArrowBuffers for raw data (same as collector)
@@ -370,10 +371,10 @@ class CombinedEngine:
         except Exception:
             pass
 
-        callback = create_direct_callback(
+        self._callback = create_direct_callback(
             pymdl, self._buffers, self.states, self._lock, self.trading_day, self.tracker,
         )
-        self._subscriber = self._io_man.CreateSubscriber(callback, self.config.callback_multithread)
+        self._subscriber = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
         self._subscriber.SetServerAddress(self.config.server)
         logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
         if self.config.token:
