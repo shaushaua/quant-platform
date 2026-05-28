@@ -54,6 +54,12 @@ CFGEOF
 echo "[entrypoint] Starting feeder_client..."
 echo "[entrypoint] Config: $(cat $CFG_FILE)"
 cd "$CFG_DIR"
+export LD_LIBRARY_PATH="/opt/mdl-client:${LD_LIBRARY_PATH}"
+echo "[entrypoint] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+echo "[entrypoint] Files in /opt/mdl-client:"
+ls -la /opt/mdl-client/
+echo "[entrypoint] ldd check:"
+ldd /opt/mdl-client/feeder_client 2>&1 || true
 ./feeder_client 2>&1 &
 CLIENT_PID=$!
 
