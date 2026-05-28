@@ -53,18 +53,11 @@ cat > "$CFG_FILE" <<CFGEOF
 CFGEOF
 
 echo "[entrypoint] Starting feeder_client..."
-echo "[entrypoint] Config: $(cat $CFG_FILE)"
 cd "$CFG_DIR"
 export LD_LIBRARY_PATH="/opt/mdl-client:${LD_LIBRARY_PATH}"
-echo "[entrypoint] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-echo "[entrypoint] Files in /opt/mdl-client:"
-ls -la /opt/mdl-client/
-echo "[entrypoint] ldd check:"
-ldd /opt/mdl-client/feeder_client 2>&1 || true
-./feeder_client 2>&1 &
-CLIENT_PID=$!
+./feeder_client &
 
-# Wait for TCP port 9012 to be ready
+# feeder_client forks to background — just wait for port 9012 to be ready
 echo "[entrypoint] Waiting for feeder_client to listen on 9012..."
 for i in $(seq 1 120); do
     if python -c "
@@ -77,31 +70,23 @@ try:
 except:
     exit(1)
 " 2>/dev/null; then
-        echo "[entrypoint] feeder_client ready on 9012 (pid=${CLIENT_PID})"
+        echo "[entrypoint] feeder_client ready on 9012"
         break
-    fi
-    if ! kill -0 $CLIENT_PID 2>/dev/null; then
-        # feeder_client may fork to background, check port instead
-        if python -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-try:
-    s.connect(('127.0.0.1', 9012))
-    s.close()
-    exit(0)
-except:
-    exit(1)
-" 2>/dev/null; then
-            echo "[entrypoint] feeder_client ready on 9012 (forked)"
-            break
-        fi
-        echo "[entrypoint] ERROR: feeder_client exited unexpectedly"
-        echo "[entrypoint] Checking logs..."
-        cat "${LOG_DIR}/feeder_client.log" 2>/dev/null | tail -20 || echo "No log file found"
-        exit 1
     fi
     sleep 1
 done
+
+# Verify port is actually open
+if ! python -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(('127.0.0.1', 9012))
+s.close()
+" 2>/dev/null; then
+    echo "[entrypoint] ERROR: feeder_client did not start within 120s"
+    cat "${LOG_DIR}/feeder_client.log" 2>/dev/null | tail -20 || true
+    exit 1
+fi
 
 # Start Python engine
 echo "[entrypoint] Starting combined engine..."
