@@ -26,7 +26,7 @@ cat > "$CFG_FILE" <<CFGEOF
     },
     "feeder_client_log" : {
         "LogFormat" : "%D[%t][%p]%c - %m%n",
-        "LogConsole" : false,
+        "LogConsole" : true,
         "LogFiles" : [
             {"LogLevelMax": "debug", "FileName": "${LOG_DIR}/feeder_client.trace.log", "MaxSize": 10240, "MaxBackup": 5},
             {"LogLevelMin": "info",  "FileName": "${LOG_DIR}/feeder_client.log", "MaxSize": 10240, "MaxBackup": 10}
@@ -52,8 +52,9 @@ cat > "$CFG_FILE" <<CFGEOF
 CFGEOF
 
 echo "[entrypoint] Starting feeder_client..."
+echo "[entrypoint] Config: $(cat $CFG_FILE)"
 cd "$CFG_DIR"
-./feeder_client &
+./feeder_client 2>&1 &
 CLIENT_PID=$!
 
 # Wait for TCP port 9012 to be ready
