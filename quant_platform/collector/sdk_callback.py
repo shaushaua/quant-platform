@@ -76,13 +76,6 @@ def create_callback(
     """Create a pymdl.MsgCallback subclass bound to the imported pymdl module."""
 
     class SDKMessageCallback(pymdl.MsgCallback):
-        def _append(self, kind: str, row: Optional[dict]) -> None:
-            """Append row directly to Arrow buffer. No dict stored, no queue."""
-            if row is not None:
-                should_flush = buffers[kind].append_row(row)
-                if should_flush:
-                    flush_event.set()
-
         def _observe(self, hd) -> None:
             gap = tracker.observe(int(hd.ServiceID), int(hd.MessageID), int(hd.SequenceID))
             if gap is not None:
@@ -123,12 +116,14 @@ def create_callback(
                 msg = pymdl.mdl_shl2_msg.Read(hd.MessageID, buf)
                 trading_day = trading_day_getter()
                 if hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_SHL2MarketData:
-                    row = sdk_mapper.map_sh_tick(msg, trading_day, int(hd.SequenceID))
-                    self._append("tick", row)
+                    if sdk_mapper.write_sh_tick(buffers["tick"], msg, trading_day, int(hd.SequenceID)):
+                        flush_event.set()
                 elif hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_NGTSTick:
-                    order_row, deal_row = sdk_mapper.map_sh_ngts_tick(msg, trading_day)
-                    self._append("order", order_row)
-                    self._append("deal", deal_row)
+                    order_flush, deal_flush = sdk_mapper.write_sh_ngts_tick(
+                        buffers["order"], buffers["deal"], msg, trading_day,
+                    )
+                    if order_flush or deal_flush:
+                        flush_event.set()
                 del msg
             except Exception as exc:
                 logger.warning(
@@ -143,14 +138,14 @@ def create_callback(
                 msg = pymdl.mdl_szl2_msg.Read(hd.MessageID, buf)
                 trading_day = trading_day_getter()
                 if hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2:
-                    row = sdk_mapper.map_sz_tick(msg, trading_day, int(hd.SequenceID))
-                    self._append("tick", row)
+                    if sdk_mapper.write_sz_tick(buffers["tick"], msg, trading_day, int(hd.SequenceID)):
+                        flush_event.set()
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Order300192_v2:
-                    row = sdk_mapper.map_sz_order(msg, trading_day)
-                    self._append("order", row)
+                    if sdk_mapper.write_sz_order(buffers["order"], msg, trading_day):
+                        flush_event.set()
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2:
-                    row = sdk_mapper.map_sz_deal(msg, trading_day)
-                    self._append("deal", row)
+                    if sdk_mapper.write_sz_deal(buffers["deal"], msg, trading_day):
+                        flush_event.set()
                 del msg
             except Exception as exc:
                 logger.warning(

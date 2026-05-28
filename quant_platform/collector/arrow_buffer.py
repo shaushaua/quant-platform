@@ -60,6 +60,7 @@ class ArrowBuffer:
 
     HIGH_WATERMARK = 8192
     INITIAL_CAP = 4096
+    SHRINK_THRESHOLD = HIGH_WATERMARK * 4
 
     def __init__(self, schema: pa.Schema):
         self.schema = schema
@@ -87,40 +88,67 @@ class ArrowBuffer:
         new_arr[:self._n] = arr[:self._n]
         self._np[name] = new_arr
 
-    def append_row(self, row: dict) -> bool:
-        """
-        Append one row. Numeric values go directly to numpy arrays (no Python
-        float/int objects created for storage). Returns True if high watermark hit.
-        """
-        with self.lock:
+    # ------------------------------------------------------------------ #
+    # Direct-write API: begin_row / set / commit_row / cancel_row         #
+    # Eliminates dict creation entirely in the hot path.                  #
+    # ------------------------------------------------------------------ #
+
+    def begin_row(self) -> None:
+        """Start a new row. Acquires lock; MUST call commit_row() or cancel_row()."""
+        self.lock.acquire()
+        idx = self._n
+        for name in self._np:
+            self._ensure_cap(name, idx + 1)
+            self._np[name][idx] = 0  # zero-fill defaults
+
+    def set(self, name: str, value) -> None:
+        """Set column value for current row. Must be between begin_row and commit/cancel."""
+        if name in self._np:
+            if value is None:
+                return  # already zeroed
+            arr = self._np[name]
             idx = self._n
-
-            # Ensure numpy capacity
-            for name in self._np:
-                self._ensure_cap(name, idx + 1)
-
-            # Write numeric columns (direct to native memory)
-            for name, arr in self._np.items():
-                val = row.get(name)
-                if val is None:
-                    arr[idx] = 0
-                elif self._np_is_ts.get(name):
-                    # pd.Timestamp → int64 nanoseconds
-                    if isinstance(val, pd.Timestamp):
-                        arr[idx] = val.value
-                    elif hasattr(val, "value"):
-                        arr[idx] = val.value
-                    else:
-                        arr[idx] = int(pd.Timestamp(val).value)
+            if self._np_is_ts.get(name):
+                if isinstance(value, pd.Timestamp):
+                    arr[idx] = value.value
+                elif hasattr(value, "value"):
+                    arr[idx] = value.value
                 else:
-                    arr[idx] = val
+                    arr[idx] = int(pd.Timestamp(value).value)
+            else:
+                arr[idx] = value
+        elif name in self._ls:
+            self._ls[name].append(value)
 
-            # Write string columns (Python lists)
-            for name, lst in self._ls.items():
-                lst.append(row.get(name))
-
+    def commit_row(self) -> bool:
+        """Finish row, release lock. Returns True if high watermark hit."""
+        try:
+            for name in self._ls:
+                if len(self._ls[name]) <= self._n:
+                    self._ls[name].append("")
             self._n += 1
             return self._n >= self.HIGH_WATERMARK
+        finally:
+            self.lock.release()
+
+    def cancel_row(self) -> None:
+        """Cancel row (undo partial string appends), release lock."""
+        try:
+            for name in self._ls:
+                if len(self._ls[name]) > self._n:
+                    self._ls[name].pop()
+        finally:
+            self.lock.release()
+
+    def append_row(self, row: dict) -> bool:
+        """
+        Append one row via dict. Kept for backward compat; prefer begin/set/commit.
+        Returns True if high watermark hit.
+        """
+        self.begin_row()
+        for name, value in row.items():
+            self.set(name, value)
+        return self.commit_row()
 
     @property
     def row_count(self) -> int:
@@ -151,9 +179,20 @@ class ArrowBuffer:
                         pa_arr = pa.array(values).cast(field.type, safe=False)
                     arrays.append(pa_arr)
 
-            batch = pa.RecordBatch.from_arrays(arrays, schema=self.schema)
+            try:
+                batch = pa.RecordBatch.from_arrays(arrays, schema=self.schema)
+            finally:
+                del arrays
 
             # Reset: keep numpy arrays (just reset index), recreate lists
             self._ls = {name: [] for name in self._ls}
             self._n = 0
+            self._shrink_if_needed()
             return batch
+
+    def _shrink_if_needed(self) -> None:
+        """Avoid permanently retaining huge numpy buffers after transient bursts."""
+        for name, arr in list(self._np.items()):
+            if len(arr) <= self.SHRINK_THRESHOLD:
+                continue
+            self._np[name] = np.empty(self.HIGH_WATERMARK, dtype=arr.dtype)

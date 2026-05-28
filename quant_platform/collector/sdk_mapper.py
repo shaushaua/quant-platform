@@ -87,6 +87,28 @@ def _empty_tick_row() -> Dict[str, Any]:
     return {col: 0.0 for col in TICK_COLUMNS}
 
 
+# Pre-computed bid/ask column names — avoid f-string allocation per call
+_LEVEL_COLS = tuple(
+    (f"BidPrice{i}", f"BidVolume{i}", f"BidNum{i}",
+     f"AskPrice{i}", f"AskVolume{i}", f"AskNum{i}")
+    for i in range(1, 11)
+)
+
+
+def _set_levels(buf, bids: list, asks: list, price_attr: str, vol_attr: str, num_attr: str) -> None:
+    """Write 10-level bid/ask data directly to buffer."""
+    for i in range(10):
+        bp, bv, bn = _level(bids, i, price_attr, vol_attr, num_attr)
+        ap, av, an = _level(asks, i, price_attr, vol_attr, num_attr)
+        bp_c, bv_c, bn_c, ap_c, av_c, an_c = _LEVEL_COLS[i]
+        buf.set(bp_c, bp)
+        buf.set(bv_c, bv)
+        buf.set(bn_c, bn)
+        buf.set(ap_c, ap)
+        buf.set(av_c, av)
+        buf.set(an_c, an)
+
+
 def map_sh_tick(msg: Any, trading_day: date, sequence_id: int) -> Optional[Dict[str, Any]]:
     if not _is_stock(getattr(msg, "SecurityID", ""), "SH"):
         return None
@@ -255,6 +277,198 @@ def map_sz_deal(msg: Any, trading_day: date) -> Optional[Dict[str, Any]]:
         "Channel": _i(getattr(msg, "ChannelNo", 0)),
         "SeqNum": _i(getattr(msg, "ApplSeqNum", 0)),
     }
+
+
+# ================================================================== #
+# Direct-write functions: write to ArrowBuffer without creating dicts #
+# ================================================================== #
+
+def write_sh_tick(buf, msg: Any, trading_day: date, sequence_id: int) -> bool:
+    """Write SH tick directly to buffer. Returns True if watermark hit."""
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SH"):
+        return False
+    buf.begin_row()
+    try:
+        code = _code(msg.SecurityID, "SH")
+        event_time = _parse_mdl_time(getattr(msg, "UpdateTime", 0), trading_day)
+        buf.set("TradingDay", str(trading_day))
+        buf.set("Code", code)
+        buf.set("Time", event_time)
+        buf.set("UpdateTime", event_time)
+        buf.set("CurrentPrice", _f(getattr(msg, "LastPrice", 0)))
+        buf.set("TotalVolume", _f(getattr(msg, "TradVolume", 0)))
+        buf.set("TotalMoney", _f(getattr(msg, "Turnover", 0)))
+        buf.set("PreClosePrice", _f(getattr(msg, "PreCloPrice", 0)))
+        buf.set("OpenPrice", _f(getattr(msg, "OpenPrice", 0)))
+        buf.set("HighestPrice", _f(getattr(msg, "HighPrice", 0)))
+        buf.set("LowestPrice", _f(getattr(msg, "LowPrice", 0)))
+        buf.set("IOPV", _f(getattr(msg, "IOPV", 0)))
+        buf.set("TradeNum", _f(getattr(msg, "TradNumber", 0)))
+        buf.set("TotalBidVolume", _f(getattr(msg, "TotalBidVol", 0)))
+        buf.set("TotalAskVolume", _f(getattr(msg, "TotalAskVol", 0)))
+        buf.set("AvgBidPrice", _f(getattr(msg, "WAvgBidPri", 0)))
+        buf.set("AvgAskPrice", _f(getattr(msg, "WAvgAskPri", 0)))
+        buf.set("Channel", 0)
+        buf.set("SeqNum", sequence_id)
+        bids = list(getattr(msg, "BidLevels", []) or [])
+        asks = list(getattr(msg, "SellLevels", []) or [])
+        _set_levels(buf, bids, asks, "OrderPrice", "OrderVol", "OrderNum")
+    except Exception:
+        buf.cancel_row()
+        return False
+    return buf.commit_row()
+
+
+def write_sz_tick(buf, msg: Any, trading_day: date, sequence_id: int) -> bool:
+    """Write SZ tick directly to buffer. Returns True if watermark hit."""
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
+        return False
+    buf.begin_row()
+    try:
+        code = _code(msg.SecurityID, "SZ")
+        event_time = _parse_mdl_time(getattr(msg, "UpdateTime", 0), trading_day)
+        buf.set("TradingDay", str(trading_day))
+        buf.set("Code", code)
+        buf.set("Time", event_time)
+        buf.set("UpdateTime", event_time)
+        buf.set("CurrentPrice", _f(getattr(msg, "LastPrice", 0)))
+        buf.set("TotalVolume", _f(getattr(msg, "Volume", 0)))
+        buf.set("TotalMoney", _f(getattr(msg, "Turnover", 0)))
+        buf.set("PreClosePrice", _f(getattr(msg, "PreCloPrice", 0)))
+        buf.set("OpenPrice", _f(getattr(msg, "OpenPrice", 0)))
+        buf.set("HighestPrice", _f(getattr(msg, "HighPrice", 0)))
+        buf.set("LowestPrice", _f(getattr(msg, "LowPrice", 0)))
+        buf.set("HighLimitPrice", _f(getattr(msg, "HighLimitPrice", 0)))
+        buf.set("LowLimitPrice", _f(getattr(msg, "LowLimitPrice", 0)))
+        buf.set("IOPV", _f(getattr(msg, "IOPV", 0)))
+        buf.set("TradeNum", _f(getattr(msg, "TurnNum", 0)))
+        buf.set("TotalBidVolume", _f(getattr(msg, "TotalBidQty", 0)))
+        buf.set("TotalAskVolume", _f(getattr(msg, "TotalOfferQty", 0)))
+        buf.set("AvgBidPrice", _f(getattr(msg, "WeightedAvgBidPx", 0)))
+        buf.set("AvgAskPrice", _f(getattr(msg, "WeightedAvgOfferPx", 0)))
+        buf.set("Channel", _i(getattr(msg, "ChannelNo", 0)))
+        buf.set("SeqNum", sequence_id)
+        bids = list(getattr(msg, "BidPriceLevel", []) or [])
+        asks = list(getattr(msg, "AskPriceLevel", []) or [])
+        _set_levels(buf, bids, asks, "Price", "Volume", "NumOrders")
+    except Exception:
+        buf.cancel_row()
+        return False
+    return buf.commit_row()
+
+
+def write_sh_ngts_tick(order_buf, deal_buf, msg: Any, trading_day: date) -> Tuple[bool, bool]:
+    """Write SH NGTS order/deal directly to buffers. Returns (order_flush, deal_flush)."""
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SH"):
+        return False, False
+    typ = str(getattr(msg, "Type", "")).strip()
+    code = _code(msg.SecurityID, "SH")
+    event_time = _parse_mdl_time(getattr(msg, "TickTime", 0), trading_day)
+    side = _side_from_flag(getattr(msg, "TickBSFlag", ""))
+
+    if typ in ("A", "D"):
+        order_buf.begin_row()
+        try:
+            buf = order_buf
+            buf.set("TradingDay", str(trading_day))
+            buf.set("Code", code)
+            buf.set("Time", event_time)
+            buf.set("UpdateTime", event_time)
+            buf.set("OrderID", _i(getattr(msg, "BuyOrderNO", 0)) + _i(getattr(msg, "SellOrderNO", 0)))
+            buf.set("Side", side)
+            buf.set("Price", _f(getattr(msg, "Price", 0)))
+            buf.set("Volume", _f(getattr(msg, "Qty", 0)))
+            buf.set("OrderType", 2 if typ == "A" else 5)
+            buf.set("Channel", _i(getattr(msg, "Channel", 0)))
+            buf.set("SeqNum", _i(getattr(msg, "BizIndex", 0)))
+        except Exception:
+            order_buf.cancel_row()
+            return False, False
+        return order_buf.commit_row(), False
+
+    if typ == "T":
+        price = _f(getattr(msg, "Price", 0))
+        volume = _f(getattr(msg, "Qty", 0))
+        money = _f(getattr(msg, "TradeMoney", 0)) or price * volume
+        deal_buf.begin_row()
+        try:
+            buf = deal_buf
+            buf.set("TradingDay", str(trading_day))
+            buf.set("Code", code)
+            buf.set("Time", event_time)
+            buf.set("UpdateTime", event_time)
+            buf.set("SaleOrderID", _i(getattr(msg, "SellOrderNO", 0)))
+            buf.set("BuyOrderID", _i(getattr(msg, "BuyOrderNO", 0)))
+            buf.set("Side", side)
+            buf.set("Price", price)
+            buf.set("Volume", volume)
+            buf.set("Money", money)
+            buf.set("Channel", _i(getattr(msg, "Channel", 0)))
+            buf.set("SeqNum", _i(getattr(msg, "BizIndex", 0)))
+        except Exception:
+            deal_buf.cancel_row()
+            return False, False
+        return False, deal_buf.commit_row()
+
+    return False, False
+
+
+def write_sz_order(buf, msg: Any, trading_day: date) -> bool:
+    """Write SZ order directly to buffer. Returns True if watermark hit."""
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
+        return False
+    side = {49: 0, 50: 1}.get(_i(getattr(msg, "Side", 0)), 10)
+    order_type = {49: 1, 50: 2, 85: 3}.get(_i(getattr(msg, "OrdType", 0)), 0)
+    buf.begin_row()
+    try:
+        buf.set("TradingDay", str(trading_day))
+        buf.set("Code", _code(msg.SecurityID, "SZ"))
+        event_time = _parse_mdl_time(getattr(msg, "TransactTime", 0), trading_day)
+        buf.set("Time", event_time)
+        buf.set("UpdateTime", event_time)
+        buf.set("OrderID", _i(getattr(msg, "ApplSeqNum", 0)))
+        buf.set("Side", side)
+        buf.set("Price", _f(getattr(msg, "Price", 0)))
+        buf.set("Volume", _f(getattr(msg, "OrderQty", 0)))
+        buf.set("OrderType", order_type)
+        buf.set("Channel", _i(getattr(msg, "ChannelNo", 0)))
+        buf.set("SeqNum", _i(getattr(msg, "ApplSeqNum", 0)))
+    except Exception:
+        buf.cancel_row()
+        return False
+    return buf.commit_row()
+
+
+def write_sz_deal(buf, msg: Any, trading_day: date) -> bool:
+    """Write SZ deal directly to buffer. Returns True if watermark hit."""
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
+        return False
+    buy_id = _i(getattr(msg, "BidApplSeqNum", 0))
+    sell_id = _i(getattr(msg, "OfferApplSeqNum", 0))
+    side = 0 if buy_id > sell_id else 1
+    if _i(getattr(msg, "ExecType", 0)) == 52:
+        side = 4
+    price = _f(getattr(msg, "LastPx", 0))
+    volume = _f(getattr(msg, "LastQty", 0))
+    buf.begin_row()
+    try:
+        buf.set("TradingDay", str(trading_day))
+        buf.set("Code", _code(msg.SecurityID, "SZ"))
+        event_time = _parse_mdl_time(getattr(msg, "TransactTime", 0), trading_day)
+        buf.set("Time", event_time)
+        buf.set("UpdateTime", event_time)
+        buf.set("SaleOrderID", sell_id)
+        buf.set("BuyOrderID", buy_id)
+        buf.set("Side", side)
+        buf.set("Price", price)
+        buf.set("Volume", volume)
+        buf.set("Money", price * volume)
+        buf.set("Channel", _i(getattr(msg, "ChannelNo", 0)))
+        buf.set("SeqNum", _i(getattr(msg, "ApplSeqNum", 0)))
+    except Exception:
+        buf.cancel_row()
+        return False
+    return buf.commit_row()
 
 
 def frame(rows: List[Dict[str, Any]], columns: List[str]) -> pd.DataFrame:
