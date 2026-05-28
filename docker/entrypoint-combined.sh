@@ -5,8 +5,9 @@ set -e
 CFG_DIR="/opt/mdl-client"
 CFG_FILE="${CFG_DIR}/feeder_client.cfg"
 LOG_DIR="${MDL_CLIENT_LOG_DIR:-/data/quant/mdl_logs/client}"
+BACKUP_DIR="/data/quant/mdl_msg_backup"
 
-mkdir -p "$LOG_DIR" "$CFG_DIR"
+mkdir -p "$LOG_DIR" "$CFG_DIR" "$BACKUP_DIR"
 
 cat > "$CFG_FILE" <<CFGEOF
 {
@@ -62,10 +63,20 @@ echo "[entrypoint] ldd check:"
 ldd /opt/mdl-client/feeder_client 2>&1 || true
 ./feeder_client 2>&1 &
 CLIENT_PID=$!
+sleep 2
+
+# Check if feeder_client is still running
+if ! kill -0 $CLIENT_PID 2>/dev/null; then
+    echo "[entrypoint] ERROR: feeder_client exited immediately"
+    echo "[entrypoint] Checking logs..."
+    cat "${LOG_DIR}/feeder_client.log" 2>/dev/null || echo "No log file found"
+    cat "${LOG_DIR}/feeder_client.trace.log" 2>/dev/null | tail -20 || echo "No trace log found"
+    exit 1
+fi
 
 # Wait for TCP port 9012 to be ready
 echo "[entrypoint] Waiting for feeder_client to listen on 9012..."
-for i in $(seq 1 60); do
+for i in $(seq 1 120); do
     if python -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
