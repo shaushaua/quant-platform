@@ -405,10 +405,9 @@ class CombinedEngine:
             if err:
                 if isinstance(err, bytes):
                     err = err.decode("GBK", errors="replace")
-                logger.warning("[combined] %s connect to %s failed: %s (continuing without)", label, server, err)
-            else:
-                self._subscribers.append(sub)
-                logger.info("[combined] %s connected to %s", label, server)
+                raise RuntimeError(f"MDL Connect {label} failed: {err}")
+            self._subscribers.append(sub)
+            logger.info("[combined] %s connected to %s", label, server)
 
     # ------------------------------------------------------------------ #
     # ArrowBuffer flush → DataFrame                                        #
