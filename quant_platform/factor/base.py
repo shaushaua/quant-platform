@@ -65,6 +65,9 @@ class StockData:
     l2_deal_hist: list = field(default_factory=list)
     l1_tick_hist: list = field(default_factory=list)
 
+    # 实盘模式：累计聚合状态（回测时为 None）
+    state: Optional['StockState'] = None
+
     def __getitem__(self, key: str) -> pd.DataFrame:
         """
         支持 data["l2_order"] 写法，与函数式接口兼容。
