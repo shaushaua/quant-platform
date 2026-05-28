@@ -190,8 +190,8 @@ class SDKCollector:
             return
         self._last_mem_log = now
 
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        rss_mb = rss_kb / 1024
+        rss_mb = _current_rss_mb()
+        peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
         # RSS 增长速率
         elapsed_since_start = now - self._start_time
@@ -207,12 +207,13 @@ class SDKCollector:
         obj_count = len(gc.get_objects())
         obj_delta = obj_count - self._prev_obj_count
 
-        # 对象类型 Top 10（定位哪种对象在泄漏）
-        type_counter = defaultdict(int)
-        for obj in gc.get_objects():
-            type_counter[type(obj).__name__] += 1
-        top_types = sorted(type_counter.items(), key=lambda x: -x[1])[:10]
-        top_types_str = " ".join(f"{name}={count}" for name, count in top_types)
+        top_types_str = ""
+        if os.getenv("COLLECTOR_MEM_TOP_TYPES", "false").lower() in ("1", "true", "yes", "on"):
+            type_counter = defaultdict(int)
+            for obj in gc.get_objects():
+                type_counter[type(obj).__name__] += 1
+            top_types = sorted(type_counter.items(), key=lambda x: -x[1])[:10]
+            top_types_str = " ".join(f"{name}={count}" for name, count in top_types)
 
         # /dev/shm chunk 文件数和大小
         shm_info, shm_bytes = _shm_store_stats()
@@ -220,12 +221,13 @@ class SDKCollector:
         total_mb = rss_mb + shm_mb  # 进程 RSS + tmpfs 文件
 
         logger.warning(
-            "[mem] RSS=%.0fMB (+%.1fMB/30s, %.1fMB/min avg) ArrowPool=%.1fMB "
+            "[mem] RSS=%.0fMB PeakRSS=%.0fMB (+%.1fMB/30s, %.1fMB/min avg) ArrowPool=%.1fMB "
             "PyObj=%d(+%d) ShmStore=%.0fMB Total=%.0fMB pending=%s",
-            rss_mb, rss_delta, total_rate, arrow_alloc_mb,
+            rss_mb, peak_rss_mb, rss_delta, total_rate, arrow_alloc_mb,
             obj_count, obj_delta, shm_mb, total_mb, buf_rows,
         )
-        logger.warning("[mem-types] %s", top_types_str)
+        if top_types_str:
+            logger.warning("[mem-types] %s", top_types_str)
         logger.warning("[mem-shm] %s", shm_info)
 
         get_collector_logger().log(
@@ -240,6 +242,7 @@ class SDKCollector:
             seq_gaps_total=sum(snap["gaps"].values()),
             seq_gap_size_total=sum(snap["gap_size"].values()),
             rss_mb=round(rss_mb, 1),
+            peak_rss_mb=round(peak_rss_mb, 1),
             rss_delta_mb=round(rss_delta, 1),
             rss_rate_mb_per_min=round(total_rate, 1),
             arrow_pool_mb=round(arrow_alloc_mb, 1),
@@ -267,13 +270,26 @@ class SDKCollector:
 
     def start(self) -> None:
         logger.info("[sdk] collector starting config=%s", self.config)
+        max_runtime_minutes = int(os.getenv("COLLECTOR_MAX_RUNTIME_MINUTES", "0"))
         if os.getenv("SHM_CLEAR_ON_START", "true").lower() in ("1", "true", "yes", "on"):
             self.store.clear_rolling()
         self._load_daily_basic()
         self._flush_thread.start()
         self._connect()
+        start_time = time.time()
         while not self._stop.is_set():
             self._stop.wait(1.0)
+            if max_runtime_minutes > 0:
+                elapsed_min = (time.time() - start_time) / 60.0
+                if elapsed_min >= max_runtime_minutes:
+                    logger.warning(
+                        "[sdk] reached max runtime %d minutes (elapsed=%.1f), graceful restart",
+                        max_runtime_minutes, elapsed_min,
+                    )
+                    get_collector_logger().log("sdk_graceful_restart",
+                                               elapsed_min=round(elapsed_min, 1),
+                                               max_runtime_minutes=max_runtime_minutes)
+                    break
 
     def stop(self) -> None:
         self._stop.set()
@@ -311,6 +327,19 @@ def _shm_store_stats() -> tuple:
             parts.append(f"{dtype}={len(files)}files/{size / 1024 / 1024:.1f}MB")
     parts.append(f"total={total_files}files/{total_bytes / 1024 / 1024:.1f}MB")
     return " ".join(parts), total_bytes
+
+
+def _current_rss_mb() -> float:
+    """Return current resident set size, not Linux ru_maxrss high-water mark."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return int(parts[1]) / 1024
+    except Exception:
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def _quick_release() -> None:
