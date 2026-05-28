@@ -51,7 +51,8 @@ class SDKCollector:
         self._stats: Dict[str, int] = defaultdict(int)
         self._last_rolling_cleanup = 0.0
         self._rolling_cleanup_interval = max(float(os.getenv("SHM_CLEANUP_INTERVAL_SECONDS", "5")), 1.0)
-        self._last_pipeline_status_log = 0.0
+        self._last_status_log = 0.0
+        self._last_mem_log = 0.0
         self._last_gc = time.time()
         # 内存增长趋势追踪
         self._prev_rss_mb = 0.0
@@ -133,9 +134,9 @@ class SDKCollector:
             self._flush_event.clear()
             self._flush_all()
             now = time.time()
-            if now - self._last_pipeline_status_log >= 5:
+            if now - self._last_status_log >= 5:
                 self._log_status(now)
-                self._last_pipeline_status_log = now
+                self._last_status_log = now
             if now - self._last_rolling_cleanup >= self._rolling_cleanup_interval:
                 self.store.cleanup_rolling()
                 self._last_rolling_cleanup = now
@@ -185,9 +186,9 @@ class SDKCollector:
             snap["gaps"],
         )
         # 每 30 秒输出一次内存详情（含诊断信息）
-        if now - self._last_pipeline_status_log < 30:
+        if now - self._last_mem_log < 30:
             return
-        self._last_pipeline_status_log = now
+        self._last_mem_log = now
 
         rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         rss_mb = rss_kb / 1024
