@@ -140,6 +140,62 @@ class StockState:
         if t.zfill(20) > current.zfill(20):
             self._last_market_time_raw = t
 
+    def _update_market_time_raw(self, raw_time: str) -> None:
+        """Update market time using raw string (HHMMSSmmm format). No allocation."""
+        current = self._last_market_time_raw
+        if len(raw_time) > len(current) or (len(raw_time) == len(current) and raw_time > current):
+            self._last_market_time_raw = raw_time
+
+    # ------------------------------------------------------------------ #
+    # Scalar update methods (for combined engine, zero Python objects)    #
+    # ------------------------------------------------------------------ #
+
+    def update_tick_scalar(self, price: float, pre_close: float, open_p: float,
+                           high: float, low: float, ask1: float, bid1: float,
+                           ask_vol1: int, bid_vol1: int, raw_time: str) -> None:
+        """Incremental tick update from scalar values. No DataFrame/Arrow allocation."""
+        self.tick_count += 1
+        if price > 0:
+            if self.open == 0.0:
+                self.open = price
+            self.latest_price = price
+            self.high = max(self.high, price)
+            if price < self.low:
+                self.low = price
+        if pre_close > 0:
+            self.pre_close = pre_close
+        if ask1 > 0:
+            self.ask1 = ask1
+        if bid1 > 0:
+            self.bid1 = bid1
+        self.ask_volume1 = ask_vol1
+        self.bid_volume1 = bid_vol1
+        self.last_tick_time = raw_time
+        self._update_market_time_raw(raw_time)
+
+    def update_deal_scalar(self, price: float, volume: float, raw_time: str) -> None:
+        """Incremental deal update from scalar values."""
+        self.deal_count += 1
+        self.cum_amount += price * volume
+        self.cum_volume += int(volume)
+        self.last_deal_time = raw_time
+        self._update_market_time_raw(raw_time)
+
+    def update_order_scalar(self, side: int, volume: float, order_type: int,
+                            raw_time: str) -> None:
+        """Incremental order update from scalar values."""
+        self.order_count += 1
+        if side == 0:
+            self.buy_order_count += 1
+            self.buy_order_volume += int(volume)
+        elif side == 1:
+            self.sell_order_count += 1
+            self.sell_order_volume += int(volume)
+        if order_type == 5:
+            self.cancel_count += 1
+        self.last_order_time = raw_time
+        self._update_market_time_raw(raw_time)
+
     @property
     def last_market_time(self) -> str:
         """所有数据类型中最新的行情时间。"""

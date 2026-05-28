@@ -1,0 +1,117 @@
+# combined-engine：合并 collector + live-engine 为单 Pod
+# pymdl 回调直接更新 StockState，无需 Arrow/ShmStore IPC
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: combined-engine
+  namespace: quant
+  labels:
+    app: combined-engine
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: combined-engine
+  template:
+    metadata:
+      labels:
+        app: combined-engine
+    spec:
+      nodeSelector:
+        role: live-trading
+      tolerations:
+        - key: role
+          operator: Equal
+          value: live-trading
+          effect: NoSchedule
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
+      hostNetwork: true
+      dnsPolicy: Default
+      containers:
+        - name: combined-engine
+          image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+          command: ["python", "-m", "quant_platform.live_engine.combined_engine"]
+          env:
+            # --- pymdl SDK ---
+            - name: MDL_SERVER
+              value: 127.0.0.1:9012
+            - name: MDL_IO_THREADS
+              value: "4"
+            - name: MDL_CALLBACK_MULTITHREAD
+              value: "false"
+            - name: MDL_ENCODING
+              value: "1"
+            - name: MDL_ENABLE_MERGE
+              value: "false"
+            - name: MDL_SUBS
+              value: "4.4,4.24,6.28,6.33,6.36"
+            - name: MDL_FLUSH_INTERVAL_MS
+              value: "10"
+            - name: MDL_BATCH_SIZE
+              value: "2000"
+            - name: MDL_QUEUE_WARN_SIZE
+              value: "50000"
+            - name: MDL_QUEUE_HARD_LIMIT
+              value: "200000"
+            - name: MDL_LOG_PATH
+              value: /data/quant/mdl_logs/mdl
+            # --- 因子计算 ---
+            - name: FACTOR_MODULE
+              value: "quant_platform.factor.examples.live_momentum"
+            - name: COMPUTE_INTERVAL
+              value: "60"
+            - name: UNIVERSE
+              value: ""
+            - name: FACTOR_OUTPUT_PATH
+              value: /data/factors
+            - name: DAILY_BASIC_MARKET_COUNT
+              value: "5"
+            # --- 通用 ---
+            - name: TZ
+              value: Asia/Shanghai
+            - name: LOG_LEVEL
+              value: INFO
+            - name: PIPELINE_LOG_DIR
+              value: /data/quant/pipeline_logs
+            - name: PIPELINE_LOG_FALLBACK_DIR
+              value: /tmp/quant_pipeline_logs
+            # --- 内存保护 ---
+            - name: COLLECTOR_MEM_LIMIT_MB
+              value: "5120"
+            - name: COLLECTOR_MAX_RUNTIME_MINUTES
+              value: "0"
+          envFrom:
+            - secretRef:
+                name: quant-secrets
+          volumeMounts:
+            - name: factor-output
+              mountPath: /data/factors
+            - name: pipeline-logs
+              mountPath: /data/quant/pipeline_logs
+            - name: mdl-logs
+              mountPath: /data/quant/mdl_logs
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+      volumes:
+        - name: factor-output
+          hostPath:
+            path: /data/quant/factors
+            type: DirectoryOrCreate
+        - name: pipeline-logs
+          hostPath:
+            path: /data/quant/pipeline_logs
+            type: DirectoryOrCreate
+        - name: mdl-logs
+          hostPath:
+            path: /data/quant/mdl_logs
+            type: DirectoryOrCreate
