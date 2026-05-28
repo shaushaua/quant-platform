@@ -20,6 +20,8 @@ spec:
       labels:
         app: combined-engine
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         quant.lianghua.io/combined-engine: "true"
       tolerations:
@@ -101,10 +103,10 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: 32Gi
+              memory: 64Gi
             limits:
-              cpu: "10"
-              memory: 80Gi
+              cpu: "12"
+              memory: 90Gi
       volumes:
         - name: factor-output
           hostPath:

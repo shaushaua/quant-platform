@@ -375,6 +375,7 @@ class CombinedEngine:
         )
         self._subscriber = self._io_man.CreateSubscriber(callback, self.config.callback_multithread)
         self._subscriber.SetServerAddress(self.config.server)
+        logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
         if self.config.token:
             self._subscriber.SetUserName(self.config.token)
         self._subscriber.SetMessageEncoding(self.config.encoding)
