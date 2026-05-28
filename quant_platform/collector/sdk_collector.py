@@ -215,13 +215,15 @@ class SDKCollector:
         top_types_str = " ".join(f"{name}={count}" for name, count in top_types)
 
         # /dev/shm chunk 文件数和大小
-        shm_info = _shm_store_stats()
+        shm_info, shm_bytes = _shm_store_stats()
+        shm_mb = shm_bytes / 1024 / 1024
+        total_mb = rss_mb + shm_mb  # 进程 RSS + tmpfs 文件
 
         logger.warning(
             "[mem] RSS=%.0fMB (+%.1fMB/30s, %.1fMB/min avg) ArrowPool=%.1fMB "
-            "PyObj=%d(+%d) pending=%s",
+            "PyObj=%d(+%d) ShmStore=%.0fMB Total=%.0fMB pending=%s",
             rss_mb, rss_delta, total_rate, arrow_alloc_mb,
-            obj_count, obj_delta, buf_rows,
+            obj_count, obj_delta, shm_mb, total_mb, buf_rows,
         )
         logger.warning("[mem-types] %s", top_types_str)
         logger.warning("[mem-shm] %s", shm_info)
@@ -250,11 +252,17 @@ class SDKCollector:
         self._prev_rss_mb = rss_mb
         self._prev_obj_count = obj_count
 
-        # RSS 自保护：超限主动退出，K8s 会重启 pod（比 OOM 驱逐更优雅）
-        rss_limit_mb = int(os.environ.get("COLLECTOR_RSS_LIMIT_MB", "12288"))
-        if rss_mb > rss_limit_mb:
-            logger.error("[mem] RSS=%.0fMB 超过限制 %dMB，主动退出", rss_mb, rss_limit_mb)
-            get_collector_logger().log("sdk_oom_self_kill", rss_mb=round(rss_mb, 1), limit_mb=rss_limit_mb)
+        # 自保护：RSS + /dev/shm 文件总大小超限，主动退出
+        # tmpfs 文件也在吃节点内存，不能只看进程 RSS
+        mem_limit_mb = int(os.environ.get("COLLECTOR_MEM_LIMIT_MB", "8192"))
+        if total_mb > mem_limit_mb:
+            logger.error("[mem] Total=%.0fMB (RSS=%.0fMB + Shm=%.0fMB) 超过限制 %dMB，主动退出",
+                         total_mb, rss_mb, shm_mb, mem_limit_mb)
+            get_collector_logger().log("sdk_oom_self_kill",
+                                       total_mb=round(total_mb, 1),
+                                       rss_mb=round(rss_mb, 1),
+                                       shm_mb=round(shm_mb, 1),
+                                       limit_mb=mem_limit_mb)
             self.stop()
 
     def start(self) -> None:
@@ -284,8 +292,8 @@ class SDKCollector:
         logger.info("[sdk] collector stopped")
 
 
-def _shm_store_stats() -> str:
-    """统计 /dev/shm chunk 文件数和大小，辅助定位内存去向。"""
+def _shm_store_stats() -> tuple:
+    """统计 /dev/shm chunk 文件数和大小。返回 (描述字符串, 总字节数)。"""
     from pathlib import Path
     shm_base = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
     parts = []
@@ -302,7 +310,7 @@ def _shm_store_stats() -> str:
         if files:
             parts.append(f"{dtype}={len(files)}files/{size / 1024 / 1024:.1f}MB")
     parts.append(f"total={total_files}files/{total_bytes / 1024 / 1024:.1f}MB")
-    return " ".join(parts)
+    return " ".join(parts), total_bytes
 
 
 def _quick_release() -> None:
