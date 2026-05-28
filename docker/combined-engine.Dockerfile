@@ -1,11 +1,12 @@
-# Combined Engine: pymdl SDK + factor computation in single process.
-# Extends backtest-base for the full Python/runtime dependency set, but does
-# not depend on sdk-collector.
-# Build context must include vendor/pymdl/pymdl-2.13.232-py3.tar.gz.
+# Combined Engine: feeder_client sidecar + pymdl SDK + factor computation.
+# Extends backtest-base for the full Python/runtime dependency set.
+# Build context must include:
+#   vendor/pymdl/pymdl-2.13.232-py3.tar.gz
+#   vendor/mdl-client/mdl_forward_2.13.232_linux.tar.gz
 
 FROM 172.24.99.176:5000/quant-platform/backtest-base:latest
 
-LABEL description="Combined engine: pymdl SDK + MemoryStore + factor computation"
+LABEL description="Combined engine: MDL client sidecar + pymdl SDK + MemoryStore + factor computation"
 
 WORKDIR /app
 
@@ -22,11 +23,25 @@ RUN pip install --no-cache-dir "setuptools<70" \
     && python -c "import pymdl; print('pymdl import ok')" \
     && rm -f /tmp/pymdl-2.13.232-py3.tar.gz
 
+# Install MDL Linux client (feeder_client sidecar)
+COPY vendor/mdl-client/mdl_forward_2.13.232_linux.tar.gz /tmp/
+RUN mkdir -p /opt/mdl-client \
+    && tar xzf /tmp/mdl_forward_2.13.232_linux.tar.gz -C /opt/mdl-client \
+    && chmod +x /opt/mdl-client/feeder_client \
+    && rm -f /tmp/mdl_forward_2.13.232_linux.tar.gz
+
+# Copy entrypoint script (starts feeder_client then Python engine)
+COPY docker/entrypoint-combined.sh /app/entrypoint-combined.sh
+RUN chmod +x /app/entrypoint-combined.sh
+
 # Copy latest framework code over the base image copy.
 COPY quant_platform/ ./quant_platform/
 
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/pymdl:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/site-packages/pymdl:/opt/mdl-client:${LD_LIBRARY_PATH}
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 ENV MALLOC_ARENA_MAX=1
 
-CMD ["python", "-m", "quant_platform.live_engine.combined_engine"]
+# MDL client log directory
+RUN mkdir -p /data/quant/mdl_logs/client
+
+ENTRYPOINT ["/app/entrypoint-combined.sh"]

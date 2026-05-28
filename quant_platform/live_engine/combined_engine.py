@@ -371,51 +371,70 @@ class CombinedEngine:
         except Exception:
             pass
 
-        logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
-
         # Single callback instance shared by all subscribers (per SDK sample code)
         self._callbacks = [create_direct_callback(
             pymdl, self._buffers, self.states, self._lock, self.trading_day, self.tracker,
         )]
         callback = self._callbacks[0]
 
-        # SH L2 and SZ L2 use different servers per MDL documentation:
-        # SH L2: mdl-sse01.datayes.com:19010 / appa-mdl-sse-private.datayes.com:19010
-        # SZ L2: mdl-cloud-sh.datayes.com:19012
-        sh_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 4]
-        sz_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 6]
-
-        conn_groups = [
-            ("SH-L2", self.config.server_sh, sh_subs),
-            ("SZ-L2", self.config.server, sz_subs),
-        ]
-
-        for label, server, subs in conn_groups:
-            if not subs:
-                continue
-            sub = self._io_man.CreateSubscriber(callback, True)  # multithread=True per sample
-            sub.SetServerAddress(server)
-            sub.SetUserName(self.config.token)  # SDK doc: SetUserName sets the 32-char token
-            sub.SetSendMacAuth(True)  # 上证云服务器要求 MAC 地址验证
-            sub.SetMessageEncoding(self.config.encoding)
-            sub.EnableMergeMessage(self.config.enable_merge)
+        if self.config.use_local_client:
+            # Local mode: connect to feeder_client sidecar on 127.0.0.1:9012
+            # Single subscriber, all services on one connection, no token/MAC needed
+            sub = self._io_man.CreateSubscriber(callback, True)
+            sub.SetServerAddress(self.config.server)  # 127.0.0.1:9012
+            sub.SetMessageEncoding(self.config.encoding)  # 1 (uncompressed for local)
+            sub.EnableMergeMessage(self.config.enable_merge)  # False for local
             sub.SetHeartbeatInterval(self.config.heartbeat_interval)
             sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
-            for service_id, message_id in subs:
+            for service_id, message_id in self.config.subs:
                 sub.AddSubscription(service_id, 101, message_id)
-                logger.info("[combined] subscribe %s.%s (%s -> %s)", service_id, message_id, label, server)
+                logger.info("[combined] subscribe %s.%s (local -> %s)", service_id, message_id, self.config.server)
             err = sub.Connect()
             if err:
                 if isinstance(err, bytes):
                     err = err.decode("GBK", errors="replace")
-                logger.warning("[combined] MDL Connect %s failed: %s (continuing with other connections)", label, err)
-                continue
+                raise RuntimeError(f"MDL Connect local failed: {err}")
             self._subscribers.append(sub)
-            logger.info("[combined] %s connected to %s", label, server)
+            logger.info("[combined] connected to local feeder_client %s", self.config.server)
+        else:
+            # Remote cloud mode: direct connection to MDL cloud servers
+            # SH L2 and SZ L2 may need different servers
+            logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
 
-        if not self._subscribers:
-            raise RuntimeError("All MDL connections failed, cannot start engine")
-        logger.info("[combined] %d/%d connections established", len(self._subscribers), len(conn_groups))
+            sh_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 4]
+            sz_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 6]
+
+            conn_groups = [
+                ("SH-L2", self.config.server_sh, sh_subs),
+                ("SZ-L2", self.config.server, sz_subs),
+            ]
+
+            for label, server, subs in conn_groups:
+                if not subs:
+                    continue
+                sub = self._io_man.CreateSubscriber(callback, True)
+                sub.SetServerAddress(server)
+                sub.SetUserName(self.config.token)
+                sub.SetSendMacAuth(True)
+                sub.SetMessageEncoding(self.config.encoding)
+                sub.EnableMergeMessage(self.config.enable_merge)
+                sub.SetHeartbeatInterval(self.config.heartbeat_interval)
+                sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
+                for service_id, message_id in subs:
+                    sub.AddSubscription(service_id, 101, message_id)
+                    logger.info("[combined] subscribe %s.%s (%s -> %s)", service_id, message_id, label, server)
+                err = sub.Connect()
+                if err:
+                    if isinstance(err, bytes):
+                        err = err.decode("GBK", errors="replace")
+                    logger.warning("[combined] MDL Connect %s failed: %s (continuing with other connections)", label, err)
+                    continue
+                self._subscribers.append(sub)
+                logger.info("[combined] %s connected to %s", label, server)
+
+            if not self._subscribers:
+                raise RuntimeError("All MDL connections failed, cannot start engine")
+            logger.info("[combined] %d/%d connections established", len(self._subscribers), len(conn_groups))
 
     # ------------------------------------------------------------------ #
     # ArrowBuffer flush → DataFrame                                        #

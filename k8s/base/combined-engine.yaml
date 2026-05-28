@@ -31,22 +31,15 @@ spec:
       containers:
         - name: combined-engine
           image: 172.24.99.176:5000/quant-platform/combined-engine:latest
-          command: ["python", "-m", "quant_platform.live_engine.combined_engine"]
           env:
-            # --- pymdl SDK (remote) ---
-            - name: MDL_SERVER
-              value: "mdl-cloud-sh.datayes.com:19012"
-            - name: MDL_SERVER_SH
-              value: "mdl-cloud-sh.datayes.com:19012"
-            # MDL_TOKEN 从 secret 注入
+            # --- pymdl SDK (local feeder_client sidecar) ---
+            - name: MDL_USE_LOCAL_CLIENT
+              value: "true"
+            # MDL_TOKEN 从 secret 注入，供 feeder_client.cfg 使用
             - name: MDL_IO_THREADS
               value: "4"
             - name: MDL_CALLBACK_MULTITHREAD
               value: "false"
-            - name: MDL_ENCODING
-              value: "7"
-            - name: MDL_ENABLE_MERGE
-              value: "true"
             - name: MDL_SUBS
               value: "4.4,4.24,6.28,6.33,6.36"
             - name: MDL_FLUSH_INTERVAL_MS

@@ -11,6 +11,8 @@ Subscription = Tuple[int, int]
 
 @dataclass(frozen=True)
 class SDKCollectorConfig:
+    # Local mode: connect to feeder_client sidecar on localhost
+    use_local_client: bool = False
     # Remote MDL cloud: token-based auth, no password needed
     # SZ L2 server (19012 port)
     server: str = "mdl-cloud-sh.datayes.com:19012"
@@ -52,14 +54,32 @@ def _parse_subs(raw: str) -> Tuple[Subscription, ...]:
 
 def load_config() -> SDKCollectorConfig:
     default_subs = "4.4,4.24,6.28,6.33,6.36"
+    use_local = _env_bool("MDL_USE_LOCAL_CLIENT", False)
+
+    if use_local:
+        # Local mode: feeder_client sidecar on localhost, no compression/token needed
+        defaults = dict(
+            use_local_client=True,
+            server="127.0.0.1:9012",
+            server_sh="127.0.0.1:9012",
+            token="",
+            encoding=1,
+            enable_merge=False,
+        )
+    else:
+        defaults = dict(
+            use_local_client=False,
+            server=os.getenv("MDL_SERVER", "mdl-cloud-sh.datayes.com:19012"),
+            server_sh=os.getenv("MDL_SERVER_SH", "mdl-sse01.datayes.com:19010"),
+            token=os.getenv("MDL_TOKEN", ""),
+            encoding=int(os.getenv("MDL_ENCODING", "7")),
+            enable_merge=_env_bool("MDL_ENABLE_MERGE", True),
+        )
+
     return SDKCollectorConfig(
-        server=os.getenv("MDL_SERVER", "mdl-cloud-sh.datayes.com:19012"),
-        server_sh=os.getenv("MDL_SERVER_SH", "mdl-sse01.datayes.com:19010"),
-        token=os.getenv("MDL_TOKEN", ""),
+        **defaults,
         io_threads=int(os.getenv("MDL_IO_THREADS", "4")),
         callback_multithread=_env_bool("MDL_CALLBACK_MULTITHREAD", True),
-        encoding=int(os.getenv("MDL_ENCODING", "7")),
-        enable_merge=_env_bool("MDL_ENABLE_MERGE", True),
         heartbeat_interval=int(os.getenv("MDL_HEARTBEAT_INTERVAL", "10")),
         heartbeat_timeout=int(os.getenv("MDL_HEARTBEAT_TIMEOUT", "30")),
         flush_interval_ms=int(os.getenv("MDL_FLUSH_INTERVAL_MS", "10")),
