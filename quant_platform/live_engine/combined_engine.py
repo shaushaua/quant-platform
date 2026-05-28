@@ -287,7 +287,7 @@ class CombinedEngine:
         self.config: SDKCollectorConfig = load_config()
         self._io_man = None
         self._subscribers = []  # multiple subscribers: SH L2 + SZ L2
-        self._callback = None
+        self._callbacks = []    # keep callback references to prevent GC
         self.tracker = SequenceTracker()
 
         # ArrowBuffers for raw data (same as collector)
@@ -371,13 +371,16 @@ class CombinedEngine:
         except Exception:
             pass
 
-        self._callback = create_direct_callback(
-            pymdl, self._buffers, self.states, self._lock, self.trading_day, self.tracker,
-        )
         logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
 
+        # Single callback instance shared by all subscribers (per SDK sample code)
+        self._callbacks = [create_direct_callback(
+            pymdl, self._buffers, self.states, self._lock, self.trading_day, self.tracker,
+        )]
+        callback = self._callbacks[0]
+
         # SH L2 and SZ L2 use different servers per MDL documentation:
-        # SH L2: mdl-sse01.datayes.com:19010
+        # SH L2: mdl-sse01.datayes.com:19010 / appa-mdl-sse-private.datayes.com:19010
         # SZ L2: mdl-cloud-sh.datayes.com:19012
         sh_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 4]
         sz_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 6]
@@ -390,10 +393,13 @@ class CombinedEngine:
         for label, server, subs in conn_groups:
             if not subs:
                 continue
-            sub = self._io_man.CreateSubscriber(self._callback, self.config.callback_multithread)
+            sub = self._io_man.CreateSubscriber(callback, True)  # multithread=True per sample
             sub.SetServerAddress(server)
-            if self.config.token:
-                sub.SetUserName(self.config.token)
+            sub.SetMessageEncoding(self.config.encoding)
+            sub.EnableMergeMessage(self.config.enable_merge)
+            sub.SetHeartbeatInterval(self.config.heartbeat_interval)
+            sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
+            sub.SetUserName(self.config.token)  # token after server/encoding per sample
             sub.SetMessageEncoding(self.config.encoding)
             sub.EnableMergeMessage(self.config.enable_merge)
             sub.SetHeartbeatInterval(self.config.heartbeat_interval)
