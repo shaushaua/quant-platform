@@ -85,18 +85,12 @@ def create_direct_callback(
     tracker: SequenceTracker,
 ):
     """Create pymdl callback that appends to per-stock lists AND updates StockState.
-    No ArrowBuffer involved — extract_*_tuple + append_* runs in ~5μs/msg."""
+    Lock-free hot path: CPython GIL guarantees dict.get/set atomicity.
+    Wall clock sampled once per callback invocation, not per stock."""
+
+    _datetime = datetime  # local ref for speed
 
     class DirectCallback(pymdl.MsgCallback):
-        def _get_or_create(self, code: str) -> StockState:
-            state = states.get(code)
-            if state is None:
-                state = StockState(code=code)
-                states[code] = state
-            # Wall clock as seconds since midnight (comparable with _time_to_seconds)
-            now = datetime.now()
-            state.last_update_ts = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
-            return state
 
         def _observe(self, hd) -> None:
             gap = tracker.observe(int(hd.ServiceID), int(hd.MessageID), int(hd.SequenceID))
@@ -133,34 +127,37 @@ def create_direct_callback(
                 self._observe(hd)
                 msg = pymdl.mdl_shl2_msg.Read(hd.MessageID, buf)
                 trading_day = trading_day_getter()
+                now = _datetime.now()
+                wall_ts = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond * 1e-6
 
                 if hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_SHL2MarketData:
-                    # 1. Per-stock list append
                     result = extract_sh_tick_tuple(msg, trading_day, int(hd.SequenceID))
                     if result:
                         code, tup = result
                         memory_store.append_tick(code, tup)
 
-                        # 2. StockState scalar update
+                        state = states.get(code)
+                        if state is None:
+                            state = StockState(code=code)
+                            states[code] = state
+                        state.last_update_ts = wall_ts
                         raw_t = _raw_time(getattr(msg, "UpdateTime", ""))
                         asks = list(getattr(msg, "SellLevels", []) or [])
                         bids = list(getattr(msg, "BidLevels", []) or [])
-                        ask1 = _f(getattr(asks[0], "OrderPrice", 0)) if asks else 0.0
-                        bid1 = _f(getattr(bids[0], "OrderPrice", 0)) if bids else 0.0
-                        ask_v1 = _i(getattr(asks[0], "OrderVol", 0)) if asks else 0
-                        bid_v1 = _i(getattr(bids[0], "OrderVol", 0)) if bids else 0
-                        with lock:
-                            self._get_or_create(code).update_tick_scalar(
-                                _f(getattr(msg, "LastPrice", 0)),
-                                _f(getattr(msg, "PreCloPrice", 0)),
-                                _f(getattr(msg, "OpenPrice", 0)),
-                                _f(getattr(msg, "HighPrice", 0)),
-                                _f(getattr(msg, "LowPrice", 0)),
-                                ask1, bid1, ask_v1, bid_v1, raw_t,
-                            )
+                        state.update_tick_scalar(
+                            _f(getattr(msg, "LastPrice", 0)),
+                            _f(getattr(msg, "PreCloPrice", 0)),
+                            _f(getattr(msg, "OpenPrice", 0)),
+                            _f(getattr(msg, "HighPrice", 0)),
+                            _f(getattr(msg, "LowPrice", 0)),
+                            _f(getattr(asks[0], "OrderPrice", 0)) if asks else 0.0,
+                            _f(getattr(bids[0], "OrderPrice", 0)) if bids else 0.0,
+                            _i(getattr(asks[0], "OrderVol", 0)) if asks else 0,
+                            _i(getattr(bids[0], "OrderVol", 0)) if bids else 0,
+                            raw_t,
+                        )
 
                 elif hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_NGTSTick:
-                    # 1. Per-stock list append
                     result = extract_sh_ngts_tuple(msg, trading_day)
                     if result:
                         code, order_tup, deal_tup = result
@@ -169,25 +166,26 @@ def create_direct_callback(
                         if deal_tup is not None:
                             memory_store.append_deal(code, deal_tup)
 
-                        # 2. StockState scalar update
+                        state = states.get(code)
+                        if state is None:
+                            state = StockState(code=code)
+                            states[code] = state
+                        state.last_update_ts = wall_ts
                         typ = str(getattr(msg, "Type", "")).strip()
                         raw_t = _raw_time(getattr(msg, "TickTime", ""))
-                        side = _side_from_flag(getattr(msg, "TickBSFlag", ""))
-                        with lock:
-                            if typ in ("A", "D"):
-                                order_type = 2 if typ == "A" else 5
-                                self._get_or_create(code).update_order_scalar(
-                                    side,
-                                    _f(getattr(msg, "Qty", 0)),
-                                    order_type,
-                                    raw_t,
-                                )
-                            elif typ == "T":
-                                self._get_or_create(code).update_deal_scalar(
-                                    _f(getattr(msg, "Price", 0)),
-                                    _f(getattr(msg, "Qty", 0)),
-                                    raw_t,
-                                )
+                        if typ in ("A", "D"):
+                            state.update_order_scalar(
+                                _side_from_flag(getattr(msg, "TickBSFlag", "")),
+                                _f(getattr(msg, "Qty", 0)),
+                                2 if typ == "A" else 5,
+                                raw_t,
+                            )
+                        elif typ == "T":
+                            state.update_deal_scalar(
+                                _f(getattr(msg, "Price", 0)),
+                                _f(getattr(msg, "Qty", 0)),
+                                raw_t,
+                            )
 
                 del msg
             except Exception as exc:
@@ -202,66 +200,70 @@ def create_direct_callback(
                 self._observe(hd)
                 msg = pymdl.mdl_szl2_msg.Read(hd.MessageID, buf)
                 trading_day = trading_day_getter()
+                now = _datetime.now()
+                wall_ts = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond * 1e-6
 
                 if hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2:
-                    # 1. Per-stock list append
                     result = extract_sz_tick_tuple(msg, trading_day, int(hd.SequenceID))
                     if result:
                         code, tup = result
                         memory_store.append_tick(code, tup)
 
-                        # 2. StockState scalar update
+                        state = states.get(code)
+                        if state is None:
+                            state = StockState(code=code)
+                            states[code] = state
+                        state.last_update_ts = wall_ts
                         raw_t = _raw_time(getattr(msg, "UpdateTime", ""))
                         asks = list(getattr(msg, "AskPriceLevel", []) or [])
                         bids = list(getattr(msg, "BidPriceLevel", []) or [])
-                        ask1 = _f(getattr(asks[0], "Price", 0)) if asks else 0.0
-                        bid1 = _f(getattr(bids[0], "Price", 0)) if bids else 0.0
-                        ask_v1 = _i(getattr(asks[0], "Volume", 0)) if asks else 0
-                        bid_v1 = _i(getattr(bids[0], "Volume", 0)) if bids else 0
-                        with lock:
-                            self._get_or_create(code).update_tick_scalar(
-                                _f(getattr(msg, "LastPrice", 0)),
-                                _f(getattr(msg, "PreCloPrice", 0)),
-                                _f(getattr(msg, "OpenPrice", 0)),
-                                _f(getattr(msg, "HighPrice", 0)),
-                                _f(getattr(msg, "LowPrice", 0)),
-                                ask1, bid1, ask_v1, bid_v1, raw_t,
-                            )
+                        state.update_tick_scalar(
+                            _f(getattr(msg, "LastPrice", 0)),
+                            _f(getattr(msg, "PreCloPrice", 0)),
+                            _f(getattr(msg, "OpenPrice", 0)),
+                            _f(getattr(msg, "HighPrice", 0)),
+                            _f(getattr(msg, "LowPrice", 0)),
+                            _f(getattr(asks[0], "Price", 0)) if asks else 0.0,
+                            _f(getattr(bids[0], "Price", 0)) if bids else 0.0,
+                            _i(getattr(asks[0], "Volume", 0)) if asks else 0,
+                            _i(getattr(bids[0], "Volume", 0)) if bids else 0,
+                            raw_t,
+                        )
 
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Order300192_v2:
-                    # 1. Per-stock list append
                     result = extract_sz_order_tuple(msg, trading_day, int(hd.SequenceID))
                     if result:
                         code, tup = result
                         memory_store.append_order(code, tup)
 
-                        # 2. StockState scalar update
-                        raw_t = _raw_time(getattr(msg, "TransactTime", ""))
-                        side = {49: 0, 50: 1}.get(_i(getattr(msg, "Side", 0)), 10)
-                        order_type = {49: 1, 50: 2, 85: 3}.get(_i(getattr(msg, "OrdType", 0)), 0)
-                        with lock:
-                            self._get_or_create(code).update_order_scalar(
-                                side,
-                                _f(getattr(msg, "OrderQty", 0)),
-                                order_type,
-                                raw_t,
-                            )
+                        state = states.get(code)
+                        if state is None:
+                            state = StockState(code=code)
+                            states[code] = state
+                        state.last_update_ts = wall_ts
+                        state.update_order_scalar(
+                            {49: 0, 50: 1}.get(_i(getattr(msg, "Side", 0)), 10),
+                            _f(getattr(msg, "OrderQty", 0)),
+                            {49: 1, 50: 2, 85: 3}.get(_i(getattr(msg, "OrdType", 0)), 0),
+                            _raw_time(getattr(msg, "TransactTime", "")),
+                        )
 
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2:
-                    # 1. Per-stock list append
                     result = extract_sz_deal_tuple(msg, trading_day, int(hd.SequenceID))
                     if result:
                         code, tup = result
                         memory_store.append_deal(code, tup)
 
-                        # 2. StockState scalar update
-                        raw_t = _raw_time(getattr(msg, "TransactTime", ""))
-                        with lock:
-                            self._get_or_create(code).update_deal_scalar(
-                                _f(getattr(msg, "LastPx", 0)),
-                                _f(getattr(msg, "LastQty", 0)),
-                                raw_t,
-                            )
+                        state = states.get(code)
+                        if state is None:
+                            state = StockState(code=code)
+                            states[code] = state
+                        state.last_update_ts = wall_ts
+                        state.update_deal_scalar(
+                            _f(getattr(msg, "LastPx", 0)),
+                            _f(getattr(msg, "LastQty", 0)),
+                            _raw_time(getattr(msg, "TransactTime", "")),
+                        )
 
                 del msg
             except Exception as exc:
