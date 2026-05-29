@@ -41,13 +41,36 @@ cat > "$CFG_FILE" <<CFGEOF
         "FolderCountReserve" : 10
     },
     "Client" : {
-        "AutoConfig": {
-            "URL": "https://mdl01.datayes.com:19000/subscribe",
-            "Token": "${MDL_TOKEN}",
-            "Options": {
-                "UseCDN": false
+        "UpStreams" : [
+            {
+                "Address": "mdl-cloud-sh.datayes.com:19012",
+                "UserName": "${MDL_TOKEN}",
+                "Encoding": 7,
+                "EnableServerSelect": true,
+                "HeartbeatInterval": 10,
+                "HeartbeatTimeout": 30,
+                "Services": [
+                    {
+                        "Version": 101,
+                        "Messages": [28, 33, 36]
+                    }
+                ]
+            },
+            {
+                "Address": "mdl-cloud-sh.datayes.com:19014",
+                "UserName": "${MDL_TOKEN}",
+                "Encoding": 7,
+                "EnableServerSelect": true,
+                "HeartbeatInterval": 10,
+                "HeartbeatTimeout": 30,
+                "Services": [
+                    {
+                        "Version": 101,
+                        "Messages": [4, 24]
+                    }
+                ]
             }
-        }
+        ]
     }
 }
 CFGEOF
