@@ -51,7 +51,7 @@ cat > "$CFG_FILE" <<CFGEOF
                 "HeartbeatTimeout": 30,
                 "Services": [
                     {
-                        "Version": 101,
+                        "Name": "6.101",
                         "Messages": [28, 33, 36]
                     }
                 ]
@@ -65,7 +65,7 @@ cat > "$CFG_FILE" <<CFGEOF
                 "HeartbeatTimeout": 30,
                 "Services": [
                     {
-                        "Version": 101,
+                        "Name": "4.101",
                         "Messages": [4, 24]
                     }
                 ]
