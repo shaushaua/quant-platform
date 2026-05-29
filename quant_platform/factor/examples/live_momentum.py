@@ -23,12 +23,12 @@ Order (委托):
 """
 
 
-def factor_calculation(state, code, date, end_time):
+def factor_calculation(data, code, date, end_time):
     """
     实盘因子计算函数。
 
     Args:
-        state:    StockState，由 StreamingEngine 维护的聚合状态
+        data:     StockData（回测兼容，实盘模式下 data.state 有聚合状态）
         code:     股票代码
         date:     交易日 YYYYMMDD
         end_time: 截面时刻 HHMMSS
@@ -36,40 +36,85 @@ def factor_calculation(state, code, date, end_time):
     Returns:
         dict: 因子结果
     """
+    # 实盘模式通过 data.state 获取聚合状态，回测模式从 DataFrame 计算
+    state = data.state
+
+    if state is not None:
+        # --- 实盘模式：用 StockState 聚合值 ---
+        deal_count = state.deal_count
+        cum_volume = state.cum_volume
+        latest_price = state.latest_price
+        high = state.high
+        low = state.low
+        pre_close = state.pre_close
+        change_pct = state.change_pct
+        spread = state.spread
+        bid_volume1 = state.bid_volume1
+        ask_volume1 = state.ask_volume1
+        vwap = state.vwap
+        order_imbalance = state.order_imbalance
+        order_buy_vol_ratio = state.order_buy_vol_ratio
+        cancel_ratio = state.cancel_ratio
+        order_count = state.order_count
+    else:
+        # --- 回测模式：从 DataFrame 计算 ---
+        deal = data.l2_deal
+        tick = data.l1_tick
+
+        deal_count = len(deal)
+        cum_volume = int(deal["Volume"].sum()) if not deal.empty else 0
+        if not tick.empty:
+            latest_price = float(tick["CurrentPrice"].iloc[-1])
+            high = float(tick["HighPrice"].iloc[-1]) if "HighPrice" in tick.columns else 0
+            low = float(tick["LowPrice"].iloc[-1]) if "LowPrice" in tick.columns else 0
+            pre_close = float(tick["PreCloPrice"].iloc[-1]) if "PreCloPrice" in tick.columns else 0
+            change_pct = ((latest_price - pre_close) / pre_close * 100) if pre_close > 0 else 0
+            spread = 0.0
+            bid_volume1 = int(tick["BidVolume1"].iloc[-1]) if "BidVolume1" in tick.columns else 0
+            ask_volume1 = int(tick["AskVolume1"].iloc[-1]) if "AskVolume1" in tick.columns else 0
+        else:
+            latest_price = high = low = pre_close = change_pct = spread = 0
+            bid_volume1 = ask_volume1 = 0
+        vwap = 0
+        if cum_volume > 0 and not deal.empty:
+            total_amount = (deal["Price"] * deal["Volume"]).sum()
+            vwap = total_amount / cum_volume
+        order_imbalance = 0
+        order_buy_vol_ratio = 0
+        cancel_ratio = 0
+        order_count = len(data.l2_order)
+
     # --- Tick 衍生 ---
-    # 成交量比率：平均每笔成交量
-    vol_ratio = state.cum_volume / state.deal_count if state.deal_count > 0 else 0
+    vol_ratio = cum_volume / deal_count if deal_count > 0 else 0
 
-    # 价格位置：当前价在当日高低区间的位置
-    price_range = state.high - state.low if state.high > state.low else 0
-    price_pos = (state.latest_price - state.low) / price_range if price_range > 0 else 0.5
+    price_range = high - low if high > low else 0
+    price_pos = (latest_price - low) / price_range if price_range > 0 else 0.5
 
-    # 买卖压力（来自盘口）
-    total_lv = state.bid_volume1 + state.ask_volume1
-    buy_pressure = state.bid_volume1 / total_lv if total_lv > 0 else 0.5
+    total_lv = bid_volume1 + ask_volume1
+    buy_pressure = bid_volume1 / total_lv if total_lv > 0 else 0.5
 
     return {
         "code": code,
         "date": date,
         "end_time": end_time,
         # tick 衍生
-        "latest_price": state.latest_price,
-        "high": state.high,
-        "low": state.low if state.low != float('inf') else 0.0,
-        "change_pct": state.change_pct,
-        "spread": state.spread,
+        "latest_price": latest_price,
+        "high": high,
+        "low": low if low != float('inf') else 0.0,
+        "change_pct": change_pct,
+        "spread": spread,
         "price_pos": round(price_pos, 4),
         "buy_pressure": round(buy_pressure, 4),
         # deal 衍生
-        "vwap": state.vwap,
-        "total_vol": state.cum_volume,
-        "deal_count": state.deal_count,
+        "vwap": vwap,
+        "total_vol": cum_volume,
+        "deal_count": deal_count,
         "vol_ratio": round(vol_ratio, 2),
         # order 衍生
-        "order_imbalance": state.order_imbalance,
-        "order_buy_vol_ratio": state.order_buy_vol_ratio,
-        "cancel_ratio": state.cancel_ratio,
-        "order_count": state.order_count,
+        "order_imbalance": order_imbalance,
+        "order_buy_vol_ratio": order_buy_vol_ratio,
+        "cancel_ratio": cancel_ratio,
+        "order_count": order_count,
     }
 
 
@@ -85,9 +130,9 @@ def outfun(date, end_time, result_df):
         print(f"  VWAP 均值: {valid['vwap'].mean():.4f}")
         print(f"  总成交量: {valid['total_vol'].sum():,.0f}")
         print(f"  涨跌幅均值: {valid['change_pct'].mean():.4f}%")
-        imb = valid["order_imbalance"].dropna()
-        if not imb.empty:
-            print(f"  委托不平衡度均值: {imb.mean():.4f}")
+    imb = valid["order_imbalance"].dropna()
+    if not imb.empty:
+        print(f"  委托不平衡度均值: {imb.mean():.4f}")
     if "data_latency_ms" in result_df.columns:
         lat = result_df["data_latency_ms"].dropna()
         if not lat.empty:
