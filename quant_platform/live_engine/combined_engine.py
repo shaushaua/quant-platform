@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
@@ -343,6 +344,10 @@ class CombinedEngine:
         self._daily_basic_df: pd.DataFrame = pd.DataFrame()
 
         self._load_checkpoint()
+
+        # Thread pools for parallel processing
+        self._flush_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="flush")
+        self._compute_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="factor")
 
         logger.info(
             "[combined] init done: module=%s interval=%ds flush=%.0fms",
@@ -714,29 +719,32 @@ class CombinedEngine:
 
     def _flush_to_memory_store(self) -> int:
         """Flush ArrowBuffers, group by Code, write per-code DataFrames to MemoryStore.
+        Uses ThreadPoolExecutor to parallelize tick/deal/order processing.
         Returns total rows flushed."""
-        store = self._memory_store
-        archive_day = self._trading_day
         total_rows = 0
-        for kind in ("tick", "deal", "order"):
-            df = self._flush_buffer(kind)
-            if df.empty:
-                continue
-            total_rows += len(df)
-            # Archive to disk (existing logic)
-            self._enqueue_raw_archive(archive_day, kind, df)
-            # Group by Code → write to MemoryStore
-            groups = self._group_by_code(df)
-            if kind == "tick":
-                for code, g in groups.items():
-                    store.update_tick(code, g)
-            elif kind == "order":
-                for code, g in groups.items():
-                    store.update_order(code, g)
-            elif kind == "deal":
-                for code, g in groups.items():
-                    store.update_deal(code, g)
+        futures = {
+            self._flush_executor.submit(self._flush_one_kind, kind): kind
+            for kind in ("tick", "deal", "order")
+        }
+        for future in futures:
+            try:
+                total_rows += future.result()
+            except Exception as exc:
+                logger.warning("[flush] %s failed: %s", futures[future], exc)
         return total_rows
+
+    def _flush_one_kind(self, kind: str) -> int:
+        """Flush, archive, and write one data kind to MemoryStore."""
+        df = self._flush_buffer(kind)
+        if df.empty:
+            return 0
+        self._enqueue_raw_archive(self._trading_day, kind, df)
+        groups = self._group_by_code(df)
+        store = self._memory_store
+        method = {"tick": store.update_tick, "order": store.update_order, "deal": store.update_deal}[kind]
+        for code, g in groups.items():
+            method(code, g)
+        return len(df)
 
     # ------------------------------------------------------------------ #
     # Factor computation                                                   #
@@ -770,45 +778,33 @@ class CombinedEngine:
         logger.info("[combined] computing: date=%s end_time=%s stocks=%d",
                      date_str, end_time, len(all_codes))
 
-        # Per-stock computation
+        # Parallel per-stock computation
         t0 = time.time()
         results = []
-        for code in all_codes:
+        wall_secs = now.hour * 3600 + now.minute * 60 + now.second
+
+        futures = {
+            self._compute_executor.submit(
+                self._compute_stock, code, date_str, end_time, states_snapshot, wall_secs,
+            ): code
+            for code in all_codes
+        }
+        for future in as_completed(futures):
             try:
-                stock_data = StockData(
-                    code=code,
-                    date=date_str,
-                    end_time=end_time,
-                    l1_tick=store.get_tick(code),
-                    l2_deal=store.get_deal(code),
-                    l2_order=store.get_order(code),
-                    market=self._market_df,
-                    daily_basic=self._daily_basic_df,
-                    state=states_snapshot.get(code),
-                )
-                result = self.factor_calculation(stock_data, code, date_str, end_time)
+                result = future.result()
                 if result is not None:
-                    # Data latency
-                    state = states_snapshot.get(code)
-                    if state and state.last_market_time:
-                        market_secs = _time_to_seconds(state.last_market_time)
-                        if market_secs > 0:
-                            wall_secs = now.hour * 3600 + now.minute * 60 + now.second
-                            data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
-                            if abs(data_latency_ms) < 600_000:
-                                result["data_latency_ms"] = data_latency_ms
                     results.append(result)
             except Exception as exc:
-                logger.warning("[%s] factor failed: %s", code, exc)
+                logger.warning("[%s] factor failed: %s", futures[future], exc)
 
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
-        logger.info("[combined] computed: %d results in %.0fms", len(result_df), elapsed_ms)
+        logger.info("[combined] computed: %d results in %.0fms (parallel, 8 workers)", len(result_df), elapsed_ms)
 
         # Sample factor compute latency
         if states_snapshot:
             compute_now = datetime.now()
-            wall_secs = compute_now.hour * 3600 + compute_now.minute * 60 + compute_now.second
+            compute_wall_secs = compute_now.hour * 3600 + compute_now.minute * 60 + compute_now.second
             sample_codes = list(states_snapshot.keys())[:3]
             latency_parts = []
             for sc in sample_codes:
@@ -818,7 +814,7 @@ class CombinedEngine:
                     if mkt_secs > 0:
                         latency_parts.append(
                             f"{sc}: 行情={st.last_market_time} "
-                            f"因子计算延迟={round((wall_secs - mkt_secs) * 1000, 1)}ms"
+                            f"因子计算延迟={round((compute_wall_secs - mkt_secs) * 1000, 1)}ms"
                         )
             if latency_parts:
                 logger.info("[latency-factor] %s", " | ".join(latency_parts))
@@ -844,6 +840,32 @@ class CombinedEngine:
         pipe_log.log("factor_compute", date=date_str, end_time=end_time,
                       stocks=len(all_codes), results=len(result_df),
                       compute_ms=round(elapsed_ms, 1))
+
+    def _compute_stock(self, code: str, date_str: str, end_time: str,
+                       states_snapshot: Dict[str, StockState], wall_secs: float) -> Optional[dict]:
+        """Compute factor for a single stock (called from thread pool)."""
+        store = self._memory_store
+        stock_data = StockData(
+            code=code,
+            date=date_str,
+            end_time=end_time,
+            l1_tick=store.get_tick(code),
+            l2_deal=store.get_deal(code),
+            l2_order=store.get_order(code),
+            market=self._market_df,
+            daily_basic=self._daily_basic_df,
+            state=states_snapshot.get(code),
+        )
+        result = self.factor_calculation(stock_data, code, date_str, end_time)
+        if result is not None:
+            state = states_snapshot.get(code)
+            if state and state.last_market_time:
+                market_secs = _time_to_seconds(state.last_market_time)
+                if market_secs > 0:
+                    data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
+                    if abs(data_latency_ms) < 600_000:
+                        result["data_latency_ms"] = data_latency_ms
+        return result
 
         del result_df
 
@@ -1036,6 +1058,9 @@ class CombinedEngine:
                 self._io_man.Shutdown()
             except Exception:
                 pass
+        # Shutdown thread pools
+        self._flush_executor.shutdown(wait=False)
+        self._compute_executor.shutdown(wait=False)
         logger.info("[combined] engine stopped")
 
 
