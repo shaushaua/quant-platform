@@ -124,7 +124,7 @@ def _time_to_seconds(time_val) -> float:
     # 纯数字 HHMMSSmmm
     try:
         raw = s.replace('.', '').replace(':', '')
-        raw = raw.zfill(6)  # 至少 HHMMSS
+        raw = raw.zfill(9)  # HHMMSSmmm (至少9位，保证前导零不丢失)
         h = int(raw[0:2])
         m = int(raw[2:4])
         sec = int(raw[4:6])
