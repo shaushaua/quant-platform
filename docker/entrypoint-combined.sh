@@ -44,7 +44,8 @@ cat > "$CFG_FILE" <<CFGEOF
         "URL": "https://mdl01.datayes.com:19000/subscribe",
         "Token": "${MDL_TOKEN}",
         "Options": {
-            "UseCDN": false
+            "UseCDN": false,
+            "ExMsgs": "4.6,4.16,4.17,4.20,4.21,4.22,4.23,6.29,6.30,6.31,6.42,6.43,6.44,6.45,6.46,6.47,6.50,6.51,6.54"
         }
     }
 }
