@@ -2,16 +2,21 @@
 """
 内存数据存储
 存储当天的实时数据，供策略直接读取
+
+内部使用 per-stock list 存储（而非 DataFrame），热路径 append 极快。
+get_* 方法按需惰性转换为 DataFrame。
 """
 
+import os
 import threading
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 
 import pandas as pd
-import numpy as np
+
+from ..core.constants import TICK_COLUMNS, ORDER_COLUMNS, DEAL_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +29,6 @@ class MemoryStore:
 
     使用方式:
         store = MemoryStore.get_instance()
-        df_1min = store.get_kline("1min")
         df_tick = store.get_tick("000001.XSHE")
     """
 
@@ -52,13 +56,16 @@ class MemoryStore:
 
     def _init_storage(self):
         """初始化存储结构"""
+        # 最大每股票存储行数
+        self._max_rows = int(os.environ.get("MAX_ROWS_PER_STOCK", "100000"))
+
         # 当前交易日
         self._trading_day: str = ""
 
-        # 逐笔数据（按股票代码索引）
-        self._tick: Dict[str, pd.DataFrame] = {}
-        self._order: Dict[str, pd.DataFrame] = {}
-        self._deal: Dict[str, pd.DataFrame] = {}
+        # Per-stock list 存储: code -> list[tuple]
+        self._tick_lists: Dict[str, list] = {}
+        self._order_lists: Dict[str, list] = {}
+        self._deal_lists: Dict[str, list] = {}
 
         # 最新行情快照
         self._quotes: Dict[str, dict] = {}
@@ -82,7 +89,7 @@ class MemoryStore:
         # 读写锁 (使用RLock，Python 3.12兼容)
         self._rw_lock = threading.RLock()
 
-        logger.info("MemoryStore 初始化完成")
+        logger.info("MemoryStore 初始化完成 (per-stock list 存储)")
 
     # ==================== 交易日管理 ====================
 
@@ -91,9 +98,9 @@ class MemoryStore:
         with self._rw_lock:
             self._trading_day = trading_day
             # 清空当天数据
-            self._tick.clear()
-            self._order.clear()
-            self._deal.clear()
+            self._tick_lists.clear()
+            self._order_lists.clear()
+            self._deal_lists.clear()
             self._quotes.clear()
             self._kline_state.clear()
             self._kline_1min = pd.DataFrame()
@@ -107,43 +114,66 @@ class MemoryStore:
         """获取当前交易日"""
         return self._trading_day
 
-    # ==================== 写入接口（采集器调用）====================
+    # ==================== 热路径写入（SDK callback 调用，~50K/sec）====================
 
-    def update_tick(self, code: str, df: pd.DataFrame):
-        """更新tick数据"""
-        with self._rw_lock:
-            if code not in self._tick:
-                self._tick[code] = df
-            else:
-                self._tick[code] = pd.concat(
-                    [self._tick[code], df],
-                    ignore_index=True
-                )
-            self._last_update[f"tick_{code}"] = datetime.now()
+    def append_tick(self, code: str, row_tuple: tuple) -> None:
+        """Append a single tick tuple (very fast)."""
+        lst = self._tick_lists.get(code)
+        if lst is None:
+            lst = []
+            self._tick_lists[code] = lst
+        lst.append(row_tuple)
+        if len(lst) > self._max_rows:
+            self._tick_lists[code] = lst[-self._max_rows:]
 
-    def update_order(self, code: str, df: pd.DataFrame):
-        """更新逐笔委托数据"""
-        with self._rw_lock:
-            if code not in self._order:
-                self._order[code] = df
-            else:
-                self._order[code] = pd.concat(
-                    [self._order[code], df],
-                    ignore_index=True
-                )
-            self._last_update[f"order_{code}"] = datetime.now()
+    def append_order(self, code: str, row_tuple: tuple) -> None:
+        """Append a single order tuple (very fast)."""
+        lst = self._order_lists.get(code)
+        if lst is None:
+            lst = []
+            self._order_lists[code] = lst
+        lst.append(row_tuple)
+        if len(lst) > self._max_rows:
+            self._order_lists[code] = lst[-self._max_rows:]
 
-    def update_deal(self, code: str, df: pd.DataFrame):
-        """更新逐笔成交数据"""
-        with self._rw_lock:
-            if code not in self._deal:
-                self._deal[code] = df
-            else:
-                self._deal[code] = pd.concat(
-                    [self._deal[code], df],
-                    ignore_index=True
-                )
-            self._last_update[f"deal_{code}"] = datetime.now()
+    def append_deal(self, code: str, row_tuple: tuple) -> None:
+        """Append a single deal tuple (very fast)."""
+        lst = self._deal_lists.get(code)
+        if lst is None:
+            lst = []
+            self._deal_lists[code] = lst
+        lst.append(row_tuple)
+        if len(lst) > self._max_rows:
+            self._deal_lists[code] = lst[-self._max_rows:]
+
+    # ==================== 兼容写入接口（采集器调用）====================
+
+    def update_tick(self, code: str, df: pd.DataFrame) -> None:
+        """Legacy: convert DataFrame to tuples and append."""
+        if df.empty:
+            return
+        for _, row in df.iterrows():
+            tup = tuple(row.get(c, 0) for c in TICK_COLUMNS)
+            self.append_tick(code, tup)
+        self._last_update[f"tick_{code}"] = datetime.now()
+
+    def update_order(self, code: str, df: pd.DataFrame) -> None:
+        """Legacy: convert DataFrame to tuples and append."""
+        if df.empty:
+            return
+        for _, row in df.iterrows():
+            tup = tuple(row.get(c, 0) for c in ORDER_COLUMNS)
+            self.append_order(code, tup)
+        self._last_update[f"order_{code}"] = datetime.now()
+
+    def update_deal(self, code: str, df: pd.DataFrame) -> None:
+        """Legacy: convert DataFrame to tuples and append."""
+        if df.empty:
+            return
+        for _, row in df.iterrows():
+            tup = tuple(row.get(c, 0) for c in DEAL_COLUMNS)
+            self.append_deal(code, tup)
+        self._last_update[f"deal_{code}"] = datetime.now()
 
     def update_quote(self, code: str, quote: dict):
         """更新最新行情"""
@@ -164,34 +194,61 @@ class MemoryStore:
             if hasattr(self, attr_name):
                 setattr(self, attr_name, df)
 
-    # ==================== 读取接口（策略调用）====================
+    # ==================== 读取接口（策略调用，惰性转 DataFrame）====================
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
-        """获取tick数据"""
+        """Get tick data as DataFrame. Converts from internal list on demand."""
         with self._rw_lock:
-            if code:
-                return self._tick.get(code, pd.DataFrame()).copy()
-            if not self._tick:
-                return pd.DataFrame()
-            return pd.concat(self._tick.values(), ignore_index=True)
+            if code is not None:
+                lst = self._tick_lists.get(code, [])
+                if not lst:
+                    return pd.DataFrame()
+                snapshot = list(lst)  # copy
+                return pd.DataFrame(snapshot, columns=TICK_COLUMNS)
+            else:
+                # All stocks combined
+                all_rows = []
+                for lst in self._tick_lists.values():
+                    all_rows.extend(lst)
+                if not all_rows:
+                    return pd.DataFrame()
+                return pd.DataFrame(all_rows, columns=TICK_COLUMNS)
 
     def get_order(self, code: Optional[str] = None) -> pd.DataFrame:
-        """获取逐笔委托数据"""
+        """Get order data as DataFrame. Converts from internal list on demand."""
         with self._rw_lock:
-            if code:
-                return self._order.get(code, pd.DataFrame()).copy()
-            if not self._order:
-                return pd.DataFrame()
-            return pd.concat(self._order.values(), ignore_index=True)
+            if code is not None:
+                lst = self._order_lists.get(code, [])
+                if not lst:
+                    return pd.DataFrame()
+                snapshot = list(lst)  # copy
+                return pd.DataFrame(snapshot, columns=ORDER_COLUMNS)
+            else:
+                # All stocks combined
+                all_rows = []
+                for lst in self._order_lists.values():
+                    all_rows.extend(lst)
+                if not all_rows:
+                    return pd.DataFrame()
+                return pd.DataFrame(all_rows, columns=ORDER_COLUMNS)
 
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
-        """获取逐笔成交数据"""
+        """Get deal data as DataFrame. Converts from internal list on demand."""
         with self._rw_lock:
-            if code:
-                return self._deal.get(code, pd.DataFrame()).copy()
-            if not self._deal:
-                return pd.DataFrame()
-            return pd.concat(self._deal.values(), ignore_index=True)
+            if code is not None:
+                lst = self._deal_lists.get(code, [])
+                if not lst:
+                    return pd.DataFrame()
+                snapshot = list(lst)  # copy
+                return pd.DataFrame(snapshot, columns=DEAL_COLUMNS)
+            else:
+                # All stocks combined
+                all_rows = []
+                for lst in self._deal_lists.values():
+                    all_rows.extend(lst)
+                if not all_rows:
+                    return pd.DataFrame()
+                return pd.DataFrame(all_rows, columns=DEAL_COLUMNS)
 
     def get_quote(self, code: str) -> dict:
         """获取单只股票最新行情"""
@@ -226,6 +283,22 @@ class MemoryStore:
     def get_all_stocks_10min(self) -> pd.DataFrame:
         """获取所有股票10分钟K线"""
         return self.get_kline("10min")
+
+    # ==================== 快照与清理（磁盘归档用）====================
+
+    def snapshot_and_clear(self, kind: str) -> Dict[str, list]:
+        """Swap out all per-stock lists for a data kind, returning the old data.
+        Caller gets all the data and internal lists are reset to empty."""
+        with self._rw_lock:
+            attr = f"_{kind}_lists"
+            old = getattr(self, attr)
+            result = {}
+            for code, lst in old.items():
+                if lst:
+                    result[code] = lst
+            # Reset all lists to empty (keep the same stock keys)
+            setattr(self, attr, {code: [] for code in old})
+            return result
 
     # ==================== K线聚合 ====================
 
@@ -289,15 +362,21 @@ class MemoryStore:
     def get_stats(self) -> dict:
         """获取存储统计信息"""
         with self._rw_lock:
-            tick_count = sum(len(df) for df in self._tick.values())
-            order_count = sum(len(df) for df in self._order.values())
-            deal_count = sum(len(df) for df in self._deal.values())
+            tick_total = sum(len(lst) for lst in self._tick_lists.values())
+            order_total = sum(len(lst) for lst in self._order_lists.values())
+            deal_total = sum(len(lst) for lst in self._deal_lists.values())
+            tick_stocks = len(self._tick_lists)
+            order_stocks = len(self._order_lists)
+            deal_stocks = len(self._deal_lists)
 
             return {
                 "trading_day": self._trading_day,
-                "tick_count": tick_count,
-                "order_count": order_count,
-                "deal_count": deal_count,
+                "tick_stocks": tick_stocks,
+                "tick_rows": tick_total,
+                "order_stocks": order_stocks,
+                "order_rows": order_total,
+                "deal_stocks": deal_stocks,
+                "deal_rows": deal_total,
                 "quote_count": len(self._quotes),
                 "kline_1min_count": len(self._kline_1min),
                 "kline_5min_count": len(self._kline_5min),
@@ -307,14 +386,25 @@ class MemoryStore:
             }
 
     def get_memory_usage(self) -> dict:
-        """获取内存使用情况"""
-        def get_df_memory(df: pd.DataFrame) -> int:
-            return df.memory_usage(deep=True).sum() if not df.empty else 0
+        """获取内存使用情况（基于 list 长度估算）"""
+        # Rough estimate: each tuple row ~ N floats/integers
+        # tick: ~80 columns * 8 bytes, order: ~10 * 8, deal: ~12 * 8
+        TICK_ROW_BYTES = len(TICK_COLUMNS) * 8
+        ORDER_ROW_BYTES = len(ORDER_COLUMNS) * 8
+        DEAL_ROW_BYTES = len(DEAL_COLUMNS) * 8
 
         with self._rw_lock:
-            tick_mem = sum(get_df_memory(df) for df in self._tick.values())
-            order_mem = sum(get_df_memory(df) for df in self._order.values())
-            deal_mem = sum(get_df_memory(df) for df in self._deal.values())
+            tick_rows = sum(len(lst) for lst in self._tick_lists.values())
+            order_rows = sum(len(lst) for lst in self._order_lists.values())
+            deal_rows = sum(len(lst) for lst in self._deal_lists.values())
+
+            tick_mem = tick_rows * TICK_ROW_BYTES
+            order_mem = order_rows * ORDER_ROW_BYTES
+            deal_mem = deal_rows * DEAL_ROW_BYTES
+
+            def get_df_memory(df: pd.DataFrame) -> int:
+                return df.memory_usage(deep=True).sum() if not df.empty else 0
+
             kline_mem = (
                 get_df_memory(self._kline_1min) +
                 get_df_memory(self._kline_5min) +

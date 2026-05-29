@@ -494,3 +494,297 @@ def frame_arrow(rows: List[Dict[str, Any]], kind: str) -> Optional[pa.RecordBatc
             arr = pa.array(values).cast(col_type, safe=False)
         arrays.append(arr)
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+
+# ================================================================== #
+# Tuple-extraction functions: return (code, tuple) from SDK messages #
+# ================================================================== #
+
+
+def _tick_levels_tuple(
+    bids: list, asks: list,
+    bid_price_attr: str, bid_vol_attr: str, bid_num_attr: str,
+    ask_price_attr: str, ask_vol_attr: str, ask_num_attr: str,
+) -> tuple:
+    """Build 60-element tuple for 10-level ask/bid data.
+
+    Order matches TICK_COLUMNS: AskPrice1-10, AskVolume1-10, AskNum1-10,
+    BidPrice1-10, BidVolume1-10, BidNum1-10.
+    """
+    ask_prices: list = [0.0] * 10
+    ask_volumes: list = [0.0] * 10
+    ask_nums: list = [0.0] * 10
+    bid_prices: list = [0.0] * 10
+    bid_volumes: list = [0.0] * 10
+    bid_nums: list = [0.0] * 10
+    for i in range(10):
+        ap, av, an = _level(asks, i, ask_price_attr, ask_vol_attr, ask_num_attr)
+        ask_prices[i] = ap
+        ask_volumes[i] = av
+        ask_nums[i] = an
+        bp, bv, bn = _level(bids, i, bid_price_attr, bid_vol_attr, bid_num_attr)
+        bid_prices[i] = bp
+        bid_volumes[i] = bv
+        bid_nums[i] = bn
+    return tuple(ask_prices + ask_volumes + ask_nums +
+                 bid_prices + bid_volumes + bid_nums)
+
+
+def extract_sh_tick_tuple(
+    msg: Any, trading_day: date, seq_id: int,
+) -> Optional[Tuple[str, tuple]]:
+    """Extract SH tick fields into an 81-element tuple matching TICK_COLUMNS order.
+
+    Returns ``(code, tuple)`` or ``None`` if the message is not a valid SH stock.
+    HighLimitPrice and LowLimitPrice are set to 0.0 for SH ticks.
+    """
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SH"):
+        return None
+    code = _code(msg.SecurityID, "SH")
+    event_time = _parse_mdl_time(getattr(msg, "UpdateTime", 0), trading_day)
+    td = str(trading_day)
+    row = (
+        # (0) TradingDay
+        td,
+        # (1) Code
+        code,
+        # (2) Time
+        event_time,
+        # (3) UpdateTime
+        event_time,
+        # (4) CurrentPrice
+        _f(getattr(msg, "LastPrice", 0)),
+        # (5) TotalVolume
+        _f(getattr(msg, "TradVolume", 0)),
+        # (6) TotalMoney
+        _f(getattr(msg, "Turnover", 0)),
+        # (7) PreClosePrice
+        _f(getattr(msg, "PreCloPrice", 0)),
+        # (8) OpenPrice
+        _f(getattr(msg, "OpenPrice", 0)),
+        # (9) HighestPrice
+        _f(getattr(msg, "HighPrice", 0)),
+        # (10) LowestPrice
+        _f(getattr(msg, "LowPrice", 0)),
+        # (11) HighLimitPrice
+        0.0,
+        # (12) LowLimitPrice
+        0.0,
+        # (13) IOPV
+        _f(getattr(msg, "IOPV", 0)),
+        # (14) TradeNum
+        _f(getattr(msg, "TradNumber", 0)),
+        # (15) TotalBidVolume
+        _f(getattr(msg, "TotalBidVol", 0)),
+        # (16) TotalAskVolume
+        _f(getattr(msg, "TotalAskVol", 0)),
+        # (17) AvgBidPrice
+        _f(getattr(msg, "WAvgBidPri", 0)),
+        # (18) AvgAskPrice
+        _f(getattr(msg, "WAvgAskPri", 0)),
+    )
+    bids = list(getattr(msg, "BidLevels", []) or [])
+    asks = list(getattr(msg, "SellLevels", []) or [])
+    levels = _tick_levels_tuple(
+        bids, asks,
+        "OrderPrice", "OrderVol", "OrderNum",
+        "OrderPrice", "OrderVol", "OrderNum",
+    )
+    # (19-78) 60-level elements + (79) Channel + (80) SeqNum
+    return code, row + levels + (0, seq_id)
+
+
+def extract_sz_tick_tuple(
+    msg: Any, trading_day: date, seq_id: int,
+) -> Optional[Tuple[str, tuple]]:
+    """Extract SZ tick fields into an 81-element tuple matching TICK_COLUMNS order.
+
+    Returns ``(code, tuple)`` or ``None`` if the message is not a valid SZ stock.
+    Uses SZ-specific field names (Volume, HighLimitPrice, LowLimitPrice, etc.).
+    """
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
+        return None
+    code = _code(msg.SecurityID, "SZ")
+    event_time = _parse_mdl_time(getattr(msg, "UpdateTime", 0), trading_day)
+    td = str(trading_day)
+    row = (
+        # (0) TradingDay
+        td,
+        # (1) Code
+        code,
+        # (2) Time
+        event_time,
+        # (3) UpdateTime
+        event_time,
+        # (4) CurrentPrice
+        _f(getattr(msg, "LastPrice", 0)),
+        # (5) TotalVolume
+        _f(getattr(msg, "Volume", 0)),
+        # (6) TotalMoney
+        _f(getattr(msg, "Turnover", 0)),
+        # (7) PreClosePrice
+        _f(getattr(msg, "PreCloPrice", 0)),
+        # (8) OpenPrice
+        _f(getattr(msg, "OpenPrice", 0)),
+        # (9) HighestPrice
+        _f(getattr(msg, "HighPrice", 0)),
+        # (10) LowestPrice
+        _f(getattr(msg, "LowPrice", 0)),
+        # (11) HighLimitPrice
+        _f(getattr(msg, "HighLimitPrice", 0)),
+        # (12) LowLimitPrice
+        _f(getattr(msg, "LowLimitPrice", 0)),
+        # (13) IOPV
+        _f(getattr(msg, "IOPV", 0)),
+        # (14) TradeNum
+        _f(getattr(msg, "TurnNum", 0)),
+        # (15) TotalBidVolume
+        _f(getattr(msg, "TotalBidQty", 0)),
+        # (16) TotalAskVolume
+        _f(getattr(msg, "TotalOfferQty", 0)),
+        # (17) AvgBidPrice
+        _f(getattr(msg, "WeightedAvgBidPx", 0)),
+        # (18) AvgAskPrice
+        _f(getattr(msg, "WeightedAvgOfferPx", 0)),
+    )
+    bids = list(getattr(msg, "BidPriceLevel", []) or [])
+    asks = list(getattr(msg, "AskPriceLevel", []) or [])
+    levels = _tick_levels_tuple(
+        bids, asks,
+        "Price", "Volume", "NumOrders",
+        "Price", "Volume", "NumOrders",
+    )
+    # (19-78) 60-level elements + (79) Channel + (80) SeqNum
+    return code, row + levels + (_i(getattr(msg, "ChannelNo", 0)), seq_id)
+
+
+def extract_sh_ngts_tuple(
+    msg: Any, trading_day: date,
+) -> Optional[Tuple[str, Optional[tuple], Optional[tuple]]]:
+    """Extract SH NGTS fields into order and/or deal tuples.
+
+    Returns ``(code, order_tuple_or_None, deal_tuple_or_None)`` where
+    ``order_tuple`` has 11 elements matching ORDER_COLUMNS and
+    ``deal_tuple`` has 12 elements matching DEAL_COLUMNS.
+    SH NGTS ``Type`` field: ``"A"``/``"D"`` = order, ``"T"`` = deal.
+    Returns ``None`` if the message is not a valid SH stock.
+    """
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SH"):
+        return None
+    typ = str(getattr(msg, "Type", "")).strip()
+    code = _code(msg.SecurityID, "SH")
+    event_time = _parse_mdl_time(getattr(msg, "TickTime", 0), trading_day)
+    side = _side_from_flag(getattr(msg, "TickBSFlag", ""))
+    td = str(trading_day)
+
+    if typ in ("A", "D"):
+        order_tuple = (
+            # ORDER_COLUMNS: TradingDay, Code, Time, UpdateTime,
+            # OrderID, Side, Price, Volume, OrderType, Channel, SeqNum
+            td,
+            code,
+            event_time,
+            event_time,
+            _i(getattr(msg, "BuyOrderNO", 0)) + _i(getattr(msg, "SellOrderNO", 0)),
+            side,
+            _f(getattr(msg, "Price", 0)),
+            _f(getattr(msg, "Qty", 0)),
+            2 if typ == "A" else 5,
+            _i(getattr(msg, "Channel", 0)),
+            _i(getattr(msg, "BizIndex", 0)),
+        )
+        return code, order_tuple, None
+
+    if typ == "T":
+        price = _f(getattr(msg, "Price", 0))
+        volume = _f(getattr(msg, "Qty", 0))
+        money = _f(getattr(msg, "TradeMoney", 0)) or price * volume
+        deal_tuple = (
+            # DEAL_COLUMNS: TradingDay, Code, Time, UpdateTime,
+            # SaleOrderID, BuyOrderID, Side, Price, Volume, Money, Channel, SeqNum
+            td,
+            code,
+            event_time,
+            event_time,
+            _i(getattr(msg, "SellOrderNO", 0)),
+            _i(getattr(msg, "BuyOrderNO", 0)),
+            side,
+            price,
+            volume,
+            money,
+            _i(getattr(msg, "Channel", 0)),
+            _i(getattr(msg, "BizIndex", 0)),
+        )
+        return code, None, deal_tuple
+
+    return code, None, None
+
+
+def extract_sz_order_tuple(
+    msg: Any, trading_day: date, seq_id: int,
+) -> Optional[Tuple[str, tuple]]:
+    """Extract SZ order fields into an 11-element tuple matching ORDER_COLUMNS.
+
+    Returns ``(code, tuple)`` or ``None`` if the message is not a valid SZ stock.
+    Side mapping: 49=buy(0), 50=sell(1).
+    OrderType mapping: 49=1, 50=2, 85=3.
+    """
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
+        return None
+    side = {49: 0, 50: 1}.get(_i(getattr(msg, "Side", 0)), 10)
+    order_type = {49: 1, 50: 2, 85: 3}.get(_i(getattr(msg, "OrdType", 0)), 0)
+    code = _code(msg.SecurityID, "SZ")
+    event_time = _parse_mdl_time(getattr(msg, "TransactTime", 0), trading_day)
+    # ORDER_COLUMNS: TradingDay, Code, Time, UpdateTime,
+    # OrderID, Side, Price, Volume, OrderType, Channel, SeqNum
+    return code, (
+        str(trading_day),
+        code,
+        event_time,
+        event_time,
+        _i(getattr(msg, "ApplSeqNum", 0)),
+        side,
+        _f(getattr(msg, "Price", 0)),
+        _f(getattr(msg, "OrderQty", 0)),
+        order_type,
+        _i(getattr(msg, "ChannelNo", 0)),
+        _i(getattr(msg, "ApplSeqNum", 0)),
+    )
+
+
+def extract_sz_deal_tuple(
+    msg: Any, trading_day: date, seq_id: int,
+) -> Optional[Tuple[str, tuple]]:
+    """Extract SZ deal fields into a 12-element tuple matching DEAL_COLUMNS.
+
+    Returns ``(code, tuple)`` or ``None`` if the message is not a valid SZ stock.
+    Side logic: buy_id > sell_id -> 0 (buy), else 1 (sell).
+    If ExecType == 52, side is set to 4.
+    """
+    if not _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
+        return None
+    buy_id = _i(getattr(msg, "BidApplSeqNum", 0))
+    sell_id = _i(getattr(msg, "OfferApplSeqNum", 0))
+    side = 0 if buy_id > sell_id else 1
+    if _i(getattr(msg, "ExecType", 0)) == 52:
+        side = 4
+    price = _f(getattr(msg, "LastPx", 0))
+    volume = _f(getattr(msg, "LastQty", 0))
+    code = _code(msg.SecurityID, "SZ")
+    event_time = _parse_mdl_time(getattr(msg, "TransactTime", 0), trading_day)
+    # DEAL_COLUMNS: TradingDay, Code, Time, UpdateTime,
+    # SaleOrderID, BuyOrderID, Side, Price, Volume, Money, Channel, SeqNum
+    return code, (
+        str(trading_day),
+        code,
+        event_time,
+        event_time,
+        sell_id,
+        buy_id,
+        side,
+        price,
+        volume,
+        price * volume,
+        _i(getattr(msg, "ChannelNo", 0)),
+        _i(getattr(msg, "ApplSeqNum", 0)),
+    )

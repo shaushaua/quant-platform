@@ -4,15 +4,14 @@
 
 数据流：
     pymdl SDK → callback
-                  ├─ sdk_mapper.write_*()  → ArrowBuffer（原始数据，columnar numpy）
+                  ├─ extract_*_tuple() → memory_store.append_*()（per-stock list，~5μs/msg）
                   └─ StockState.update_*_scalar() → 累计聚合值
 
-    数据入 MemoryStore（独立线程，每 DATA_FLUSH_INTERVAL 秒）：
-        flush ArrowBuffer → DataFrame → groupby("Code") → MemoryStore.update_*
-        交易员通过 DataAPI(mode="realtime") 实时可查（延迟 ~10ms）
-
     因子计算（每 COMPUTE_INTERVAL 秒）：
-        MemoryStore.get_tick/get_deal/get_order(code) → StockData → factor_calculation
+        MemoryStore.get_tick/get_deal/get_order(code) → list→DataFrame → StockData → factor_calculation
+
+    磁盘归档（每 ARCHIVE_INTERVAL 秒）：
+        memory_store.snapshot_and_clear() → DataFrame → parquet 落盘 → 盘后上传 OSS
 
 环境变量：
     MDL_SERVER               MDL 服务地址（默认 mdl-cloud-sh.datayes.com:19012）
@@ -20,7 +19,7 @@
     MDL_SUBS                 订阅配置（默认 4.4,4.24,6.28,6.33,6.36）
     FACTOR_MODULE            交易员因子模块路径
     COMPUTE_INTERVAL         因子计算间隔秒数（默认 60）
-    DATA_FLUSH_INTERVAL      数据刷新到 MemoryStore 间隔秒数（默认 0.01 = 10ms）
+    ARCHIVE_INTERVAL         磁盘归档间隔秒数（默认 30）
     FACTOR_OUTPUT_PATH       因子结果输出目录
     RAW_DATA_ARCHIVE_ENABLED 是否落盘并在盘后上传 tick/order/deal 原始数据（默认 true）
 """
@@ -45,12 +44,10 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import pandas as pd
-import pyarrow as pa
 
-from ..collector.arrow_buffer import ArrowBuffer
 from ..collector.sdk_callback import SequenceTracker
 from ..collector.sdk_config import SDKCollectorConfig, load_config
-from ..core.constants import ARROW_SCHEMA_BY_KIND
+from ..core.constants import TICK_COLUMNS, ORDER_COLUMNS, DEAL_COLUMNS
 from ..data.memory_store import MemoryStore
 from ..data.mysql_loader import DailyBasicCache
 from ..factor.base import StockData, StockState
@@ -61,9 +58,12 @@ from .streaming_engine import (
     _upload_to_oss,
 )
 
-# Re-use sdk_mapper for ArrowBuffer writes and scalar helpers
-from ..collector import sdk_mapper
-from ..collector.sdk_mapper import _f, _i, _code, _is_stock, _side_from_flag
+# extract_*_tuple for fast callback path; scalar helpers for StockState
+from ..collector.sdk_mapper import (
+    extract_sh_tick_tuple, extract_sz_tick_tuple, extract_sh_ngts_tuple,
+    extract_sz_order_tuple, extract_sz_deal_tuple,
+    _f, _i, _code, _is_stock, _side_from_flag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,18 +73,19 @@ def _raw_time(value: Any) -> str:
 
 
 # ================================================================== #
-# Direct callback — ArrowBuffer writes + StockState scalar updates     #
+# Direct callback — per-stock list append + StockState scalar updates  #
 # ================================================================== #
 
 def create_direct_callback(
     pymdl,
-    buffers: Dict[str, ArrowBuffer],
+    memory_store: MemoryStore,
     states: Dict[str, StockState],
     lock: threading.Lock,
     trading_day_getter,
     tracker: SequenceTracker,
 ):
-    """Create pymdl callback that writes to ArrowBuffer AND updates StockState."""
+    """Create pymdl callback that appends to per-stock lists AND updates StockState.
+    No ArrowBuffer involved — extract_*_tuple + append_* runs in ~5μs/msg."""
 
     class DirectCallback(pymdl.MsgCallback):
         def _get_or_create(self, code: str) -> StockState:
@@ -134,12 +135,13 @@ def create_direct_callback(
                 trading_day = trading_day_getter()
 
                 if hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_SHL2MarketData:
-                    # 1. ArrowBuffer write (reuses sdk_mapper)
-                    sdk_mapper.write_sh_tick(buffers["tick"], msg, trading_day, int(hd.SequenceID))
+                    # 1. Per-stock list append
+                    result = extract_sh_tick_tuple(msg, trading_day, int(hd.SequenceID))
+                    if result:
+                        code, tup = result
+                        memory_store.append_tick(code, tup)
 
-                    # 2. StockState scalar update
-                    if _is_stock(getattr(msg, "SecurityID", ""), "SH"):
-                        code = _code(msg.SecurityID, "SH")
+                        # 2. StockState scalar update
                         raw_t = _raw_time(getattr(msg, "UpdateTime", ""))
                         asks = list(getattr(msg, "SellLevels", []) or [])
                         bids = list(getattr(msg, "BidLevels", []) or [])
@@ -158,14 +160,16 @@ def create_direct_callback(
                             )
 
                 elif hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_NGTSTick:
-                    # 1. ArrowBuffer write
-                    sdk_mapper.write_sh_ngts_tick(
-                        buffers["order"], buffers["deal"], msg, trading_day,
-                    )
+                    # 1. Per-stock list append
+                    result = extract_sh_ngts_tuple(msg, trading_day)
+                    if result:
+                        code, order_tup, deal_tup = result
+                        if order_tup is not None:
+                            memory_store.append_order(code, order_tup)
+                        if deal_tup is not None:
+                            memory_store.append_deal(code, deal_tup)
 
-                    # 2. StockState scalar update
-                    if _is_stock(getattr(msg, "SecurityID", ""), "SH"):
-                        code = _code(msg.SecurityID, "SH")
+                        # 2. StockState scalar update
                         typ = str(getattr(msg, "Type", "")).strip()
                         raw_t = _raw_time(getattr(msg, "TickTime", ""))
                         side = _side_from_flag(getattr(msg, "TickBSFlag", ""))
@@ -200,12 +204,13 @@ def create_direct_callback(
                 trading_day = trading_day_getter()
 
                 if hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2:
-                    # 1. ArrowBuffer write
-                    sdk_mapper.write_sz_tick(buffers["tick"], msg, trading_day, int(hd.SequenceID))
+                    # 1. Per-stock list append
+                    result = extract_sz_tick_tuple(msg, trading_day, int(hd.SequenceID))
+                    if result:
+                        code, tup = result
+                        memory_store.append_tick(code, tup)
 
-                    # 2. StockState scalar update
-                    if _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
-                        code = _code(msg.SecurityID, "SZ")
+                        # 2. StockState scalar update
                         raw_t = _raw_time(getattr(msg, "UpdateTime", ""))
                         asks = list(getattr(msg, "AskPriceLevel", []) or [])
                         bids = list(getattr(msg, "BidPriceLevel", []) or [])
@@ -224,12 +229,13 @@ def create_direct_callback(
                             )
 
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Order300192_v2:
-                    # 1. ArrowBuffer write
-                    sdk_mapper.write_sz_order(buffers["order"], msg, trading_day)
+                    # 1. Per-stock list append
+                    result = extract_sz_order_tuple(msg, trading_day, int(hd.SequenceID))
+                    if result:
+                        code, tup = result
+                        memory_store.append_order(code, tup)
 
-                    # 2. StockState scalar update
-                    if _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
-                        code = _code(msg.SecurityID, "SZ")
+                        # 2. StockState scalar update
                         raw_t = _raw_time(getattr(msg, "TransactTime", ""))
                         side = {49: 0, 50: 1}.get(_i(getattr(msg, "Side", 0)), 10)
                         order_type = {49: 1, 50: 2, 85: 3}.get(_i(getattr(msg, "OrdType", 0)), 0)
@@ -242,12 +248,13 @@ def create_direct_callback(
                             )
 
                 elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2:
-                    # 1. ArrowBuffer write
-                    sdk_mapper.write_sz_deal(buffers["deal"], msg, trading_day)
+                    # 1. Per-stock list append
+                    result = extract_sz_deal_tuple(msg, trading_day, int(hd.SequenceID))
+                    if result:
+                        code, tup = result
+                        memory_store.append_deal(code, tup)
 
-                    # 2. StockState scalar update
-                    if _is_stock(getattr(msg, "SecurityID", ""), "SZ"):
-                        code = _code(msg.SecurityID, "SZ")
+                        # 2. StockState scalar update
                         raw_t = _raw_time(getattr(msg, "TransactTime", ""))
                         with lock:
                             self._get_or_create(code).update_deal_scalar(
@@ -269,10 +276,11 @@ def create_direct_callback(
 
 class CombinedEngine:
     """
-    Single-process engine: pymdl SDK → ArrowBuffer + StockState → StockData → factor calculation.
+    Single-process engine: pymdl SDK → per-stock lists + StockState → StockData → factor calculation.
 
     Replaces both sdk_collector + streaming_engine.
     Provides full StockData (with DataFrames) matching the backtest DataAPI.
+    No ArrowBuffer — callback writes directly to per-stock lists via MemoryStore.append_*().
     """
 
     _CHECKPOINT_NAME = "combined_checkpoint.pkl"
@@ -291,16 +299,8 @@ class CombinedEngine:
         self._callbacks = []    # keep callback references to prevent GC
         self.tracker = SequenceTracker()
 
-        # ArrowBuffers for raw data (same as collector)
-        self._buffers = {
-            "tick": ArrowBuffer(ARROW_SCHEMA_BY_KIND["tick"]),
-            "order": ArrowBuffer(ARROW_SCHEMA_BY_KIND["order"]),
-            "deal": ArrowBuffer(ARROW_SCHEMA_BY_KIND["deal"]),
-        }
-
-        # MemoryStore: SDK data → MemoryStore → DataAPI (unified interface)
+        # MemoryStore: callback writes directly via append_* (no ArrowBuffer)
         self._memory_store = MemoryStore.get_instance()
-        self._data_flush_interval = float(os.environ.get("DATA_FLUSH_INTERVAL", "0.01"))
 
         # Factor module
         module_path = os.environ.get("FACTOR_MODULE", "")
@@ -311,6 +311,9 @@ class CombinedEngine:
         self.factor_calculation: Callable = self.factor_module.factor_calculation
         self.outfun: Optional[Callable] = getattr(self.factor_module, "outfun", None)
         self.compute_interval = int(os.environ.get("COMPUTE_INTERVAL", "60"))
+
+        # Disk archive interval (default 30s, replaces the old 10ms flush)
+        self._archive_interval = int(os.environ.get("ARCHIVE_INTERVAL", "30"))
 
         # Output & checkpoint
         output_path_str = os.environ.get("FACTOR_OUTPUT_PATH", "")
@@ -345,14 +348,12 @@ class CombinedEngine:
 
         self._load_checkpoint()
 
-        # Thread pools for parallel processing
-        self._flush_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="flush")
+        # Thread pool for parallel factor computation
         self._compute_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="factor")
 
         logger.info(
-            "[combined] init done: module=%s interval=%ds flush=%.0fms",
-            module_path, self.compute_interval,
-            self._data_flush_interval * 1000,
+            "[combined] init done: module=%s interval=%ds archive=%ds",
+            module_path, self.compute_interval, self._archive_interval,
         )
 
     def trading_day(self) -> date:
@@ -378,7 +379,7 @@ class CombinedEngine:
 
         # Single callback instance shared by all subscribers (per SDK sample code)
         self._callbacks = [create_direct_callback(
-            pymdl, self._buffers, self.states, self._lock, self.trading_day, self.tracker,
+            pymdl, self._memory_store, self.states, self._lock, self.trading_day, self.tracker,
         )]
         callback = self._callbacks[0]
 
@@ -442,25 +443,7 @@ class CombinedEngine:
             logger.info("[combined] %d/%d connections established", len(self._subscribers), len(conn_groups))
 
     # ------------------------------------------------------------------ #
-    # ArrowBuffer flush → DataFrame                                        #
-    # ------------------------------------------------------------------ #
-
-    def _flush_buffer(self, kind: str) -> pd.DataFrame:
-        """Flush ArrowBuffer to DataFrame and clear the buffer."""
-        buf = self._buffers[kind]
-        if buf.row_count == 0:
-            return pd.DataFrame()
-        batch = buf.flush()
-        if batch is None:
-            return pd.DataFrame()
-        try:
-            df = batch.to_pandas()
-        finally:
-            del batch
-        return df
-
-    # ------------------------------------------------------------------ #
-    # Raw data archive: async parquet chunks + after-close OSS upload      #
+    # Raw data archive: snapshot MemoryStore → parquet → OSS upload        #
     # ------------------------------------------------------------------ #
 
     def _enqueue_raw_archive(self, trading_day: date, kind: str, df: pd.DataFrame) -> None:
@@ -530,18 +513,37 @@ class CombinedEngine:
             active,
         )
 
-    def _flush_raw_buffers_to_archive(self) -> None:
-        """Flush any buffered SDK rows to disk before upload or shutdown."""
+    def _snapshot_to_archive(self) -> None:
+        """Snapshot MemoryStore per-stock lists to disk for archiving.
+        Uses snapshot_and_clear to swap out data so callback can continue writing."""
         archive_day = self._trading_day
+        store = self._memory_store
         for kind in ("tick", "deal", "order"):
-            df = self._flush_buffer(kind)
-            self._enqueue_raw_archive(archive_day, kind, df)
+            columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
+            snapshots = store.snapshot_and_clear(kind)
+            if not snapshots:
+                continue
+            all_rows = []
+            for code, lst in snapshots.items():
+                all_rows.extend(lst)
+            if all_rows:
+                df = pd.DataFrame(all_rows, columns=columns)
+                self._enqueue_raw_archive(archive_day, kind, df)
 
-    def _flush_raw_buffers_for_day(self, trading_day: date) -> None:
-        """Flush buffered SDK rows and attribute them to a specific trading day."""
+    def _snapshot_for_day(self, trading_day: date) -> None:
+        """Snapshot and archive data attributed to a specific trading day."""
+        store = self._memory_store
         for kind in ("tick", "deal", "order"):
-            df = self._flush_buffer(kind)
-            self._enqueue_raw_archive(trading_day, kind, df)
+            columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
+            snapshots = store.snapshot_and_clear(kind)
+            if not snapshots:
+                continue
+            all_rows = []
+            for code, lst in snapshots.items():
+                all_rows.extend(lst)
+            if all_rows:
+                df = pd.DataFrame(all_rows, columns=columns)
+                self._enqueue_raw_archive(trading_day, kind, df)
 
     def _get_oss_bucket(self):
         import oss2
@@ -572,7 +574,7 @@ class CombinedEngine:
         now = datetime.now()
         if (now.hour, now.minute) < (upload_hour, upload_minute):
             return
-        self._flush_raw_buffers_to_archive()
+        self._snapshot_to_archive()
         self._flush_disk_queue()
         if self._upload_raw_day_to_oss(self._trading_day):
             self._uploaded_today = True
@@ -662,28 +664,24 @@ class CombinedEngine:
         return uploaded_any and not had_error
 
     # ------------------------------------------------------------------ #
-    # Data flush thread: ArrowBuffer → MemoryStore (every ~10ms)           #
+    # Archive loop: MemoryStore snapshot → disk (every ARCHIVE_INTERVAL s)  #
     # ------------------------------------------------------------------ #
 
-    def _data_flush_loop(self) -> None:
-        """High-frequency flush: ArrowBuffer → group by code → MemoryStore."""
-        log_counter = 0
+    def _archive_loop(self) -> None:
+        """Periodically snapshot MemoryStore to disk for archiving."""
         while not self._stopped:
-            time.sleep(self._data_flush_interval)
+            time.sleep(self._archive_interval)
             try:
-                t0 = time.time()
-                total_rows = self._flush_to_memory_store()
-                flush_ms = (time.time() - t0) * 1000
-
-                # Every 100 flush cycles (~1s) log latency stats
-                log_counter += 1
-                if log_counter % 100 == 0 and total_rows > 0:
-                    self._log_pipeline_latency(flush_ms, total_rows)
+                self._snapshot_to_archive()
             except Exception as exc:
-                logger.warning("[data-flush] failed: %s", exc)
+                logger.warning("[archive] snapshot failed: %s", exc)
 
-    def _log_pipeline_latency(self, flush_ms: float, total_rows: int) -> None:
-        """Sample and log SDK→MemoryStore→wall latency for a few stocks."""
+    # ------------------------------------------------------------------ #
+    # Latency logging                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _log_pipeline_latency(self) -> None:
+        """Sample and log SDK→wall latency for a few stocks."""
         now = datetime.now()
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
 
@@ -712,50 +710,12 @@ class CombinedEngine:
                 f"总延迟={pipeline_latency_ms}ms"
             )
 
-        logger.info(
-            "[latency] flush=%.1fms rows=%d | %s",
-            flush_ms, total_rows, " | ".join(parts),
-        )
-
-    def _flush_to_memory_store(self) -> int:
-        """Flush ArrowBuffers, group by Code, write per-code DataFrames to MemoryStore.
-        Uses ThreadPoolExecutor to parallelize tick/deal/order processing.
-        Returns total rows flushed."""
-        total_rows = 0
-        futures = {
-            self._flush_executor.submit(self._flush_one_kind, kind): kind
-            for kind in ("tick", "deal", "order")
-        }
-        for future in futures:
-            try:
-                total_rows += future.result()
-            except Exception as exc:
-                logger.warning("[flush] %s failed: %s", futures[future], exc)
-        return total_rows
-
-    def _flush_one_kind(self, kind: str) -> int:
-        """Flush, archive, and write one data kind to MemoryStore."""
-        df = self._flush_buffer(kind)
-        if df.empty:
-            return 0
-        self._enqueue_raw_archive(self._trading_day, kind, df)
-        groups = self._group_by_code(df)
-        store = self._memory_store
-        method = {"tick": store.update_tick, "order": store.update_order, "deal": store.update_deal}[kind]
-        for code, g in groups.items():
-            method(code, g)
-        return len(df)
+        if parts:
+            logger.info("[latency] %s", " | ".join(parts))
 
     # ------------------------------------------------------------------ #
     # Factor computation                                                   #
     # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _group_by_code(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """Split DataFrame into {code: sub-DataFrame} via groupby."""
-        if df.empty or "Code" not in df.columns:
-            return {}
-        return {code: group for code, group in df.groupby("Code", sort=False)}
 
     def _compute_and_output(self) -> None:
         """Read from MemoryStore, build StockData per stock, compute factors, output."""
@@ -771,9 +731,9 @@ class CombinedEngine:
         # Collect all stock codes from MemoryStore + StockState
         store = self._memory_store
         all_codes = set(states_snapshot.keys())
-        all_codes.update(store._tick.keys())
-        all_codes.update(store._order.keys())
-        all_codes.update(store._deal.keys())
+        all_codes.update(store._tick_lists.keys())
+        all_codes.update(store._order_lists.keys())
+        all_codes.update(store._deal_lists.keys())
 
         logger.info("[combined] computing: date=%s end_time=%s stocks=%d",
                      date_str, end_time, len(all_codes))
@@ -867,8 +827,6 @@ class CombinedEngine:
                         result["data_latency_ms"] = data_latency_ms
         return result
 
-        del result_df
-
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
     # ------------------------------------------------------------------ #
@@ -926,7 +884,7 @@ class CombinedEngine:
                 except Exception:
                     pass
         if upload_day is not None:
-            self._flush_raw_buffers_for_day(upload_day)
+            self._snapshot_for_day(upload_day)
             self._flush_disk_queue()
             self._upload_raw_day_to_oss(upload_day)
 
@@ -948,15 +906,14 @@ class CombinedEngine:
 
         store = self._memory_store
         mem_info = store.get_memory_usage()
+        stats = store.get_stats()
 
         logger.warning(
-            "[mem] RSS=%.0fMB stocks=%d store=tick:%.0fMB deal:%.0fMB order:%.0fMB "
-            "buffer_rows=tick:%d deal:%d order:%d",
+            "[mem] RSS=%.0fMB stocks=%d store=tick:%.0fMB(%d/%drows) deal:%.0fMB(%d/%drows) order:%.0fMB(%d/%drows)",
             rss_mb, len(self.states),
-            mem_info["tick_mb"], mem_info["deal_mb"], mem_info["order_mb"],
-            self._buffers["tick"].row_count,
-            self._buffers["deal"].row_count,
-            self._buffers["order"].row_count,
+            mem_info["tick_mb"], stats["tick_stocks"], stats["tick_rows"],
+            mem_info["deal_mb"], stats["deal_stocks"], stats["deal_rows"],
+            mem_info["order_mb"], stats["order_stocks"], stats["order_rows"],
         )
 
     # ------------------------------------------------------------------ #
@@ -985,12 +942,13 @@ class CombinedEngine:
             self._memory_store.update_daily_basic(self._daily_basic_df)
             logger.info("[combined] MemoryStore initialized: trading_day=%s", trade_date)
 
-        # Start data flush thread (ArrowBuffer → MemoryStore, every ~10ms)
-        self._data_flush_thread = threading.Thread(
-            target=self._data_flush_loop, name="data-flush", daemon=True,
-        )
-        self._data_flush_thread.start()
-        logger.info("[combined] data flush thread started: interval=%.3fs", self._data_flush_interval)
+        # Start archive thread (MemoryStore snapshot → disk, every ARCHIVE_INTERVAL)
+        if self._raw_archive_enabled:
+            self._archive_thread = threading.Thread(
+                target=self._archive_loop, name="archive-snapshot", daemon=True,
+            )
+            self._archive_thread.start()
+            logger.info("[combined] archive thread started: interval=%ds", self._archive_interval)
 
         self._connect()
 
@@ -1005,9 +963,7 @@ class CombinedEngine:
 
             # Factor computation
             if now - last_compute >= self.compute_interval:
-                if _is_trading_hours() and (self.states or any(
-                    b.row_count > 0 for b in self._buffers.values()
-                )):
+                if _is_trading_hours() and self.states:
                     self._compute_and_output()
                 last_compute = now
 
@@ -1016,9 +972,10 @@ class CombinedEngine:
                 self._save_checkpoint()
                 last_checkpoint = now
 
-            # Memory log
+            # Memory log + latency
             if now - last_mem_log >= 30:
                 self._log_mem()
+                self._log_pipeline_latency()
                 last_mem_log = now
 
             self._check_raw_upload_time()
@@ -1026,10 +983,6 @@ class CombinedEngine:
             # GC
             if now - last_gc >= 60:
                 gc.collect()
-                try:
-                    pa.default_memory_pool().release_unused()
-                except Exception:
-                    pass
                 last_gc = now
 
             # Day rollover
@@ -1038,11 +991,11 @@ class CombinedEngine:
             time.sleep(0.5)
 
     def stop(self) -> None:
-        # Flush remaining ArrowBuffer data to MemoryStore + disk archive
+        # Snapshot remaining data to disk archive
         try:
-            self._flush_to_memory_store()
+            self._snapshot_to_archive()
         except Exception as exc:
-            logger.warning("[combined] final MemoryStore flush failed: %s", exc)
+            logger.warning("[combined] final archive snapshot failed: %s", exc)
         if self._raw_archive_enabled:
             self._flush_disk_queue()
         self._stopped = True
@@ -1059,7 +1012,6 @@ class CombinedEngine:
             except Exception:
                 pass
         # Shutdown thread pools
-        self._flush_executor.shutdown(wait=False)
         self._compute_executor.shutdown(wait=False)
         logger.info("[combined] engine stopped")
 
