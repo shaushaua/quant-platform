@@ -548,10 +548,6 @@ class CombinedEngine:
         self._flush_disk_queue()
         if self._upload_raw_day_to_oss(self._trading_day):
             self._uploaded_today = True
-        else:
-            # No data to upload (e.g. non-trading day) — mark done to stop retrying
-            logger.info("[raw-archive] upload returned false, marking uploaded_today to stop retrying")
-            self._uploaded_today = True
 
     def _upload_raw_day_to_oss(self, trading_day: date) -> bool:
         date_str = trading_day.strftime("%Y%m%d")
@@ -936,6 +932,7 @@ class CombinedEngine:
         last_checkpoint = time.time()
         last_mem_log = time.time()
         last_gc = time.time()
+        last_upload_check = time.time()
         self._start_time = time.time()
 
         while not self._stopped:
@@ -955,7 +952,9 @@ class CombinedEngine:
                 self._log_pipeline_latency()
                 last_mem_log = now
 
-            self._check_raw_upload_time()
+            if now - last_upload_check >= 60:
+                self._check_raw_upload_time()
+                last_upload_check = now
 
             if now - last_gc >= 60:
                 gc.collect()
