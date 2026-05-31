@@ -71,6 +71,10 @@ class MemoryStore:
 
         # Dirty tracking: stocks that received new data since last reset
         self._dirty_codes: set = set()
+        # Per-type dirty tracking: only warm data types that actually changed
+        self._dirty_tick: set = set()
+        self._dirty_deal: set = set()
+        self._dirty_order: set = set()
 
         # Incremental numpy cache: accumulate as ndarray (fast), convert to DataFrame at read time
         self._tick_np_cache: Dict[str, np.ndarray] = {}
@@ -122,6 +126,9 @@ class MemoryStore:
             self._order_lists.clear()
             self._deal_lists.clear()
             self._dirty_codes.clear()
+            self._dirty_tick.clear()
+            self._dirty_deal.clear()
+            self._dirty_order.clear()
             self._quotes.clear()
             self._kline_state.clear()
             self._last_append_ts = 0.0
@@ -159,6 +166,16 @@ class MemoryStore:
         self._dirty_codes = set()
         return dirty
 
+    def drain_dirty_typed(self) -> tuple:
+        """Return and reset per-type dirty sets: (tick_codes, deal_codes, order_codes)."""
+        tick = self._dirty_tick
+        deal = self._dirty_deal
+        order = self._dirty_order
+        self._dirty_tick = set()
+        self._dirty_deal = set()
+        self._dirty_order = set()
+        return tick, deal, order
+
     # --- Parsed per-stock list (SDK callback writes) ---
 
     def append_tick(self, code: str, row_tuple: tuple) -> None:
@@ -169,6 +186,7 @@ class MemoryStore:
             self._tick_lists[code] = lst
         lst.append(row_tuple)
         self._dirty_codes.add(code)
+        self._dirty_tick.add(code)
         if len(lst) > self._max_rows:
             # CAS: only trim if no other thread replaced the list
             new_lst = lst[-(self._max_rows // 2):]
@@ -184,9 +202,8 @@ class MemoryStore:
             self._order_lists[code] = lst
         lst.append(row_tuple)
         self._dirty_codes.add(code)
+        self._dirty_order.add(code)
         if len(lst) > self._max_rows:
-            new_lst = lst[-(self._max_rows // 2):]
-            if self._order_lists.get(code) is lst:
                 self._order_lists[code] = new_lst
         self._last_append_ts = time.time()
 
@@ -198,6 +215,7 @@ class MemoryStore:
             self._deal_lists[code] = lst
         lst.append(row_tuple)
         self._dirty_codes.add(code)
+        self._dirty_deal.add(code)
         if len(lst) > self._max_rows:
             new_lst = lst[-(self._max_rows // 2):]
             if self._deal_lists.get(code) is lst:

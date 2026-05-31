@@ -693,20 +693,27 @@ class CombinedEngine:
         if not dirty:
             return
 
+        # Per-type dirty: only warm data types that actually changed
+        dirty_tick, dirty_deal, dirty_order = store.drain_dirty_typed()
+
         all_codes = dirty & states_snapshot.keys() if states_snapshot else dirty
         codes_list = list(all_codes)
 
-        logger.info("[combined] computing: date=%s end_time=%s stocks=%d (dirty=%d)",
-                     date_str, end_time, len(all_codes), len(dirty))
+        # Filter per-type dirty to only stocks we'll compute
+        tick_codes = list(dirty_tick & all_codes)
+        deal_codes = list(dirty_deal & all_codes)
+        order_codes = list(dirty_order & all_codes)
+
+        logger.info("[combined] computing: date=%s end_time=%s stocks=%d (tick=%d deal=%d order=%d)",
+                     date_str, end_time, len(all_codes), len(tick_codes), len(deal_codes), len(order_codes))
 
         t0 = time.time()
 
-        # Pre-warm numpy caches in main thread (fast, ~250ms for 5000 stocks)
-        # After this, workers only do pd.DataFrame build (thread-safe, no shared mutation)
+        # Pre-warm only the data types that changed
         warm_t0 = time.perf_counter()
-        store.warm_tick_batch(codes_list)
-        store.warm_deal_batch(codes_list)
-        store.warm_order_batch(codes_list)
+        if tick_codes: store.warm_tick_batch(tick_codes)
+        if deal_codes: store.warm_deal_batch(deal_codes)
+        if order_codes: store.warm_order_batch(order_codes)
         warm_ms = (time.perf_counter() - warm_t0) * 1000
 
         results = []
