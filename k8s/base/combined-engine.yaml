@@ -60,7 +60,7 @@ spec:
               value: /data/quant/mdl_logs/mdl
             # --- 因子计算 ---
             - name: FACTOR_MODULE
-              value: "quant_platform.factor.examples.live_momentum"
+              value: "quant_platform.factor.examples.protected_eillen_strategy"
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: DATA_FLUSH_INTERVAL

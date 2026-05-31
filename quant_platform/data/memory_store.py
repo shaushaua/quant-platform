@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from collections import defaultdict
 
+import numpy as np
 import pandas as pd
 
 from ..core.constants import TICK_COLUMNS, ORDER_COLUMNS, DEAL_COLUMNS
@@ -71,10 +72,10 @@ class MemoryStore:
         # Dirty tracking: stocks that received new data since last reset
         self._dirty_codes: set = set()
 
-        # Incremental DataFrame cache: only convert new rows since last get_*() call
-        self._tick_df_cache: Dict[str, pd.DataFrame] = {}
-        self._order_df_cache: Dict[str, pd.DataFrame] = {}
-        self._deal_df_cache: Dict[str, pd.DataFrame] = {}
+        # Incremental numpy cache: accumulate as ndarray (fast), convert to DataFrame at read time
+        self._tick_np_cache: Dict[str, np.ndarray] = {}
+        self._order_np_cache: Dict[str, np.ndarray] = {}
+        self._deal_np_cache: Dict[str, np.ndarray] = {}
         self._tick_cache_len: Dict[str, int] = {}
         self._order_cache_len: Dict[str, int] = {}
         self._deal_cache_len: Dict[str, int] = {}
@@ -129,10 +130,10 @@ class MemoryStore:
             self._archive_offset_tick = {}
             self._archive_offset_order = {}
             self._archive_offset_deal = {}
-            # Reset incremental DataFrame cache
-            self._tick_df_cache.clear()
-            self._order_df_cache.clear()
-            self._deal_df_cache.clear()
+            # Reset incremental numpy cache
+            self._tick_np_cache.clear()
+            self._order_np_cache.clear()
+            self._deal_np_cache.clear()
             self._tick_cache_len.clear()
             self._order_cache_len.clear()
             self._deal_cache_len.clear()
@@ -248,7 +249,8 @@ class MemoryStore:
 
     def _get_incremental(self, kind: str, code: Optional[str], columns: tuple) -> pd.DataFrame:
         """Core logic for incremental DataFrame retrieval.
-        Only converts new rows since last call; returns cached copy if unchanged."""
+        Uses numpy ndarray for fast incremental accumulation,
+        converts to DataFrame only at read time."""
         if code is None:
             # All stocks combined — no cache, build from scratch (rare path)
             lists = getattr(self, f"_{kind}_lists")
@@ -261,31 +263,31 @@ class MemoryStore:
         if not lst:
             return pd.DataFrame()
 
-        cache = getattr(self, f"_{kind}_df_cache")
+        np_cache = getattr(self, f"_{kind}_np_cache")
         cache_len = getattr(self, f"_{kind}_cache_len")
 
         cached_len = cache_len.get(code, 0)
         current_len = len(lst)
 
-        # No new data → return cached DataFrame directly (read-only callers)
-        if cached_len == current_len and code in cache:
-            return cache[code]
+        # No new data → convert cached ndarray to DataFrame
+        if cached_len == current_len and code in np_cache:
+            return pd.DataFrame(np_cache[code], columns=columns)
 
         # List was truncated (MAX_ROWS) → invalidate cache, rebuild from scratch
         if cached_len > current_len:
             cached_len = 0
 
-        # Convert only the new rows (delta)
+        # Convert only the new rows (delta) to numpy
         new_rows = lst[cached_len:]
-        new_df = pd.DataFrame(new_rows, columns=columns)
+        new_np = np.array(new_rows)
 
-        if cached_len == 0 or code not in cache:
-            cache[code] = new_df
+        if cached_len == 0 or code not in np_cache:
+            np_cache[code] = new_np
         else:
-            cache[code] = pd.concat([cache[code], new_df], ignore_index=True)
+            np_cache[code] = np.concatenate([np_cache[code], new_np])
 
         cache_len[code] = current_len
-        return cache[code]
+        return pd.DataFrame(np_cache[code], columns=columns)
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
         """Get tick data as DataFrame. Uses incremental cache for per-stock queries."""
