@@ -21,6 +21,10 @@ test_*.py
 
 # Local vendor binaries
 /vendor/pymdl/*.tar.gz
+/vendor/mdl_parser/*.whl
+
+# Rust build artifacts
+mdl_parser/target/
 
 # IDE
 .idea/
