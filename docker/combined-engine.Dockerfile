@@ -3,6 +3,17 @@
 # Build context must include:
 #   vendor/pymdl/pymdl-2.13.232-py3.tar.gz
 #   vendor/mdl-client/mdl_forward_2.13.232_linux.tar.gz
+#   vendor/mdl_parser/*.whl  (pre-built, see below)
+#
+# Pre-build mdl_parser wheel on the build host (one-time or when lib.rs changes):
+#   export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+#   export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+#   curl -sSf https://mirrors.ustc.edu.cn/rust-static/rustup/rustup-init.sh | sh -s -- -y
+#   . "$HOME/.cargo/env"
+#   pip install maturin
+#   mkdir -p vendor/mdl_parser
+#   cd mdl_parser && maturin build --release --strip
+#   cp target/wheels/*.whl ../vendor/mdl_parser/
 
 FROM 172.24.99.176:5000/quant-platform/backtest-base:latest
 
@@ -30,20 +41,11 @@ RUN mkdir -p /opt/mdl-client \
     && chmod +x /opt/mdl-client/feeder_client \
     && rm -f /tmp/mdl_forward_2.13.232_linux.tar.gz
 
-# Build Rust mdl_parser extension — install, build, cleanup in ONE layer to avoid bloat.
-# Use Chinese mirrors for rustup and cargo (direct rustup.sh is too slow in China)
-ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
-ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
-COPY mdl_parser/ /app/mdl_parser/
-RUN curl --proto '=https' --tlsv1.2 -sSf https://mirrors.ustc.edu.cn/rust-static/rustup/rustup-init.sh | sh -s -- -y --default-toolchain stable \
-    && . "$HOME/.cargo/env" \
-    && pip install --no-cache-dir maturin \
-    && mkdir -p /root/.cargo \
-    && printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' > /root/.cargo/config.toml \
-    && cd /app/mdl_parser && maturin build --release --strip \
-    && pip install --no-cache-dir /app/mdl_parser/target/wheels/*.whl \
+# Install pre-built mdl_parser wheel (built on host, no Rust toolchain in Docker)
+COPY vendor/mdl_parser/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/*.whl \
     && python -c "import mdl_parser; print('mdl_parser import ok')" \
-    && rm -rf /app/mdl_parser/target /root/.rustup /root/.cargo
+    && rm -f /tmp/*.whl
 
 # Copy entrypoint script (starts feeder_client then Python engine)
 COPY docker/entrypoint-combined.sh /app/entrypoint-combined.sh
