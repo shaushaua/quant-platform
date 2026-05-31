@@ -30,6 +30,20 @@ RUN mkdir -p /opt/mdl-client \
     && chmod +x /opt/mdl-client/feeder_client \
     && rm -f /tmp/mdl_forward_2.13.232_linux.tar.gz
 
+# Build Rust mdl_parser extension (binary parser for MDL messages, ~10x faster than Python)
+# Install Rust via rustup (apt-get cargo is too old for pyo3 0.24 which needs Rust >= 1.70)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && . "$HOME/.cargo/env" \
+    && pip install --no-cache-dir maturin
+COPY mdl_parser/ /app/mdl_parser/
+RUN . "$HOME/.cargo/env" \
+    && cd /app/mdl_parser && maturin build --release --strip \
+    && pip install --no-cache-dir /app/mdl_parser/target/wheels/*.whl \
+    && python -c "import mdl_parser; print('mdl_parser import ok')" \
+    && rm -rf /app/mdl_parser/target /root/.cargo/registry
+# Remove Rust toolchain after build to save ~500MB
+RUN rm -rf /root/.rustup /root/.cargo
+
 # Copy entrypoint script (starts feeder_client then Python engine)
 COPY docker/entrypoint-combined.sh /app/entrypoint-combined.sh
 RUN chmod +x /app/entrypoint-combined.sh

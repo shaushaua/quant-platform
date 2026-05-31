@@ -8,6 +8,7 @@ get_* 方法按需惰性转换为 DataFrame。
 """
 
 import os
+import time
 import threading
 import logging
 from typing import Dict, List, Optional
@@ -62,10 +63,21 @@ class MemoryStore:
         # 当前交易日
         self._trading_day: str = ""
 
-        # Per-stock list 存储: code -> list[tuple]
+        # Per-stock list 存储: code -> list[tuple] (SDK 回调直接写入)
         self._tick_lists: Dict[str, list] = {}
         self._order_lists: Dict[str, list] = {}
         self._deal_lists: Dict[str, list] = {}
+
+        # Dirty tracking: stocks that received new data since last reset
+        self._dirty_codes: set = set()
+
+        # Incremental DataFrame cache: only convert new rows since last get_*() call
+        self._tick_df_cache: Dict[str, pd.DataFrame] = {}
+        self._order_df_cache: Dict[str, pd.DataFrame] = {}
+        self._deal_df_cache: Dict[str, pd.DataFrame] = {}
+        self._tick_cache_len: Dict[str, int] = {}
+        self._order_cache_len: Dict[str, int] = {}
+        self._deal_cache_len: Dict[str, int] = {}
 
         # 最新行情快照
         self._quotes: Dict[str, dict] = {}
@@ -89,6 +101,9 @@ class MemoryStore:
         # 读写锁 (使用RLock，Python 3.12兼容)
         self._rw_lock = threading.RLock()
 
+        # 数据活性时间戳 — SDK 回调每次 append 时更新，主循环用于检测断线
+        self._last_append_ts: float = 0.0
+
         logger.info("MemoryStore 初始化完成 (per-stock list 存储)")
 
     # ==================== 交易日管理 ====================
@@ -101,13 +116,26 @@ class MemoryStore:
             self._tick_lists.clear()
             self._order_lists.clear()
             self._deal_lists.clear()
+            self._dirty_codes.clear()
             self._quotes.clear()
             self._kline_state.clear()
+            self._last_append_ts = 0.0
             self._kline_1min = pd.DataFrame()
             self._kline_5min = pd.DataFrame()
             self._kline_10min = pd.DataFrame()
             self._kline_30min = pd.DataFrame()
             self._kline_60min = pd.DataFrame()
+            # Reset archive offsets
+            self._archive_offset_tick = {}
+            self._archive_offset_order = {}
+            self._archive_offset_deal = {}
+            # Reset incremental DataFrame cache
+            self._tick_df_cache.clear()
+            self._order_df_cache.clear()
+            self._deal_df_cache.clear()
+            self._tick_cache_len.clear()
+            self._order_cache_len.clear()
+            self._deal_cache_len.clear()
             logger.info(f"设置交易日: {trading_day}, 已清空历史数据")
 
     def get_trading_day(self) -> str:
@@ -116,6 +144,15 @@ class MemoryStore:
 
     # ==================== 热路径写入（SDK callback 调用，~50K/sec）====================
 
+    def drain_dirty(self) -> set:
+        """Return and reset the set of codes that received new data.
+        Called by factor computation to skip unchanged stocks."""
+        dirty = self._dirty_codes
+        self._dirty_codes = set()
+        return dirty
+
+    # --- Parsed per-stock list (SDK callback writes) ---
+
     def append_tick(self, code: str, row_tuple: tuple) -> None:
         """Append a single tick tuple (very fast)."""
         lst = self._tick_lists.get(code)
@@ -123,8 +160,13 @@ class MemoryStore:
             lst = []
             self._tick_lists[code] = lst
         lst.append(row_tuple)
+        self._dirty_codes.add(code)
         if len(lst) > self._max_rows:
-            self._tick_lists[code] = lst[-self._max_rows:]
+            # CAS: only trim if no other thread replaced the list
+            new_lst = lst[-(self._max_rows // 2):]
+            if self._tick_lists.get(code) is lst:
+                self._tick_lists[code] = new_lst
+        self._last_append_ts = time.time()
 
     def append_order(self, code: str, row_tuple: tuple) -> None:
         """Append a single order tuple (very fast)."""
@@ -133,8 +175,12 @@ class MemoryStore:
             lst = []
             self._order_lists[code] = lst
         lst.append(row_tuple)
+        self._dirty_codes.add(code)
         if len(lst) > self._max_rows:
-            self._order_lists[code] = lst[-self._max_rows:]
+            new_lst = lst[-(self._max_rows // 2):]
+            if self._order_lists.get(code) is lst:
+                self._order_lists[code] = new_lst
+        self._last_append_ts = time.time()
 
     def append_deal(self, code: str, row_tuple: tuple) -> None:
         """Append a single deal tuple (very fast)."""
@@ -143,8 +189,12 @@ class MemoryStore:
             lst = []
             self._deal_lists[code] = lst
         lst.append(row_tuple)
+        self._dirty_codes.add(code)
         if len(lst) > self._max_rows:
-            self._deal_lists[code] = lst[-self._max_rows:]
+            new_lst = lst[-(self._max_rows // 2):]
+            if self._deal_lists.get(code) is lst:
+                self._deal_lists[code] = new_lst
+        self._last_append_ts = time.time()
 
     # ==================== 兼容写入接口（采集器调用）====================
 
@@ -194,61 +244,60 @@ class MemoryStore:
             if hasattr(self, attr_name):
                 setattr(self, attr_name, df)
 
-    # ==================== 读取接口（策略调用，惰性转 DataFrame）====================
+    # ==================== 读取接口（策略调用，增量 DataFrame 缓存）====================
+
+    def _get_incremental(self, kind: str, code: Optional[str], columns: tuple) -> pd.DataFrame:
+        """Core logic for incremental DataFrame retrieval.
+        Only converts new rows since last call; returns cached copy if unchanged."""
+        if code is None:
+            # All stocks combined — no cache, build from scratch (rare path)
+            lists = getattr(self, f"_{kind}_lists")
+            all_rows = []
+            for lst in lists.values():
+                all_rows.extend(lst)
+            return pd.DataFrame(all_rows, columns=columns) if all_rows else pd.DataFrame()
+
+        lst = getattr(self, f"_{kind}_lists").get(code, [])
+        if not lst:
+            return pd.DataFrame()
+
+        cache = getattr(self, f"_{kind}_df_cache")
+        cache_len = getattr(self, f"_{kind}_cache_len")
+
+        cached_len = cache_len.get(code, 0)
+        current_len = len(lst)
+
+        # No new data → return cached copy directly
+        if cached_len == current_len and code in cache:
+            return cache[code].copy()
+
+        # List was truncated (MAX_ROWS) → invalidate cache, rebuild from scratch
+        if cached_len > current_len:
+            cached_len = 0
+
+        # Convert only the new rows (delta)
+        new_rows = lst[cached_len:]
+        new_df = pd.DataFrame(new_rows, columns=columns)
+
+        if cached_len == 0 or code not in cache:
+            cache[code] = new_df
+        else:
+            cache[code] = pd.concat([cache[code], new_df], ignore_index=True)
+
+        cache_len[code] = current_len
+        return cache[code].copy()
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
-        """Get tick data as DataFrame. Converts from internal list on demand."""
-        with self._rw_lock:
-            if code is not None:
-                lst = self._tick_lists.get(code, [])
-                if not lst:
-                    return pd.DataFrame()
-                snapshot = list(lst)  # copy
-                return pd.DataFrame(snapshot, columns=TICK_COLUMNS)
-            else:
-                # All stocks combined
-                all_rows = []
-                for lst in self._tick_lists.values():
-                    all_rows.extend(lst)
-                if not all_rows:
-                    return pd.DataFrame()
-                return pd.DataFrame(all_rows, columns=TICK_COLUMNS)
+        """Get tick data as DataFrame. Uses incremental cache for per-stock queries."""
+        return self._get_incremental("tick", code, TICK_COLUMNS)
 
     def get_order(self, code: Optional[str] = None) -> pd.DataFrame:
-        """Get order data as DataFrame. Converts from internal list on demand."""
-        with self._rw_lock:
-            if code is not None:
-                lst = self._order_lists.get(code, [])
-                if not lst:
-                    return pd.DataFrame()
-                snapshot = list(lst)  # copy
-                return pd.DataFrame(snapshot, columns=ORDER_COLUMNS)
-            else:
-                # All stocks combined
-                all_rows = []
-                for lst in self._order_lists.values():
-                    all_rows.extend(lst)
-                if not all_rows:
-                    return pd.DataFrame()
-                return pd.DataFrame(all_rows, columns=ORDER_COLUMNS)
+        """Get order data as DataFrame. Uses incremental cache for per-stock queries."""
+        return self._get_incremental("order", code, ORDER_COLUMNS)
 
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
-        """Get deal data as DataFrame. Converts from internal list on demand."""
-        with self._rw_lock:
-            if code is not None:
-                lst = self._deal_lists.get(code, [])
-                if not lst:
-                    return pd.DataFrame()
-                snapshot = list(lst)  # copy
-                return pd.DataFrame(snapshot, columns=DEAL_COLUMNS)
-            else:
-                # All stocks combined
-                all_rows = []
-                for lst in self._deal_lists.values():
-                    all_rows.extend(lst)
-                if not all_rows:
-                    return pd.DataFrame()
-                return pd.DataFrame(all_rows, columns=DEAL_COLUMNS)
+        """Get deal data as DataFrame. Uses incremental cache for per-stock queries."""
+        return self._get_incremental("deal", code, DEAL_COLUMNS)
 
     def get_quote(self, code: str) -> dict:
         """获取单只股票最新行情"""
@@ -299,6 +348,31 @@ class MemoryStore:
             # Reset all lists to empty (keep the same stock keys)
             setattr(self, attr, {code: [] for code in old})
             return result
+
+    def snapshot_incremental(self, kind: str) -> Dict[str, list]:
+        """Return new rows since last snapshot for each stock, WITHOUT clearing.
+        Tracks per-stock offset so next call only returns rows appended since then.
+        Data stays in memory for factor computation (full-day accumulation)."""
+        attr = f"_{kind}_lists"
+        offset_attr = f"_archive_offset_{kind}"
+        lists = getattr(self, attr)
+        offsets = getattr(self, offset_attr, {})
+
+        result = {}
+        for code, lst in lists.items():
+            start = offsets.get(code, 0)
+            if len(lst) > start:
+                # list[start:] creates a copy of the new portion
+                result[code] = list(lst[start:])
+                offsets[code] = len(lst)
+
+        setattr(self, offset_attr, offsets)
+        return result
+
+    def clear_archive_offset(self, kind: str) -> None:
+        """Reset incremental snapshot tracking. Called on trading day rollover."""
+        offset_attr = f"_archive_offset_{kind}"
+        setattr(self, offset_attr, {})
 
     # ==================== K线聚合 ====================
 

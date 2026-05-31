@@ -113,8 +113,8 @@ def _time_to_seconds(time_val) -> float:
         return time_val.hour * 3600 + time_val.minute * 60 + time_val.second + time_val.microsecond / 1e6
 
     s = str(time_val).strip()
-    # datetime 字符串 "2025-01-03 09:30:01"
-    if '-' in s and ':' in s:
+    # datetime 字符串 "2025-01-03 09:30:01" or "20250103 09:30:01.123"
+    if ':' in s:
         try:
             dt = _pd.Timestamp(s)
             return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6

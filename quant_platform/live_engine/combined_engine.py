@@ -3,29 +3,29 @@
 合并引擎：pymdl SDK + MemoryStore + DataAPI 统一接口。
 
 数据流：
-    pymdl SDK → callback
-                  ├─ extract_*_tuple() → memory_store.append_*()（per-stock list，~5μs/msg）
-                  └─ StockState.update_*_scalar() → 累计聚合值
+    pymdl SDK → callback（~4μs/msg，Rust mdl_parser 直接解析 → per-stock list + StockState）
+                     ↓
+    DataAPI（get_tick/get_deal/get_order → 已解析的 DataFrame，瞬间返回）
 
     因子计算（每 COMPUTE_INTERVAL 秒）：
-        MemoryStore.get_tick/get_deal/get_order(code) → list→DataFrame → StockData → factor_calculation
+        MemoryStore.get_tick/get_deal/get_order(code) → StockData → factor_calculation
 
-    磁盘归档（每 ARCHIVE_INTERVAL 秒）：
-        memory_store.snapshot_and_clear() → DataFrame → parquet 落盘 → 盘后上传 OSS
+    盘后归档：
+        snapshot_incremental → DataFrame → parquet → OSS
 
 环境变量：
-    MDL_SERVER               MDL 服务地址（默认 mdl-cloud-sh.datayes.com:19012）
-    MDL_TOKEN                MDL 认证 Token（32位，从 secret 注入）
+    MDL_SERVER               MDL 服务地址
+    MDL_TOKEN                MDL 认证 Token
     MDL_SUBS                 订阅配置（默认 4.4,4.24,6.28,6.33,6.36）
     FACTOR_MODULE            交易员因子模块路径
     COMPUTE_INTERVAL         因子计算间隔秒数（默认 60）
-    ARCHIVE_INTERVAL         磁盘归档间隔秒数（默认 30）
     FACTOR_OUTPUT_PATH       因子结果输出目录
-    RAW_DATA_ARCHIVE_ENABLED 是否落盘并在盘后上传 tick/order/deal 原始数据（默认 true）
+    RAW_DATA_ARCHIVE_ENABLED 是否落盘并在盘后上传（默认 true）
 """
 
 from __future__ import annotations
 
+import copy
 import gc
 import io
 import importlib
@@ -58,39 +58,46 @@ from .streaming_engine import (
     _upload_to_oss,
 )
 
-# extract_*_tuple for fast callback path; scalar helpers for StockState
-from ..collector.sdk_mapper import (
-    extract_sh_tick_tuple, extract_sz_tick_tuple, extract_sh_ngts_tuple,
-    extract_sz_order_tuple, extract_sz_deal_tuple,
-    _f, _i, _code, _is_stock, _side_from_flag,
-)
+# Rust binary parser (replaces pymdl.Read + extract_*_tuple for ~10x speedup)
+try:
+    import mdl_parser
+except ImportError:
+    mdl_parser = None
 
 logger = logging.getLogger(__name__)
 
 
-def _raw_time(value: Any) -> str:
-    return str(value or "")
-
-
 # ================================================================== #
-# Direct callback — per-stock list append + StockState scalar updates  #
+# Direct-parse callback — Rust parse in callback (~4μs/msg)          #
 # ================================================================== #
 
 def create_direct_callback(
     pymdl,
     memory_store: MemoryStore,
-    states: Dict[str, StockState],
-    lock: threading.Lock,
-    trading_day_getter,
     tracker: SequenceTracker,
+    states: Dict[str, StockState],
+    state_lock: threading.Lock,
+    trading_day_getter,
 ):
-    """Create pymdl callback that appends to per-stock lists AND updates StockState.
-    Lock-free hot path: CPython GIL guarantees dict.get/set atomicity.
-    Wall clock sampled once per callback invocation, not per stock."""
+    """Create pymdl callback that directly parses and stores data.
+    Rust mdl_parser.parse_*() called inside callback (~2μs parse + ~1μs append).
+    trading_day_getter returns 'YYYYMMDD' string for consistent Time format.
+    Data is immediately available in per-stock lists — no intermediate queue.
+    Total callback cost ~4-5μs/msg, well under feeder_client ~50μs kick threshold."""
 
-    _datetime = datetime  # local ref for speed
+    MID_SH_TICK = pymdl.mdl_shl2_msg.MDLMID_SHL2MarketData
+    MID_SH_NGTS = pymdl.mdl_shl2_msg.MDLMID_NGTSTick
+    MID_SZ_TICK = pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2
+    MID_SZ_ORDER = pymdl.mdl_szl2_msg.MDLMID_Order300192_v2
+    MID_SZ_DEAL = pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2
 
     class DirectCallback(pymdl.MsgCallback):
+
+        # Cached values — refreshed periodically to avoid per-message allocation
+        _cached_td: str = ""
+        _cached_td_ts: float = 0.0
+        _cached_wall: float = 0.0
+        _cached_wall_ts: float = 0.0
 
         def _observe(self, hd) -> None:
             gap = tracker.observe(int(hd.ServiceID), int(hd.MessageID), int(hd.SequenceID))
@@ -99,6 +106,33 @@ def create_direct_callback(
                     "[sdk-seq-gap] sid=%s mid=%s expected=%s actual=%s",
                     hd.ServiceID, hd.MessageID, gap[0], gap[1],
                 )
+
+        def _get_or_create(self, code: str) -> StockState:
+            state = states.get(code)
+            if state is None:
+                with state_lock:
+                    state = states.get(code)
+                    if state is None:
+                        state = StockState(code=code)
+                        states[code] = state
+            return state
+
+        def _wall_ts(self) -> float:
+            """Get wall-clock seconds since midnight, cached for 100ms."""
+            now = time.time()
+            if now - self._cached_wall_ts > 0.1:
+                dt = datetime.now()
+                self._cached_wall = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond * 1e-6
+                self._cached_wall_ts = now
+            return self._cached_wall
+
+        def _get_td(self) -> str:
+            """Get trading day string, cached for 1s."""
+            now = time.time()
+            if now - self._cached_td_ts > 1.0:
+                self._cached_td = trading_day_getter()
+                self._cached_td_ts = now
+            return self._cached_td
 
         def OnMDLAPIMessage(self, hd, buf):
             try:
@@ -118,154 +152,93 @@ def create_direct_callback(
             except Exception:
                 pass
 
-        # ---------------------------------------------------------- #
-        # SH messages                                                 #
-        # ---------------------------------------------------------- #
-
         def OnMDLSHL2Message(self, hd, buf):
             try:
                 self._observe(hd)
-                msg = pymdl.mdl_shl2_msg.Read(hd.MessageID, buf)
-                trading_day = trading_day_getter()
-                now = _datetime.now()
-                wall_ts = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond * 1e-6
+                mid = int(hd.MessageID)
+                seq_id = int(hd.SequenceID)
+                trading_day = self._get_td()
+                wall_ts = self._wall_ts()
 
-                if hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_SHL2MarketData:
-                    result = extract_sh_tick_tuple(msg, trading_day, int(hd.SequenceID))
+                if mid == MID_SH_TICK:
+                    result = mdl_parser.parse_sh_tick(buf, trading_day, seq_id)
                     if result:
                         code, tup = result
                         memory_store.append_tick(code, tup)
-
-                        state = states.get(code)
-                        if state is None:
-                            state = StockState(code=code)
-                            states[code] = state
+                        state = self._get_or_create(code)
                         state.last_update_ts = wall_ts
-                        raw_t = _raw_time(getattr(msg, "UpdateTime", ""))
-                        asks = list(getattr(msg, "SellLevels", []) or [])
-                        bids = list(getattr(msg, "BidLevels", []) or [])
                         state.update_tick_scalar(
-                            _f(getattr(msg, "LastPrice", 0)),
-                            _f(getattr(msg, "PreCloPrice", 0)),
-                            _f(getattr(msg, "OpenPrice", 0)),
-                            _f(getattr(msg, "HighPrice", 0)),
-                            _f(getattr(msg, "LowPrice", 0)),
-                            _f(getattr(asks[0], "OrderPrice", 0)) if asks else 0.0,
-                            _f(getattr(bids[0], "OrderPrice", 0)) if bids else 0.0,
-                            _i(getattr(asks[0], "OrderVol", 0)) if asks else 0,
-                            _i(getattr(bids[0], "OrderVol", 0)) if bids else 0,
-                            raw_t,
+                            float(tup[4]), float(tup[7]), float(tup[8]),
+                            float(tup[9]), float(tup[10]),
+                            float(tup[19]), float(tup[49]),
+                            int(tup[29]), int(tup[59]),
+                            str(tup[3]),
                         )
-
-                elif hd.MessageID == pymdl.mdl_shl2_msg.MDLMID_NGTSTick:
-                    result = extract_sh_ngts_tuple(msg, trading_day)
+                elif mid == MID_SH_NGTS:
+                    result = mdl_parser.parse_sh_ngts(buf, trading_day)
                     if result:
                         code, order_tup, deal_tup = result
+                        state = self._get_or_create(code)
+                        state.last_update_ts = wall_ts
                         if order_tup is not None:
                             memory_store.append_order(code, order_tup)
+                            state.update_order_scalar(
+                                int(order_tup[5]), float(order_tup[7]),
+                                int(order_tup[8]), str(order_tup[3]),
+                            )
                         if deal_tup is not None:
                             memory_store.append_deal(code, deal_tup)
-
-                        state = states.get(code)
-                        if state is None:
-                            state = StockState(code=code)
-                            states[code] = state
-                        state.last_update_ts = wall_ts
-                        typ = str(getattr(msg, "Type", "")).strip()
-                        raw_t = _raw_time(getattr(msg, "TickTime", ""))
-                        if typ in ("A", "D"):
-                            state.update_order_scalar(
-                                _side_from_flag(getattr(msg, "TickBSFlag", "")),
-                                _f(getattr(msg, "Qty", 0)),
-                                2 if typ == "A" else 5,
-                                raw_t,
-                            )
-                        elif typ == "T":
                             state.update_deal_scalar(
-                                _f(getattr(msg, "Price", 0)),
-                                _f(getattr(msg, "Qty", 0)),
-                                raw_t,
+                                float(deal_tup[7]), float(deal_tup[8]),
+                                str(deal_tup[3]),
                             )
-
-                del msg
             except Exception as exc:
                 logger.warning("[callback] SHL2 failed: %s", exc)
-
-        # ---------------------------------------------------------- #
-        # SZ messages                                                 #
-        # ---------------------------------------------------------- #
 
         def OnMDLSZL2Message(self, hd, buf):
             try:
                 self._observe(hd)
-                msg = pymdl.mdl_szl2_msg.Read(hd.MessageID, buf)
-                trading_day = trading_day_getter()
-                now = _datetime.now()
-                wall_ts = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond * 1e-6
+                mid = int(hd.MessageID)
+                seq_id = int(hd.SequenceID)
+                trading_day = self._get_td()
+                wall_ts = self._wall_ts()
 
-                if hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2:
-                    result = extract_sz_tick_tuple(msg, trading_day, int(hd.SequenceID))
+                if mid == MID_SZ_TICK:
+                    result = mdl_parser.parse_sz_tick(buf, trading_day, seq_id)
                     if result:
                         code, tup = result
                         memory_store.append_tick(code, tup)
-
-                        state = states.get(code)
-                        if state is None:
-                            state = StockState(code=code)
-                            states[code] = state
+                        state = self._get_or_create(code)
                         state.last_update_ts = wall_ts
-                        raw_t = _raw_time(getattr(msg, "UpdateTime", ""))
-                        asks = list(getattr(msg, "AskPriceLevel", []) or [])
-                        bids = list(getattr(msg, "BidPriceLevel", []) or [])
                         state.update_tick_scalar(
-                            _f(getattr(msg, "LastPrice", 0)),
-                            _f(getattr(msg, "PreCloPrice", 0)),
-                            _f(getattr(msg, "OpenPrice", 0)),
-                            _f(getattr(msg, "HighPrice", 0)),
-                            _f(getattr(msg, "LowPrice", 0)),
-                            _f(getattr(asks[0], "Price", 0)) if asks else 0.0,
-                            _f(getattr(bids[0], "Price", 0)) if bids else 0.0,
-                            _i(getattr(asks[0], "Volume", 0)) if asks else 0,
-                            _i(getattr(bids[0], "Volume", 0)) if bids else 0,
-                            raw_t,
+                            float(tup[4]), float(tup[7]), float(tup[8]),
+                            float(tup[9]), float(tup[10]),
+                            float(tup[19]), float(tup[49]),
+                            int(tup[29]), int(tup[59]),
+                            str(tup[3]),
                         )
-
-                elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Order300192_v2:
-                    result = extract_sz_order_tuple(msg, trading_day, int(hd.SequenceID))
+                elif mid == MID_SZ_ORDER:
+                    result = mdl_parser.parse_sz_order(buf, trading_day, seq_id)
                     if result:
                         code, tup = result
                         memory_store.append_order(code, tup)
-
-                        state = states.get(code)
-                        if state is None:
-                            state = StockState(code=code)
-                            states[code] = state
+                        state = self._get_or_create(code)
                         state.last_update_ts = wall_ts
                         state.update_order_scalar(
-                            {49: 0, 50: 1}.get(_i(getattr(msg, "Side", 0)), 10),
-                            _f(getattr(msg, "OrderQty", 0)),
-                            {49: 1, 50: 2, 85: 3}.get(_i(getattr(msg, "OrdType", 0)), 0),
-                            _raw_time(getattr(msg, "TransactTime", "")),
+                            int(tup[5]), float(tup[7]),
+                            int(tup[8]), str(tup[3]),
                         )
-
-                elif hd.MessageID == pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2:
-                    result = extract_sz_deal_tuple(msg, trading_day, int(hd.SequenceID))
+                elif mid == MID_SZ_DEAL:
+                    result = mdl_parser.parse_sz_deal(buf, trading_day, seq_id)
                     if result:
                         code, tup = result
                         memory_store.append_deal(code, tup)
-
-                        state = states.get(code)
-                        if state is None:
-                            state = StockState(code=code)
-                            states[code] = state
+                        state = self._get_or_create(code)
                         state.last_update_ts = wall_ts
                         state.update_deal_scalar(
-                            _f(getattr(msg, "LastPx", 0)),
-                            _f(getattr(msg, "LastQty", 0)),
-                            _raw_time(getattr(msg, "TransactTime", "")),
+                            float(tup[7]), float(tup[8]),
+                            str(tup[3]),
                         )
-
-                del msg
             except Exception as exc:
                 logger.warning("[callback] SZL2 failed: %s", exc)
 
@@ -278,11 +251,11 @@ def create_direct_callback(
 
 class CombinedEngine:
     """
-    Single-process engine: pymdl SDK → per-stock lists + StockState → StockData → factor calculation.
+    Single-process engine: pymdl SDK → Rust parse in callback → per-stock lists → StockData.
 
-    Replaces both sdk_collector + streaming_engine.
-    Provides full StockData (with DataFrames) matching the backtest DataAPI.
-    No ArrowBuffer — callback writes directly to per-stock lists via MemoryStore.append_*().
+    Architecture:
+      - SDK callback: Rust mdl_parser.parse_*() directly (~4μs/msg), appends to per-stock lists + StockState
+      - Factor computation: reads from already-parsed MemoryStore (instant)
     """
 
     _CHECKPOINT_NAME = "combined_checkpoint.pkl"
@@ -293,15 +266,14 @@ class CombinedEngine:
         self._stopped = False
         self._trading_day: date = date.today()
         self._start_time = time.time()
-
         # pymdl SDK config
         self.config: SDKCollectorConfig = load_config()
         self._io_man = None
-        self._subscribers = []  # multiple subscribers: SH L2 + SZ L2
-        self._callbacks = []    # keep callback references to prevent GC
+        self._subscribers = []
+        self._callbacks = []
         self.tracker = SequenceTracker()
 
-        # MemoryStore: callback writes directly via append_* (no ArrowBuffer)
+        # MemoryStore
         self._memory_store = MemoryStore.get_instance()
 
         # Factor module
@@ -314,7 +286,7 @@ class CombinedEngine:
         self.outfun: Optional[Callable] = getattr(self.factor_module, "outfun", None)
         self.compute_interval = int(os.environ.get("COMPUTE_INTERVAL", "60"))
 
-        # Disk archive interval (default 30s, replaces the old 10ms flush)
+        # Archive interval
         self._archive_interval = int(os.environ.get("ARCHIVE_INTERVAL", "30"))
 
         # Output & checkpoint
@@ -344,7 +316,7 @@ class CombinedEngine:
             )
             self._disk_thread.start()
 
-        # daily_basic data (loaded once at startup)
+        # daily_basic data
         self._market_df: pd.DataFrame = pd.DataFrame()
         self._daily_basic_df: pd.DataFrame = pd.DataFrame()
 
@@ -361,6 +333,10 @@ class CombinedEngine:
     def trading_day(self) -> date:
         return self._trading_day
 
+    def trading_day_str(self) -> str:
+        """Trading day as 'YYYYMMDD' string (matches OSS format and Rust parser expectation)."""
+        return self._trading_day.strftime("%Y%m%d")
+
     # ------------------------------------------------------------------ #
     # pymdl SDK connection                                                 #
     # ------------------------------------------------------------------ #
@@ -371,6 +347,9 @@ class CombinedEngine:
         except ImportError as exc:
             raise RuntimeError("pymdl not installed") from exc
 
+        if mdl_parser is None:
+            raise RuntimeError("mdl_parser (Rust extension) not installed — build with maturin")
+
         self._io_man = pymdl.CreateIOController(self.config.io_threads)
         log_path = os.environ.get("MDL_LOG_PATH", "/data/quant/mdl_logs/mdl")
         try:
@@ -379,19 +358,18 @@ class CombinedEngine:
         except Exception:
             pass
 
-        # Single callback instance shared by all subscribers (per SDK sample code)
+        # Direct-parse callback — Rust parse inside callback, data available immediately
         self._callbacks = [create_direct_callback(
-            pymdl, self._memory_store, self.states, self._lock, self.trading_day, self.tracker,
+            pymdl, self._memory_store, self.tracker,
+            self.states, self._lock, self.trading_day_str,
         )]
         callback = self._callbacks[0]
 
         if self.config.use_local_client:
-            # Local mode: connect to feeder_client sidecar on 127.0.0.1:9012
-            # Single subscriber, all services on one connection, no token/MAC needed
             sub = self._io_man.CreateSubscriber(callback, True)
-            sub.SetServerAddress(self.config.server)  # 127.0.0.1:9012
-            sub.SetMessageEncoding(self.config.encoding)  # 1 (uncompressed for local)
-            sub.EnableMergeMessage(self.config.enable_merge)  # False for local
+            sub.SetServerAddress(self.config.server)
+            sub.SetMessageEncoding(self.config.encoding)
+            sub.EnableMergeMessage(self.config.enable_merge)
             sub.SetHeartbeatInterval(self.config.heartbeat_interval)
             sub.SetHeartbeatTimeout(self.config.heartbeat_timeout)
             for service_id, message_id in self.config.subs:
@@ -405,8 +383,6 @@ class CombinedEngine:
             self._subscribers.append(sub)
             logger.info("[combined] connected to local feeder_client %s", self.config.server)
         else:
-            # Remote cloud mode: direct connection to MDL cloud servers
-            # SH L2 and SZ L2 may need different servers
             logger.info("[combined] token=%s...%s", self.config.token[:4], self.config.token[-4:] if len(self.config.token) > 8 else "")
 
             sh_subs = [(sid, mid) for sid, mid in self.config.subs if sid == 4]
@@ -445,23 +421,17 @@ class CombinedEngine:
             logger.info("[combined] %d/%d connections established", len(self._subscribers), len(conn_groups))
 
     # ------------------------------------------------------------------ #
-    # Raw data archive: snapshot MemoryStore → parquet → OSS upload        #
+    # Raw data archive: snapshot → parquet → OSS                          #
     # ------------------------------------------------------------------ #
 
     def _enqueue_raw_archive(self, trading_day: date, kind: str, df: pd.DataFrame) -> None:
-        """Persist raw market data without changing the in-memory calculation path."""
         if not self._raw_archive_enabled or df.empty:
             return
         with self._disk_queue_lock:
             if len(self._disk_queue) < self._max_disk_queue:
                 self._disk_queue.append((trading_day, kind, df))
                 return
-
-        logger.warning(
-            "[raw-archive] queue full (%d), writing %s synchronously",
-            self._max_disk_queue,
-            kind,
-        )
+        logger.warning("[raw-archive] queue full (%d), writing %s synchronously", self._max_disk_queue, kind)
         self._append_raw_to_disk(trading_day, kind, df)
 
     def _disk_writer_loop(self) -> None:
@@ -508,36 +478,38 @@ class CombinedEngine:
             if pending == 0 and active == 0:
                 return
             time.sleep(0.05)
-        logger.warning(
-            "[raw-archive] disk queue not drained after %.0fs pending=%d active=%d",
-            timeout_seconds,
-            pending,
-            active,
-        )
+        logger.warning("[raw-archive] disk queue not drained after %.0fs pending=%d active=%d", timeout_seconds, pending, active)
 
     def _snapshot_to_archive(self) -> None:
-        """Snapshot MemoryStore per-stock lists to disk for archiving.
-        Uses snapshot_and_clear to swap out data so callback can continue writing."""
+        """Snapshot per-stock lists to disk for archiving."""
         archive_day = self._trading_day
         store = self._memory_store
+        t0 = time.time()
         for kind in ("tick", "deal", "order"):
             columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
-            snapshots = store.snapshot_and_clear(kind)
+            # Incremental snapshot: get new rows without clearing (full-day data stays in memory)
+            snapshots = store.snapshot_incremental(kind)
             if not snapshots:
                 continue
             all_rows = []
+            row_count = 0
             for code, lst in snapshots.items():
                 all_rows.extend(lst)
+                row_count += len(lst)
             if all_rows:
+                t1 = time.time()
                 df = pd.DataFrame(all_rows, columns=columns)
+                t2 = time.time()
                 self._enqueue_raw_archive(archive_day, kind, df)
+                logger.info("[archive] %s: %d stocks %d rows | snapshot=%.0fms df_build=%.0fms",
+                            kind, len(snapshots), row_count, (t1 - t0) * 1000, (t2 - t1) * 1000)
 
     def _snapshot_for_day(self, trading_day: date) -> None:
-        """Snapshot and archive data attributed to a specific trading day."""
         store = self._memory_store
         for kind in ("tick", "deal", "order"):
             columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
-            snapshots = store.snapshot_and_clear(kind)
+            # Final incremental snapshot for the day (gets any remaining un-archived rows)
+            snapshots = store.snapshot_incremental(kind)
             if not snapshots:
                 continue
             all_rows = []
@@ -549,11 +521,7 @@ class CombinedEngine:
 
     def _get_oss_bucket(self):
         import oss2
-
-        auth = oss2.Auth(
-            os.environ["OSS_ACCESS_KEY_ID"],
-            os.environ["OSS_ACCESS_KEY_SECRET"],
-        )
+        auth = oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
         endpoint = os.environ.get("OSS_ENDPOINT", "")
         if endpoint and not endpoint.startswith("http"):
             endpoint = f"https://{endpoint}"
@@ -582,7 +550,6 @@ class CombinedEngine:
             self._uploaded_today = True
 
     def _upload_raw_day_to_oss(self, trading_day: date) -> bool:
-        """Merge raw parquet chunks, sort like historical data, and upload to OSS."""
         date_str = trading_day.strftime("%Y%m%d")
         year = date_str[:4]
         month = date_str[4:6]
@@ -620,7 +587,8 @@ class CombinedEngine:
             try:
                 tmp_file.unlink(missing_ok=True)
                 con = duckdb.connect(":memory:")
-                con.execute("SET memory_limit='2GB'")
+                duckdb_mem = os.environ.get("ARCHIVE_DUCKDB_MEMORY", "2GB")
+                con.execute(f"SET memory_limit='{duckdb_mem}'")
                 con.execute(f"""
                     COPY (
                         SELECT * FROM read_parquet('{chunk_dir}/*.parquet')
@@ -632,14 +600,8 @@ class CombinedEngine:
                 oss_key = f"{prefix}/{date_str}_{kind}.parquet"
                 bucket.put_object_from_file(oss_key, str(tmp_file))
                 size_mb = tmp_file.stat().st_size / 1024 / 1024
-                logger.info(
-                    "[raw-archive] uploaded %s -> oss://%s/%s (%.1f MB, %d chunks)",
-                    kind,
-                    os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"),
-                    oss_key,
-                    size_mb,
-                    len(chunks),
-                )
+                logger.info("[raw-archive] uploaded %s -> oss://%s/%s (%.1f MB, %d chunks)",
+                            kind, os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"), oss_key, size_mb, len(chunks))
                 uploaded_any = True
                 tmp_file.unlink(missing_ok=True)
                 for chunk in chunks:
@@ -666,11 +628,10 @@ class CombinedEngine:
         return uploaded_any and not had_error
 
     # ------------------------------------------------------------------ #
-    # Archive loop: MemoryStore snapshot → disk (every ARCHIVE_INTERVAL s)  #
+    # Archive loop                                                         #
     # ------------------------------------------------------------------ #
 
     def _archive_loop(self) -> None:
-        """Periodically snapshot MemoryStore to disk for archiving."""
         while not self._stopped:
             time.sleep(self._archive_interval)
             try:
@@ -683,16 +644,13 @@ class CombinedEngine:
     # ------------------------------------------------------------------ #
 
     def _log_pipeline_latency(self) -> None:
-        """Sample and log SDK→wall latency for a few stocks."""
         now = datetime.now()
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
 
-        # Pick up to 3 stocks with latest market time
         samples = []
-        with self._lock:
-            for code, state in list(self.states.items())[:50]:
-                if state.last_market_time:
-                    samples.append((code, state.last_market_time, state.last_update_ts))
+        for code, state in list(self.states.items())[:50]:
+            if state.last_market_time:
+                samples.append((code, state.last_market_time, state.last_update_ts))
         samples.sort(key=lambda x: x[1], reverse=True)
         samples = samples[:3]
 
@@ -708,7 +666,7 @@ class CombinedEngine:
             pipeline_latency_ms = round((wall_secs - mkt_secs) * 1000, 1)
             parts.append(
                 f"{code}: 行情时间={mkt_time_str} "
-                f"SDK延迟={sdk_latency_ms}ms "
+                f"解析延迟={sdk_latency_ms}ms "
                 f"总延迟={pipeline_latency_ms}ms"
             )
 
@@ -720,30 +678,33 @@ class CombinedEngine:
     # ------------------------------------------------------------------ #
 
     def _compute_and_output(self) -> None:
-        """Read from MemoryStore, build StockData per stock, compute factors, output."""
         pipe_log = get_streaming_logger()
         now = datetime.now()
         date_str = self._trading_day.strftime("%Y%m%d")
         end_time = now.strftime("%H%M%S")
 
-        # Snapshot StockState
+        # Snapshot StockState (shallow copy each state so compute thread sees consistent values)
         with self._lock:
-            states_snapshot = dict(self.states)
+            states_snapshot = {code: copy.copy(st) for code, st in self.states.items()}
 
-        # Collect all stock codes from MemoryStore + StockState
+        # Only compute stocks that received new data since last cycle
         store = self._memory_store
-        all_codes = set(states_snapshot.keys())
-        all_codes.update(store._tick_lists.keys())
-        all_codes.update(store._order_lists.keys())
-        all_codes.update(store._deal_lists.keys())
+        dirty = store.drain_dirty()
+        if not dirty:
+            return
 
-        logger.info("[combined] computing: date=%s end_time=%s stocks=%d",
-                     date_str, end_time, len(all_codes))
+        all_codes = dirty & states_snapshot.keys() if states_snapshot else dirty
 
-        # Parallel per-stock computation
+        logger.info("[combined] computing: date=%s end_time=%s stocks=%d (dirty=%d)",
+                     date_str, end_time, len(all_codes), len(dirty))
+
         t0 = time.time()
         results = []
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
+
+        # Aggregate timing from all factor workers
+        total_df_us = 0
+        total_factor_us = 0
 
         futures = {
             self._compute_executor.submit(
@@ -753,7 +714,9 @@ class CombinedEngine:
         }
         for future in as_completed(futures):
             try:
-                result = future.result()
+                result, df_us, factor_us = future.result()
+                total_df_us += df_us
+                total_factor_us += factor_us
                 if result is not None:
                     results.append(result)
             except Exception as exc:
@@ -761,9 +724,11 @@ class CombinedEngine:
 
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
-        logger.info("[combined] computed: %d results in %.0fms (parallel, 8 workers)", len(result_df), elapsed_ms)
+        logger.info(
+            "[combined] computed: %d results in %.0fms (8 workers) | df_build=%.0fms factor=%.0fms wall=%.0fms",
+            len(result_df), elapsed_ms, total_df_us / 1000, total_factor_us / 1000, elapsed_ms,
+        )
 
-        # Sample factor compute latency
         if states_snapshot:
             compute_now = datetime.now()
             compute_wall_secs = compute_now.hour * 3600 + compute_now.minute * 60 + compute_now.second
@@ -781,18 +746,15 @@ class CombinedEngine:
             if latency_parts:
                 logger.info("[latency-factor] %s", " | ".join(latency_parts))
 
-        # CSV
         if self.output_path and not result_df.empty:
             self.output_path.mkdir(parents=True, exist_ok=True)
             out_file = self.output_path / f"{date_str}_{end_time}.csv"
             result_df.to_csv(out_file, index=False)
             logger.info("[combined] wrote %s", out_file)
 
-        # OSS
         if not result_df.empty:
             _upload_to_oss(result_df, date_str, end_time)
 
-        # outfun
         if self.outfun is not None:
             try:
                 self.outfun(date_str, end_time, result_df)
@@ -804,21 +766,37 @@ class CombinedEngine:
                       compute_ms=round(elapsed_ms, 1))
 
     def _compute_stock(self, code: str, date_str: str, end_time: str,
-                       states_snapshot: Dict[str, StockState], wall_secs: float) -> Optional[dict]:
-        """Compute factor for a single stock (called from thread pool)."""
+                       states_snapshot: Dict[str, StockState], wall_secs: float) -> Optional[Tuple[Optional[dict], int, int]]:
         store = self._memory_store
+
+        # Time DataFrame creation (list → DataFrame conversion)
+        t0 = time.perf_counter()
+        tick_df = store.get_tick(code)
+        t1 = time.perf_counter()
+        deal_df = store.get_deal(code)
+        t2 = time.perf_counter()
+        order_df = store.get_order(code)
+        t3 = time.perf_counter()
+        df_us = int((t3 - t0) * 1e6)
+
         stock_data = StockData(
             code=code,
             date=date_str,
             end_time=end_time,
-            l1_tick=store.get_tick(code),
-            l2_deal=store.get_deal(code),
-            l2_order=store.get_order(code),
+            l1_tick=tick_df,
+            l2_deal=deal_df,
+            l2_order=order_df,
             market=self._market_df,
             daily_basic=self._daily_basic_df,
             state=states_snapshot.get(code),
         )
+
+        # Time factor computation
+        t4 = time.perf_counter()
         result = self.factor_calculation(stock_data, code, date_str, end_time)
+        t5 = time.perf_counter()
+        factor_us = int((t5 - t4) * 1e6)
+
         if result is not None:
             state = states_snapshot.get(code)
             if state and state.last_market_time:
@@ -827,7 +805,7 @@ class CombinedEngine:
                     data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
                     if abs(data_latency_ms) < 600_000:
                         result["data_latency_ms"] = data_latency_ms
-        return result
+        return result, df_us, factor_us
 
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
@@ -879,7 +857,6 @@ class CombinedEngine:
                 self.states.clear()
                 self._trading_day = today
                 self._uploaded_today = False
-                # Reset MemoryStore for new trading day
                 self._memory_store.set_trading_day(today.strftime("%Y%m%d"))
                 try:
                     self._checkpoint_path.unlink(missing_ok=True)
@@ -907,15 +884,12 @@ class CombinedEngine:
             rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
         store = self._memory_store
-        mem_info = store.get_memory_usage()
         stats = store.get_stats()
 
-        logger.warning(
-            "[mem] RSS=%.0fMB stocks=%d store=tick:%.0fMB(%d/%drows) deal:%.0fMB(%d/%drows) order:%.0fMB(%d/%drows)",
+        logger.info(
+            "[pipeline] RSS=%.0fMB stocks=%d | parsed: tick=%d order=%d deal=%d",
             rss_mb, len(self.states),
-            mem_info["tick_mb"], stats["tick_stocks"], stats["tick_rows"],
-            mem_info["deal_mb"], stats["deal_stocks"], stats["deal_rows"],
-            mem_info["order_mb"], stats["order_stocks"], stats["order_rows"],
+            stats["tick_rows"], stats["order_rows"], stats["deal_rows"],
         )
 
     # ------------------------------------------------------------------ #
@@ -938,13 +912,13 @@ class CombinedEngine:
         except Exception as exc:
             logger.warning("[combined] daily_basic load failed: %s", exc)
 
-        # Initialize MemoryStore for DataAPI
+        # Initialize MemoryStore
         self._memory_store.set_trading_day(trade_date)
         if not self._daily_basic_df.empty:
             self._memory_store.update_daily_basic(self._daily_basic_df)
             logger.info("[combined] MemoryStore initialized: trading_day=%s", trade_date)
 
-        # Start archive thread (MemoryStore snapshot → disk, every ARCHIVE_INTERVAL)
+        # Start archive thread
         if self._raw_archive_enabled:
             self._archive_thread = threading.Thread(
                 target=self._archive_loop, name="archive-snapshot", daemon=True,
@@ -963,18 +937,15 @@ class CombinedEngine:
         while not self._stopped:
             now = time.time()
 
-            # Factor computation
             if now - last_compute >= self.compute_interval:
                 if _is_trading_hours() and self.states:
                     self._compute_and_output()
                 last_compute = now
 
-            # Checkpoint
             if now - last_checkpoint >= 30 and self.states and _is_trading_hours():
                 self._save_checkpoint()
                 last_checkpoint = now
 
-            # Memory log + latency
             if now - last_mem_log >= 30:
                 self._log_mem()
                 self._log_pipeline_latency()
@@ -982,18 +953,24 @@ class CombinedEngine:
 
             self._check_raw_upload_time()
 
-            # GC
             if now - last_gc >= 60:
                 gc.collect()
                 last_gc = now
 
-            # Day rollover
             self._check_day_rollover()
 
-            time.sleep(0.5)
+            # Health check: if no data arrives for 120s during trading hours, exit for K8s restart
+            if _is_trading_hours() and self.states:
+                last_ts = self._memory_store._last_append_ts
+                if last_ts > 0 and (now - last_ts) > 120:
+                    logger.error("[combined] no data for %.0fs during trading hours, exiting for restart",
+                                 now - last_ts)
+                    self.stop()
+                    sys.exit(1)
+
+            time.sleep(0.1)
 
     def stop(self) -> None:
-        # Snapshot remaining data to disk archive
         try:
             self._snapshot_to_archive()
         except Exception as exc:
@@ -1013,7 +990,6 @@ class CombinedEngine:
                 self._io_man.Shutdown()
             except Exception:
                 pass
-        # Shutdown thread pools
         self._compute_executor.shutdown(wait=False)
         logger.info("[combined] engine stopped")
 
