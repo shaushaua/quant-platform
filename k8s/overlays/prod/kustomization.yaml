@@ -1,0 +1,27 @@
+# Prod overlay: large machines, full resources
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Deployment
+      name: combined-engine
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: combined-engine
+        namespace: quant
+      spec:
+        template:
+          spec:
+            containers:
+              - name: combined-engine
+                resources:
+                  requests:
+                    cpu: "4"
+                    memory: 64Gi
+                  limits:
+                    cpu: "12"
+                    memory: 90Gi

@@ -58,32 +58,18 @@ cd "$CFG_DIR"
 export LD_LIBRARY_PATH="/opt/mdl-client:${LD_LIBRARY_PATH}"
 ./feeder_client &
 
-# feeder_client forks to background — just wait for port 9012 to be ready
+# Wait for feeder_client TCP port 9012 to be ready
 echo "[entrypoint] Waiting for feeder_client to listen on 9012..."
 for i in $(seq 1 120); do
-    if python -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-try:
-    s.connect(('127.0.0.1', 9012))
-    s.close()
-    exit(0)
-except:
-    exit(1)
-" 2>/dev/null; then
+    if (echo > /dev/tcp/127.0.0.1/9012) 2>/dev/null; then
         echo "[entrypoint] feeder_client ready on 9012"
         break
     fi
     sleep 1
 done
 
-# Verify port is actually open
-if ! python -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(('127.0.0.1', 9012))
-s.close()
-" 2>/dev/null; then
+# Final check
+if ! (echo > /dev/tcp/127.0.0.1/9012) 2>/dev/null; then
     echo "[entrypoint] ERROR: feeder_client did not start within 120s"
     cat "${LOG_DIR}/feeder_client.log" 2>/dev/null | tail -20 || true
     exit 1
