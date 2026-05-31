@@ -317,23 +317,18 @@ class MemoryStore:
         """Get deal data as DataFrame. Uses incremental cache for per-stock queries."""
         return self._get_incremental("deal", code, DEAL_COLUMNS)
 
-    # ==================== 批量预热（一次 numpy 转换）====================
+    # ==================== 批量预热（逐股，线程池前）====================
 
     def warm_cache_batch(self, kind: str, codes: list) -> int:
-        """Pre-warm numpy caches for all codes in batch.
-        Collects ALL new rows into one list, converts with ONE np.array() call,
-        then splits back per stock. Avoids per-stock np.array() overhead.
-        After this, get_*() only needs pd.DataFrame build (thread-safe)."""
+        """Pre-warm numpy caches for all codes.
+        After this, get_*() only needs pd.DataFrame build (no shared state mutation).
+        Returns number of stocks updated."""
         np_cache = getattr(self, f"_{kind}_np_cache")
         cache_len = getattr(self, f"_{kind}_cache_len")
         df_cache = getattr(self, f"_{kind}_df_cache")
         lists = getattr(self, f"_{kind}_lists")
 
-        # Phase 1: Collect all new rows, track per-stock boundaries
-        all_new_rows = []
-        code_meta = {}  # code -> (start, end, is_rebuild)
-        offset = 0
-
+        updated = 0
         for code in codes:
             lst = lists.get(code, [])
             if not lst:
@@ -341,34 +336,19 @@ class MemoryStore:
             cl = cache_len.get(code, 0)
             cur = len(lst)
             if cl == cur and code in df_cache:
-                continue  # Already fully warm
+                continue
             if cl > cur:
                 cl = 0
             new_rows = lst[cl:]
-            if not new_rows:
-                cache_len[code] = cur
-                continue
-            is_rebuild = (cl == 0 or code not in np_cache)
-            all_new_rows.extend(new_rows)
-            code_meta[code] = (offset, offset + len(new_rows), is_rebuild)
-            offset += len(new_rows)
+            if new_rows:
+                new_np = np.array(new_rows)
+                if cl == 0 or code not in np_cache:
+                    np_cache[code] = new_np
+                else:
+                    np_cache[code] = np.concatenate([np_cache[code], new_np])
             cache_len[code] = cur
-
-        if not all_new_rows:
-            return 0
-
-        # Phase 2: ONE np.array conversion for ALL new rows (major speedup)
-        big_np = np.array(all_new_rows) if all_new_rows else np.empty((0,))
-
-        # Phase 3: Split back per stock
-        for code, (s, e, is_rebuild) in code_meta.items():
-            chunk = big_np[s:e]  # View into big_np
-            if is_rebuild:
-                np_cache[code] = chunk.copy()  # Own its memory
-            else:
-                np_cache[code] = np.concatenate([np_cache[code], chunk])
-
-        return len(code_meta)
+            updated += 1
+        return updated
 
     def warm_tick_batch(self, codes: list) -> int:
         return self.warm_cache_batch("tick", codes)
