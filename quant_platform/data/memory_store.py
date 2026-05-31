@@ -257,7 +257,8 @@ class MemoryStore:
     def _get_incremental(self, kind: str, code: Optional[str], columns: tuple) -> pd.DataFrame:
         """Core logic for incremental DataFrame retrieval.
         Uses numpy ndarray for fast incremental accumulation,
-        converts to DataFrame only at read time."""
+        converts to DataFrame only at read time.
+        After warm_cache_batch(), only DataFrame build remains (thread-safe)."""
         if code is None:
             # All stocks combined — no cache, build from scratch (rare path)
             lists = getattr(self, f"_{kind}_lists")
@@ -281,11 +282,16 @@ class MemoryStore:
         if cached_len == current_len and code in df_cache:
             return df_cache[code]
 
-        # List was truncated (MAX_ROWS) → invalidate cache, rebuild from scratch
+        # Numpy already warmed (cache_len matches) but DataFrame not built yet
+        if cached_len == current_len and code in np_cache:
+            df = pd.DataFrame(np_cache[code], columns=columns)
+            df_cache[code] = df
+            return df
+
+        # Numpy cache needs update (not pre-warmed, or new data arrived after warm)
         if cached_len > current_len:
             cached_len = 0
 
-        # Convert only the new rows (delta) to numpy
         new_rows = lst[cached_len:]
         new_np = np.array(new_rows)
 
@@ -310,6 +316,48 @@ class MemoryStore:
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
         """Get deal data as DataFrame. Uses incremental cache for per-stock queries."""
         return self._get_incremental("deal", code, DEAL_COLUMNS)
+
+    # ==================== 批量预热（主线程调用，线程池前）====================
+
+    def warm_cache_batch(self, kind: str, codes: list) -> int:
+        """Pre-warm numpy caches for all codes (single-threaded).
+        After this, get_*() only needs pd.DataFrame build (thread-safe, no shared state mutation).
+        Returns number of stocks updated."""
+        np_cache = getattr(self, f"_{kind}_np_cache")
+        cache_len = getattr(self, f"_{kind}_cache_len")
+        df_cache = getattr(self, f"_{kind}_df_cache")
+        lists = getattr(self, f"_{kind}_lists")
+
+        updated = 0
+        for code in codes:
+            lst = lists.get(code, [])
+            if not lst:
+                continue
+            cl = cache_len.get(code, 0)
+            cur = len(lst)
+            if cl == cur and code in df_cache:
+                continue  # Already fully warm
+            if cl > cur:
+                cl = 0  # Truncated
+            new_rows = lst[cl:]
+            if new_rows:
+                new_np = np.array(new_rows)
+                if cl == 0 or code not in np_cache:
+                    np_cache[code] = new_np
+                else:
+                    np_cache[code] = np.concatenate([np_cache[code], new_np])
+            cache_len[code] = cur
+            updated += 1
+        return updated
+
+    def warm_tick_batch(self, codes: list) -> int:
+        return self.warm_cache_batch("tick", codes)
+
+    def warm_deal_batch(self, codes: list) -> int:
+        return self.warm_cache_batch("deal", codes)
+
+    def warm_order_batch(self, codes: list) -> int:
+        return self.warm_cache_batch("order", codes)
 
     def get_quote(self, code: str) -> dict:
         """获取单只股票最新行情"""

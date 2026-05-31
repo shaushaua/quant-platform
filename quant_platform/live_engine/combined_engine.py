@@ -694,11 +694,21 @@ class CombinedEngine:
             return
 
         all_codes = dirty & states_snapshot.keys() if states_snapshot else dirty
+        codes_list = list(all_codes)
 
         logger.info("[combined] computing: date=%s end_time=%s stocks=%d (dirty=%d)",
                      date_str, end_time, len(all_codes), len(dirty))
 
         t0 = time.time()
+
+        # Pre-warm numpy caches in main thread (fast, ~250ms for 5000 stocks)
+        # After this, workers only do pd.DataFrame build (thread-safe, no shared mutation)
+        warm_t0 = time.perf_counter()
+        store.warm_tick_batch(codes_list)
+        store.warm_deal_batch(codes_list)
+        store.warm_order_batch(codes_list)
+        warm_ms = (time.perf_counter() - warm_t0) * 1000
+
         results = []
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
@@ -725,8 +735,8 @@ class CombinedEngine:
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info(
-            "[combined] computed: %d results in %.0fms (8 workers) | df_build=%.0fms factor=%.0fms wall=%.0fms",
-            len(result_df), elapsed_ms, total_df_us / 1000, total_factor_us / 1000, elapsed_ms,
+            "[combined] computed: %d results in %.0fms | warm=%.0fms df_build=%.0fms factor=%.0fms",
+            len(result_df), elapsed_ms, warm_ms, total_df_us / 1000, total_factor_us / 1000,
         )
 
         if states_snapshot:
