@@ -34,6 +34,7 @@ import os
 import pickle
 import resource
 import signal
+import struct
 import sys
 import threading
 import time
@@ -90,6 +91,31 @@ def create_direct_callback(
     MID_SZ_TICK = pymdl.mdl_szl2_msg.MDLMID_Snapshot300111_v2
     MID_SZ_ORDER = pymdl.mdl_szl2_msg.MDLMID_Order300192_v2
     MID_SZ_DEAL = pymdl.mdl_szl2_msg.MDLMID_Transaction300191_v2
+
+    # PML recording: dump raw binary for later replay testing
+    _rec_dir = os.environ.get("PML_RECORD_DIR", "")
+    _rec_seconds = int(os.environ.get("PML_RECORD_SECONDS", "60"))
+    _rec_file = None
+    _rec_count = 0
+    _rec_deadline = 0.0
+
+    if _rec_dir:
+        os.makedirs(_rec_dir, exist_ok=True)
+        _rec_path = os.path.join(_rec_dir, f"pml_capture_{time.strftime('%Y%m%d_%H%M%S')}.bin")
+        _rec_file = open(_rec_path, "wb")
+        _rec_deadline = time.time() + _rec_seconds
+        import struct
+        logger.info("[pml-rec] recording to %s for %ds", _rec_path, _rec_seconds)
+
+    def _record_buf(mid, seq_id, buf):
+        """Write one raw PML frame to capture file."""
+        f = DirectCallback._rec_file
+        if f is None or time.time() > DirectCallback._rec_deadline:
+            return
+        raw = bytes(buf)
+        frame = struct.pack("<dIII", time.time(), mid, seq_id, len(raw)) + raw
+        f.write(frame)
+        DirectCallback._rec_count += 1
 
     class DirectCallback(pymdl.MsgCallback):
 
@@ -154,6 +180,8 @@ def create_direct_callback(
 
         def OnMDLSHL2Message(self, hd, buf):
             try:
+                if DirectCallback._rec_file:
+                    _record_buf(int(hd.MessageID), int(hd.SequenceID), buf)
                 self._observe(hd)
                 mid = int(hd.MessageID)
                 seq_id = int(hd.SequenceID)
@@ -197,6 +225,8 @@ def create_direct_callback(
 
         def OnMDLSZL2Message(self, hd, buf):
             try:
+                if DirectCallback._rec_file:
+                    _record_buf(int(hd.MessageID), int(hd.SequenceID), buf)
                 self._observe(hd)
                 mid = int(hd.MessageID)
                 seq_id = int(hd.SequenceID)
