@@ -616,7 +616,7 @@ impl StockBuffer {
     /// Remaining columns are extracted as f64 directly (i64 auto-converts).
     fn append_tuples(
         &mut self,
-        py: Python,
+        _py: Python,
         tuples: &Bound<'_, PyList>,
         start_col: usize,
     ) -> PyResult<()> {
@@ -630,7 +630,8 @@ impl StockBuffer {
             self.data.resize(self.capacity * self.n_cols, 0.0);
         }
         for i in 0..n_new {
-            let tuple = tuples.get_item(i)?.downcast::<PyTuple>()?;
+            let item = tuples.get_item(i)?;
+            let tuple = item.downcast::<PyTuple>()?;
             let base = (self.row_count + i) * self.n_cols;
             for j in 0..self.n_cols {
                 let val = tuple.get_item(j + start_col)?;
