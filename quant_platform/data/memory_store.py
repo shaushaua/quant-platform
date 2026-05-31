@@ -317,10 +317,11 @@ class MemoryStore:
         """Get deal data as DataFrame. Uses incremental cache for per-stock queries."""
         return self._get_incremental("deal", code, DEAL_COLUMNS)
 
-    # ==================== 批量预热（主线程调用，线程池前）====================
+    # ==================== 批量预热（多线程并行）====================
 
-    def warm_cache_batch(self, kind: str, codes: list) -> int:
-        """Pre-warm numpy caches for all codes (single-threaded).
+    def warm_cache_batch(self, kind: str, codes: list, workers: int = 4) -> int:
+        """Pre-warm numpy caches for all codes using multiple threads.
+        np.concatenate releases GIL → near-linear speedup.
         After this, get_*() only needs pd.DataFrame build (thread-safe, no shared state mutation).
         Returns number of stocks updated."""
         np_cache = getattr(self, f"_{kind}_np_cache")
@@ -328,17 +329,16 @@ class MemoryStore:
         df_cache = getattr(self, f"_{kind}_df_cache")
         lists = getattr(self, f"_{kind}_lists")
 
-        updated = 0
-        for code in codes:
+        def _warm_one(code):
             lst = lists.get(code, [])
             if not lst:
-                continue
+                return 0
             cl = cache_len.get(code, 0)
             cur = len(lst)
             if cl == cur and code in df_cache:
-                continue  # Already fully warm
+                return 0
             if cl > cur:
-                cl = 0  # Truncated
+                cl = 0
             new_rows = lst[cl:]
             if new_rows:
                 new_np = np.array(new_rows)
@@ -347,17 +347,24 @@ class MemoryStore:
                 else:
                     np_cache[code] = np.concatenate([np_cache[code], new_np])
             cache_len[code] = cur
-            updated += 1
-        return updated
+            return 1
 
-    def warm_tick_batch(self, codes: list) -> int:
-        return self.warm_cache_batch("tick", codes)
+        if len(codes) < 100 or workers <= 1:
+            return sum(_warm_one(c) for c in codes)
 
-    def warm_deal_batch(self, codes: list) -> int:
-        return self.warm_cache_batch("deal", codes)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_warm_one, codes))
+        return sum(results)
 
-    def warm_order_batch(self, codes: list) -> int:
-        return self.warm_cache_batch("order", codes)
+    def warm_tick_batch(self, codes: list, workers: int = 4) -> int:
+        return self.warm_cache_batch("tick", codes, workers)
+
+    def warm_deal_batch(self, codes: list, workers: int = 4) -> int:
+        return self.warm_cache_batch("deal", codes, workers)
+
+    def warm_order_batch(self, codes: list, workers: int = 4) -> int:
+        return self.warm_cache_batch("order", codes, workers)
 
     def get_quote(self, code: str) -> dict:
         """获取单只股票最新行情"""
