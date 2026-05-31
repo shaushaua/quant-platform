@@ -309,6 +309,7 @@ class MemoryStore:
             return pd.DataFrame()
 
         # Build DataFrame from Rust buffer
+        t0 = time.perf_counter()
         arr = buf.to_numpy()                           # (rows, n_cols) f64
         df = pd.DataFrame(arr, columns=columns[2:])    # skip TradingDay/Code column names
 
@@ -321,6 +322,10 @@ class MemoryStore:
         df.insert(0, 'TradingDay', self._trading_day)
         df.insert(1, 'Code', code)
         df = df[columns]  # reorder to standard column order
+        build_ms = (time.perf_counter() - t0) * 1000
+
+        if build_ms > 5.0:  # log slow builds (>5ms)
+            logger.debug("[df-build-%s] %s: %d rows, %.1fms", kind, code, len(df), build_ms)
 
         df_cache[code] = df
         return df
@@ -349,7 +354,11 @@ class MemoryStore:
         lists = getattr(self, f"_{kind}_lists")
         n_cols, n_str = self._buf_config[kind]
 
+        t0 = time.perf_counter()
         updated = 0
+        total_new_rows = 0
+        truncated = 0
+        new_bufs = 0
         for code in codes:
             lst = lists.get(code, [])
             if not lst:
@@ -362,16 +371,25 @@ class MemoryStore:
                 if code in buf_map:
                     buf_map[code].reset()
                 cl = 0
+                truncated += 1
             new_rows = lst[cl:]
             if new_rows:
                 buf = buf_map.get(code)
                 if buf is None:
                     buf = mdl_parser.StockBuffer(10000, n_cols, n_str)
                     buf_map[code] = buf
+                    new_bufs += 1
                 buf.append_tuples(new_rows, 2)  # start_col=2, skip TradingDay/Code
+                total_new_rows += len(new_rows)
             cache_len[code] = cur
             df_cache.pop(code, None)  # invalidate df_cache
             updated += 1
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if updated > 0:
+            logger.info(
+                "[warm-%s] %d/%d stocks updated, +%d new rows, %d truncated, %d new_bufs | %.1fms",
+                kind, updated, len(codes), total_new_rows, truncated, new_bufs, elapsed_ms,
+            )
         return updated
 
     def warm_tick_batch(self, codes: list) -> int:

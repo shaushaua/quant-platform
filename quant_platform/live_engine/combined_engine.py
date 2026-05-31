@@ -741,9 +741,21 @@ class CombinedEngine:
 
         # Pre-warm only the data types that changed
         warm_t0 = time.perf_counter()
-        if tick_codes: store.warm_tick_batch(tick_codes)
-        if deal_codes: store.warm_deal_batch(deal_codes)
-        if order_codes: store.warm_order_batch(order_codes)
+        warm_tick_ms = 0.0
+        warm_deal_ms = 0.0
+        warm_order_ms = 0.0
+        if tick_codes:
+            t1 = time.perf_counter()
+            store.warm_tick_batch(tick_codes)
+            warm_tick_ms = (time.perf_counter() - t1) * 1000
+        if deal_codes:
+            t1 = time.perf_counter()
+            store.warm_deal_batch(deal_codes)
+            warm_deal_ms = (time.perf_counter() - t1) * 1000
+        if order_codes:
+            t1 = time.perf_counter()
+            store.warm_order_batch(order_codes)
+            warm_order_ms = (time.perf_counter() - t1) * 1000
         warm_ms = (time.perf_counter() - warm_t0) * 1000
 
         results = []
@@ -752,6 +764,7 @@ class CombinedEngine:
         # Aggregate timing from all factor workers
         total_df_us = 0
         total_factor_us = 0
+        stock_timings: List[Tuple[str, int, int]] = []  # (code, df_us, factor_us)
 
         futures = {
             self._compute_executor.submit(
@@ -760,20 +773,43 @@ class CombinedEngine:
             for code in all_codes
         }
         for future in as_completed(futures):
+            code = futures[future]
             try:
                 result, df_us, factor_us = future.result()
                 total_df_us += df_us
                 total_factor_us += factor_us
+                stock_timings.append((code, df_us, factor_us))
                 if result is not None:
                     results.append(result)
             except Exception as exc:
-                logger.warning("[%s] factor failed: %s", futures[future], exc)
+                logger.warning("[%s] factor failed: %s", code, exc)
 
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info(
-            "[combined] computed: %d results in %.0fms | warm=%.0fms df_build=%.0fms factor=%.0fms",
-            len(result_df), elapsed_ms, warm_ms, total_df_us / 1000, total_factor_us / 1000,
+            "[combined] computed: %d results in %.0fms | warm=%.0fms (tick=%.0f deal=%.0f order=%.0f) df_build=%.0fms factor=%.0fms",
+            len(result_df), elapsed_ms, warm_ms, warm_tick_ms, warm_deal_ms, warm_order_ms,
+            total_df_us / 1000, total_factor_us / 1000,
+        )
+
+        # Log top-3 slowest stocks (df_build + factor)
+        if stock_timings:
+            stock_timings.sort(key=lambda x: x[1] + x[2], reverse=True)
+            slow = stock_timings[:3]
+            parts = [f"{c}: df={df_us/1000:.0f}ms fac={fac_us/1000:.0f}ms" for c, df_us, fac_us in slow]
+            logger.info("[combined] slowest stocks: %s", " | ".join(parts))
+
+        # Log buffer row counts for data health check
+        store_stats = store.get_stats()
+        buf_tick = sum(b.len() for b in store._tick_buf.values()) if store._tick_buf else 0
+        buf_deal = sum(b.len() for b in store._deal_buf.values()) if store._deal_buf else 0
+        buf_order = sum(b.len() for b in store._order_buf.values()) if store._order_buf else 0
+        logger.info(
+            "[combined] buffer rows: tick=%d (lists=%d) deal=%d (lists=%d) order=%d (lists=%d) | df_cache=%d/%d/%d",
+            buf_tick, store_stats["tick_rows"],
+            buf_deal, store_stats["deal_rows"],
+            buf_order, store_stats["order_rows"],
+            len(store._tick_df_cache), len(store._deal_df_cache), len(store._order_df_cache),
         )
 
         if states_snapshot:
