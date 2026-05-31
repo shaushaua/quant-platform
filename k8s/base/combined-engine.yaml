@@ -80,6 +80,11 @@ spec:
               value: /data/collector_output
             - name: COLLECTOR_MAX_DISK_QUEUE
               value: "200"
+            # --- PML 录制（调试用，取消注释启用，录完关掉）---
+            # - name: PML_RECORD_DIR
+            #   value: /data/collector_output/pml_rec
+            # - name: PML_RECORD_SECONDS
+            #   value: "60"
             # --- 通用 ---
             - name: TZ
               value: Asia/Shanghai
