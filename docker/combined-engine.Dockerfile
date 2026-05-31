@@ -30,23 +30,20 @@ RUN mkdir -p /opt/mdl-client \
     && chmod +x /opt/mdl-client/feeder_client \
     && rm -f /tmp/mdl_forward_2.13.232_linux.tar.gz
 
-# Build Rust mdl_parser extension (binary parser for MDL messages, ~10x faster than Python)
+# Build Rust mdl_parser extension — install, build, cleanup in ONE layer to avoid bloat.
 # Use Chinese mirrors for rustup and cargo (direct rustup.sh is too slow in China)
 ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+COPY mdl_parser/ /app/mdl_parser/
 RUN curl --proto '=https' --tlsv1.2 -sSf https://mirrors.ustc.edu.cn/rust-static/rustup/rustup-init.sh | sh -s -- -y --default-toolchain stable \
     && . "$HOME/.cargo/env" \
-    && pip install --no-cache-dir maturin
-COPY mdl_parser/ /app/mdl_parser/
-RUN mkdir -p /root/.cargo \
-    && echo '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"' > /root/.cargo/config.toml \
-    && . "$HOME/.cargo/env" \
+    && pip install --no-cache-dir maturin \
+    && mkdir -p /root/.cargo \
+    && printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' > /root/.cargo/config.toml \
     && cd /app/mdl_parser && maturin build --release --strip \
     && pip install --no-cache-dir /app/mdl_parser/target/wheels/*.whl \
     && python -c "import mdl_parser; print('mdl_parser import ok')" \
-    && rm -rf /app/mdl_parser/target /root/.cargo/registry
-# Remove Rust toolchain after build to save ~500MB
-RUN rm -rf /root/.rustup /root/.cargo
+    && rm -rf /app/mdl_parser/target /root/.rustup /root/.cargo
 
 # Copy entrypoint script (starts feeder_client then Python engine)
 COPY docker/entrypoint-combined.sh /app/entrypoint-combined.sh
