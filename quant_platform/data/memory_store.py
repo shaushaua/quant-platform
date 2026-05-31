@@ -267,9 +267,9 @@ class MemoryStore:
         cached_len = cache_len.get(code, 0)
         current_len = len(lst)
 
-        # No new data → return cached copy directly
+        # No new data → return cached DataFrame directly (read-only callers)
         if cached_len == current_len and code in cache:
-            return cache[code].copy()
+            return cache[code]
 
         # List was truncated (MAX_ROWS) → invalidate cache, rebuild from scratch
         if cached_len > current_len:
@@ -285,7 +285,7 @@ class MemoryStore:
             cache[code] = pd.concat([cache[code], new_df], ignore_index=True)
 
         cache_len[code] = current_len
-        return cache[code].copy()
+        return cache[code]
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
         """Get tick data as DataFrame. Uses incremental cache for per-stock queries."""
