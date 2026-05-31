@@ -79,6 +79,10 @@ class MemoryStore:
         self._tick_cache_len: Dict[str, int] = {}
         self._order_cache_len: Dict[str, int] = {}
         self._deal_cache_len: Dict[str, int] = {}
+        # DataFrame cache: cache the last built DataFrame for cache-hit fast path
+        self._tick_df_cache: Dict[str, pd.DataFrame] = {}
+        self._order_df_cache: Dict[str, pd.DataFrame] = {}
+        self._deal_df_cache: Dict[str, pd.DataFrame] = {}
 
         # 最新行情快照
         self._quotes: Dict[str, dict] = {}
@@ -134,6 +138,9 @@ class MemoryStore:
             self._tick_np_cache.clear()
             self._order_np_cache.clear()
             self._deal_np_cache.clear()
+            self._tick_df_cache.clear()
+            self._order_df_cache.clear()
+            self._deal_df_cache.clear()
             self._tick_cache_len.clear()
             self._order_cache_len.clear()
             self._deal_cache_len.clear()
@@ -264,14 +271,15 @@ class MemoryStore:
             return pd.DataFrame()
 
         np_cache = getattr(self, f"_{kind}_np_cache")
+        df_cache = getattr(self, f"_{kind}_df_cache")
         cache_len = getattr(self, f"_{kind}_cache_len")
 
         cached_len = cache_len.get(code, 0)
         current_len = len(lst)
 
-        # No new data → convert cached ndarray to DataFrame
-        if cached_len == current_len and code in np_cache:
-            return pd.DataFrame(np_cache[code], columns=columns)
+        # No new data → return cached DataFrame directly (fast path)
+        if cached_len == current_len and code in df_cache:
+            return df_cache[code]
 
         # List was truncated (MAX_ROWS) → invalidate cache, rebuild from scratch
         if cached_len > current_len:
@@ -287,7 +295,9 @@ class MemoryStore:
             np_cache[code] = np.concatenate([np_cache[code], new_np])
 
         cache_len[code] = current_len
-        return pd.DataFrame(np_cache[code], columns=columns)
+        df = pd.DataFrame(np_cache[code], columns=columns)
+        df_cache[code] = df
+        return df
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
         """Get tick data as DataFrame. Uses incremental cache for per-stock queries."""
