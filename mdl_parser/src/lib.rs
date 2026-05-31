@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
-use pyo3::types::PyString;
+use pyo3::types::{PyTuple, PyString, PyList};
 use pyo3::Bound;
+use numpy::{PyArray2, IntoPyArray};
 
 // ================================================================== //
 // MDL binary parsing helpers                                          //
@@ -567,6 +567,110 @@ fn parse_sz_deal(py: Python, buf: &[u8], trading_day: &str, seq_id: i64) -> Opti
 }
 
 // ================================================================== //
+// Pre-allocated StockBuffer for fast incremental accumulation         //
+// ================================================================== //
+
+/// Parse "20260106 09:30:00.500" → 34200.5 (seconds since midnight)
+fn time_str_to_seconds(s: &str) -> f64 {
+    let time_part = match s.split(' ').nth(1) {
+        Some(t) => t,
+        None => return 0.0,
+    };
+    let parts: Vec<&str> = time_part.split(':').collect();
+    let h: f64 = parts.first().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    let m: f64 = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    let sec_parts: Vec<&str> = parts.get(2).unwrap_or(&"0.0").split('.').collect();
+    let sec: f64 = sec_parts.first().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    let ms: f64 = sec_parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    h * 3600.0 + m * 60.0 + sec + ms / 1000.0
+}
+
+/// Pre-allocated flat buffer for one stock's numeric data.
+/// Stores f64 in row-major layout: data[row * n_cols + col].
+/// append_tuples only writes new rows — no copy of existing data.
+#[pyclass]
+struct StockBuffer {
+    data: Vec<f64>,
+    row_count: usize,
+    capacity: usize,
+    n_cols: usize,
+    n_string_cols: usize,
+}
+
+#[pymethods]
+impl StockBuffer {
+    #[new]
+    fn new(capacity: usize, n_cols: usize, n_string_cols: usize) -> Self {
+        StockBuffer {
+            data: vec![0.0f64; capacity * n_cols],
+            row_count: 0,
+            capacity,
+            n_cols,
+            n_string_cols,
+        }
+    }
+
+    /// Extract numeric columns from Python tuples into the buffer.
+    /// `start_col`: skip the first N columns (e.g., TradingDay, Code).
+    /// First `n_string_cols` columns after start_col are parsed as time strings → f64 seconds.
+    /// Remaining columns are extracted as f64 directly (i64 auto-converts).
+    fn append_tuples(
+        &mut self,
+        py: Python,
+        tuples: &Bound<'_, PyList>,
+        start_col: usize,
+    ) -> PyResult<()> {
+        let n_new = tuples.len();
+        if n_new == 0 {
+            return Ok(());
+        }
+        // Auto-grow if needed
+        while self.row_count + n_new > self.capacity {
+            self.capacity *= 2;
+            self.data.resize(self.capacity * self.n_cols, 0.0);
+        }
+        for i in 0..n_new {
+            let tuple = tuples.get_item(i)?.downcast::<PyTuple>()?;
+            let base = (self.row_count + i) * self.n_cols;
+            for j in 0..self.n_cols {
+                let val = tuple.get_item(j + start_col)?;
+                self.data[base + j] = if j < self.n_string_cols {
+                    let s = val.extract::<&str>()?;
+                    time_str_to_seconds(s)
+                } else {
+                    val.extract::<f64>()?
+                };
+            }
+        }
+        self.row_count += n_new;
+        Ok(())
+    }
+
+    /// Return filled data as numpy f64 array (copy). Buffer retains data for next warm.
+    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let n = self.row_count * self.n_cols;
+        if n == 0 {
+            let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(empty.into_pyarray(py));
+        }
+        let filled: Vec<f64> = self.data[..n].to_vec();
+        let arr = numpy::ndarray::Array2::from_shape_vec((self.row_count, self.n_cols), filled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
+    }
+
+    fn len(&self) -> usize {
+        self.row_count
+    }
+
+    /// Reset row count to 0 (keep allocated memory). Used after list truncation.
+    fn reset(&mut self) {
+        self.row_count = 0;
+    }
+}
+
+// ================================================================== //
 // PyO3 module                                                         //
 // ================================================================== //
 
@@ -577,5 +681,6 @@ fn mdl_parser(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_sh_ngts, m)?)?;
     m.add_function(wrap_pyfunction!(parse_sz_order, m)?)?;
     m.add_function(wrap_pyfunction!(parse_sz_deal, m)?)?;
+    m.add_class::<StockBuffer>()?;
     Ok(())
 }

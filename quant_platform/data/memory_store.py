@@ -17,6 +17,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import mdl_parser
 
 from ..core.constants import TICK_COLUMNS, ORDER_COLUMNS, DEAL_COLUMNS
 
@@ -76,10 +77,15 @@ class MemoryStore:
         self._dirty_deal: set = set()
         self._dirty_order: set = set()
 
-        # Incremental numpy cache: accumulate as ndarray (fast), convert to DataFrame at read time
-        self._tick_np_cache: Dict[str, np.ndarray] = {}
-        self._order_np_cache: Dict[str, np.ndarray] = {}
-        self._deal_np_cache: Dict[str, np.ndarray] = {}
+        # Rust pre-allocated buffer: code -> StockBuffer (f64, incremental append)
+        # tick: 81 - 2(TradingDay,Code) = 79 cols, first 2 are Time/UpdateTime strings
+        # order: 11 - 2 = 9 cols, first 2 are Time/UpdateTime strings
+        # deal: 12 - 2 = 10 cols, first 2 are Time/UpdateTime strings
+        self._tick_buf: Dict[str, mdl_parser.StockBuffer] = {}
+        self._order_buf: Dict[str, mdl_parser.StockBuffer] = {}
+        self._deal_buf: Dict[str, mdl_parser.StockBuffer] = {}
+        self._buf_config = {"tick": (79, 2), "order": (9, 2), "deal": (10, 2)}
+
         self._tick_cache_len: Dict[str, int] = {}
         self._order_cache_len: Dict[str, int] = {}
         self._deal_cache_len: Dict[str, int] = {}
@@ -141,10 +147,10 @@ class MemoryStore:
             self._archive_offset_tick = {}
             self._archive_offset_order = {}
             self._archive_offset_deal = {}
-            # Reset incremental numpy cache
-            self._tick_np_cache.clear()
-            self._order_np_cache.clear()
-            self._deal_np_cache.clear()
+            # Reset Rust buffer and caches
+            self._tick_buf.clear()
+            self._order_buf.clear()
+            self._deal_buf.clear()
             self._tick_df_cache.clear()
             self._order_df_cache.clear()
             self._deal_df_cache.clear()
@@ -274,7 +280,7 @@ class MemoryStore:
 
     def _get_incremental(self, kind: str, code: Optional[str], columns: tuple) -> pd.DataFrame:
         """Core logic for incremental DataFrame retrieval.
-        Uses numpy ndarray for fast incremental accumulation,
+        Uses Rust StockBuffer for fast incremental accumulation,
         converts to DataFrame only at read time.
         After warm_cache_batch(), only DataFrame build remains (thread-safe)."""
         if code is None:
@@ -285,14 +291,12 @@ class MemoryStore:
                 all_rows.extend(lst)
             return pd.DataFrame(all_rows, columns=columns) if all_rows else pd.DataFrame()
 
-        lst = getattr(self, f"_{kind}_lists").get(code, [])
-        if not lst:
-            return pd.DataFrame()
-
-        np_cache = getattr(self, f"_{kind}_np_cache")
         df_cache = getattr(self, f"_{kind}_df_cache")
         cache_len = getattr(self, f"_{kind}_cache_len")
+        lists = getattr(self, f"_{kind}_lists")
+        buf_map = getattr(self, f"_{kind}_buf")
 
+        lst = lists.get(code, [])
         cached_len = cache_len.get(code, 0)
         current_len = len(lst)
 
@@ -300,26 +304,24 @@ class MemoryStore:
         if cached_len == current_len and code in df_cache:
             return df_cache[code]
 
-        # Numpy already warmed (cache_len matches) but DataFrame not built yet
-        if cached_len == current_len and code in np_cache:
-            df = pd.DataFrame(np_cache[code], columns=columns)
-            df_cache[code] = df
-            return df
+        buf = buf_map.get(code)
+        if buf is None or buf.len() == 0:
+            return pd.DataFrame()
 
-        # Numpy cache needs update (not pre-warmed, or new data arrived after warm)
-        if cached_len > current_len:
-            cached_len = 0
+        # Build DataFrame from Rust buffer
+        arr = buf.to_numpy()                           # (rows, n_cols) f64
+        df = pd.DataFrame(arr, columns=columns[2:])    # skip TradingDay/Code column names
 
-        new_rows = lst[cached_len:]
-        new_np = np.array(new_rows)
+        # Convert Time/UpdateTime from f64 seconds to datetime64[ns]
+        base = pd.Timestamp(self._trading_day)
+        df['Time'] = pd.to_datetime(df['Time'], unit='s', origin=base)
+        df['UpdateTime'] = pd.to_datetime(df['UpdateTime'], unit='s', origin=base)
 
-        if cached_len == 0 or code not in np_cache:
-            np_cache[code] = new_np
-        else:
-            np_cache[code] = np.concatenate([np_cache[code], new_np])
+        # Inject constant string columns
+        df.insert(0, 'TradingDay', self._trading_day)
+        df.insert(1, 'Code', code)
+        df = df[columns]  # reorder to standard column order
 
-        cache_len[code] = current_len
-        df = pd.DataFrame(np_cache[code], columns=columns)
         df_cache[code] = df
         return df
 
@@ -338,13 +340,14 @@ class MemoryStore:
     # ==================== 批量预热（逐股，线程池前）====================
 
     def warm_cache_batch(self, kind: str, codes: list) -> int:
-        """Pre-warm numpy caches for all codes.
-        After this, get_*() only needs pd.DataFrame build (no shared state mutation).
+        """Pre-warm Rust buffers for all codes.
+        Appends new rows to StockBuffer (no copy of existing data).
         Returns number of stocks updated."""
-        np_cache = getattr(self, f"_{kind}_np_cache")
+        buf_map = getattr(self, f"_{kind}_buf")
         cache_len = getattr(self, f"_{kind}_cache_len")
         df_cache = getattr(self, f"_{kind}_df_cache")
         lists = getattr(self, f"_{kind}_lists")
+        n_cols, n_str = self._buf_config[kind]
 
         updated = 0
         for code in codes:
@@ -355,16 +358,19 @@ class MemoryStore:
             cur = len(lst)
             if cl == cur and code in df_cache:
                 continue
-            if cl > cur:
+            if cl > cur:  # list was truncated
+                if code in buf_map:
+                    buf_map[code].reset()
                 cl = 0
             new_rows = lst[cl:]
             if new_rows:
-                new_np = np.array(new_rows)
-                if cl == 0 or code not in np_cache:
-                    np_cache[code] = new_np
-                else:
-                    np_cache[code] = np.concatenate([np_cache[code], new_np])
+                buf = buf_map.get(code)
+                if buf is None:
+                    buf = mdl_parser.StockBuffer(10000, n_cols, n_str)
+                    buf_map[code] = buf
+                buf.append_tuples(new_rows, 2)  # start_col=2, skip TradingDay/Code
             cache_len[code] = cur
+            df_cache.pop(code, None)  # invalidate df_cache
             updated += 1
         return updated
 
