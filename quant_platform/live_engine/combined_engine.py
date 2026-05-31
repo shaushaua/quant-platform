@@ -548,6 +548,10 @@ class CombinedEngine:
         self._flush_disk_queue()
         if self._upload_raw_day_to_oss(self._trading_day):
             self._uploaded_today = True
+        else:
+            # No data to upload (e.g. non-trading day) — mark done to stop retrying
+            logger.info("[raw-archive] upload returned false, marking uploaded_today to stop retrying")
+            self._uploaded_today = True
 
     def _upload_raw_day_to_oss(self, trading_day: date) -> bool:
         date_str = trading_day.strftime("%Y%m%d")
