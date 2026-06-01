@@ -271,8 +271,8 @@ def load_oss_data(date_str, codes_str, limit, cache_dir):
 # ---- Phase 2: Feed into MemoryStore (ShmStockBuffer) ----
 
 def feed_into_store(raw_groups, trading_day):
-    """Convert DataFrame rows to tuples and feed into MemoryStore via append_tick/deal/order.
-    This exercises the same ShmStockBuffer mmap write path as the live engine."""
+    """Feed DataFrames into MemoryStore via ShmStockBuffer batch writes.
+    Uses buf.append_tuples() for bulk writes instead of per-row append."""
     store = MemoryStore.get_instance()
     store.set_trading_day(trading_day)
 
@@ -280,16 +280,19 @@ def feed_into_store(raw_groups, trading_day):
     counts = {"tick": 0, "deal": 0, "order": 0}
 
     for kind, columns in [("tick", TICK_COLUMNS), ("deal", DEAL_COLUMNS), ("order", ORDER_COLUMNS)]:
-        append_fn = getattr(store, f"append_{kind}")
         groups = raw_groups.get(kind, {})
         for code, df in groups.items():
             if df.empty:
                 continue
-            for _, row in df.iterrows():
-                tup = tuple(row.get(c, 0) for c in columns)
-                append_fn(code, tup)
-                counts[kind] += 1
+            # Convert DataFrame to list of tuples, batch append to ShmStockBuffer
+            tuples = [tuple(row.get(c, 0) for c in columns) for row in df.to_dict('records')]
+            buf = store._get_or_create_buf(kind, code)
+            buf.append_tuples(tuples, 2)  # start_col=2, skip TradingDay/Code
+            store._dirty_codes.add(code)
+            getattr(store, f"_dirty_{kind}").add(code)
+            counts[kind] += len(tuples)
 
+    store._last_append_ts = time.time()
     feed_ms = (time.perf_counter() - t0) * 1000
     print(f"  Feed: {feed_ms:.0f}ms | tick={counts['tick']} deal={counts['deal']} order={counts['order']}")
     return store, counts
@@ -390,8 +393,7 @@ def main():
     parser.add_argument("--end-time", default="150000", help="end_time for factor")
     parser.add_argument("--output", default="", help="Save results to CSV/parquet")
     parser.add_argument("--cache-dir",
-                        default=os.environ.get("OSS_LOCAL_CACHE_DIR",
-                                               os.path.expanduser("~/.oss_cache")),
+                        default=os.environ.get("OSS_LOCAL_CACHE_DIR", "/data/oss_cache"),
                         help="Local cache dir for downloaded parquets")
     args = parser.parse_args()
 
