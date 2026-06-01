@@ -166,6 +166,7 @@ def _zerocopy_arr(path: str):
 
 def _build_df_from_path(path, columns, trading_day, code):
     """Build DataFrame from mmap file with zero-copy numpy read.
+    Single-pass dict construction — no insert/reorder overhead.
     Only Time/UpdateTime columns are copied (f64→datetime64 conversion).
     All other float columns reference the mmap directly — no memcpy."""
     arr = _zerocopy_arr(path)
@@ -173,98 +174,30 @@ def _build_df_from_path(path, columns, trading_day, code):
         return pd.DataFrame()
     buf_cols = columns[2:]  # skip TradingDay, Code
 
-    # Zero-copy: DataFrame Block references the mmap-backed numpy array
-    df = pd.DataFrame(arr, columns=buf_cols, copy=False)
-
-    # Fast time conversion: int64 ns arithmetic, skip pd.to_timedelta overhead
-    base_ns = pd.Timestamp(trading_day).value  # nanoseconds since epoch
-    for col in ('Time', 'UpdateTime'):
-        if col in buf_cols:
-            idx = buf_cols.index(col)
-            # f64 seconds → int64 nanoseconds → datetime64[ns]
-            df[col] = (base_ns + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
-
-    df.insert(0, 'TradingDay', trading_day)
-    df.insert(1, 'Code', code)
-    return df[columns]
-
-
-class _LazyStockData:
-    """Drop-in replacement for StockData — builds DataFrames lazily.
-    Only constructs a DataFrame when the factor actually accesses it.
-    If the factor never reads l2_order, that DataFrame is never built."""
-    __slots__ = ('code', 'date', 'end_time', '_trading_day', '_paths',
-                 '_market_df', '_daily_basic_df', 'state',
-                 '_tick_df', '_deal_df', '_order_df',
-                 'l2_order_hist', 'l2_deal_hist', 'l1_tick_hist')
-
-    def __init__(self, code, date, end_time, tick_path, deal_path, order_path,
-                 trading_day, market_df, daily_basic_df, state):
-        self.code = code
-        self.date = date
-        self.end_time = end_time
-        self._trading_day = trading_day
-        self._paths = {'tick': tick_path, 'deal': deal_path, 'order': order_path}
-        self._market_df = market_df
-        self._daily_basic_df = daily_basic_df
-        self.state = state
-        self._tick_df = None
-        self._deal_df = None
-        self._order_df = None
-        self.l2_order_hist = []
-        self.l2_deal_hist = []
-        self.l1_tick_hist = []
-
-    @property
-    def l1_tick(self):
-        if self._tick_df is None:
-            p = self._paths.get('tick', '')
-            self._tick_df = _build_df_from_path(p, _tick_columns, self._trading_day, self.code) if p else pd.DataFrame()
-        return self._tick_df
-
-    @property
-    def l2_deal(self):
-        if self._deal_df is None:
-            p = self._paths.get('deal', '')
-            self._deal_df = _build_df_from_path(p, _deal_columns, self._trading_day, self.code) if p else pd.DataFrame()
-        return self._deal_df
-
-    @property
-    def l2_order(self):
-        if self._order_df is None:
-            p = self._paths.get('order', '')
-            self._order_df = _build_df_from_path(p, _order_columns, self._trading_day, self.code) if p else pd.DataFrame()
-        return self._order_df
-
-    @property
-    def market(self):
-        return self._market_df
-
-    @property
-    def daily_basic(self):
-        return self._daily_basic_df
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-
-    def get(self, key, default=None):
-        try:
-            return getattr(self, key)
-        except AttributeError:
-            return default
+    # Build column dict in final order — avoids 2× insert + 1× reorder
+    base_ns = pd.Timestamp(trading_day).value
+    data = {'TradingDay': trading_day, 'Code': code}
+    for i, col in enumerate(buf_cols):
+        if col in ('Time', 'UpdateTime'):
+            data[col] = (base_ns + (arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+        else:
+            data[col] = arr[:, i]  # zero-copy view into mmap
+    return pd.DataFrame(data, columns=columns)
 
 
 def _compute_stock_shm(args):
-    """Compute factor with lazy DataFrame construction.
-    DataFrames are only built when the factor actually accesses them."""
+    """Compute factor — builds DataFrames with single-pass dict construction."""
     code, date_str, end_time, wall_secs, state_snap, \
         tick_path, deal_path, order_path, trading_day = args
     try:
-        stock_data = _LazyStockData(
+        tick_df = _build_df_from_path(tick_path, _tick_columns, trading_day, code) if tick_path else pd.DataFrame()
+        deal_df = _build_df_from_path(deal_path, _deal_columns, trading_day, code) if deal_path else pd.DataFrame()
+        order_df = _build_df_from_path(order_path, _order_columns, trading_day, code) if order_path else pd.DataFrame()
+
+        stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
-            tick_path=tick_path, deal_path=deal_path, order_path=order_path,
-            trading_day=trading_day,
-            market_df=_market_df, daily_basic_df=_daily_basic_df,
+            l1_tick=tick_df, l2_deal=deal_df, l2_order=order_df,
+            market=_market_df, daily_basic=_daily_basic_df,
             state=state_snap,
         )
 
