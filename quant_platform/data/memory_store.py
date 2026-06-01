@@ -213,42 +213,71 @@ class MemoryStore:
 
     # --- Parsed per-stock list (SDK callback writes) ---
 
+    def _get_or_create_buf(self, kind: str, code: str):
+        """Get or create ShmStockBuffer for a stock. Called from hot path."""
+        buf_map = getattr(self, f"_{kind}_buf")
+        buf = buf_map.get(code)
+        if buf is None:
+            n_cols, n_str = self._buf_config[kind]
+            path = self._shm_path(kind, code)
+            buf = mdl_parser.ShmStockBuffer(path, 10000, n_cols, n_str)
+            buf_map[code] = buf
+        return buf
+
     def append_tick(self, code: str, row_tuple: tuple) -> None:
-        """Append a single tick tuple (very fast)."""
+        """Append a single tick tuple — writes to Python list + ShmStockBuffer directly."""
+        # Still append to list (needed for archive snapshot)
         lst = self._tick_lists.get(code)
         if lst is None:
             lst = []
             self._tick_lists[code] = lst
         lst.append(row_tuple)
+        # Direct write to ShmStockBuffer (skip warm thread)
+        try:
+            buf = self._get_or_create_buf("tick", code)
+            buf.append_tuples([row_tuple], 2)  # start_col=2
+        except Exception:
+            pass
         self._dirty_codes.add(code)
         self._dirty_tick.add(code)
         if len(lst) > self._max_rows:
-            # CAS: only trim if no other thread replaced the list
             new_lst = lst[-(self._max_rows // 2):]
             if self._tick_lists.get(code) is lst:
                 self._tick_lists[code] = new_lst
         self._last_append_ts = time.time()
 
     def append_order(self, code: str, row_tuple: tuple) -> None:
-        """Append a single order tuple (very fast)."""
+        """Append a single order tuple — writes to list + ShmStockBuffer directly."""
         lst = self._order_lists.get(code)
         if lst is None:
             lst = []
             self._order_lists[code] = lst
         lst.append(row_tuple)
+        try:
+            buf = self._get_or_create_buf("order", code)
+            buf.append_tuples([row_tuple], 2)
+        except Exception:
+            pass
         self._dirty_codes.add(code)
         self._dirty_order.add(code)
         if len(lst) > self._max_rows:
+            new_lst = lst[-(self._max_rows // 2):]
+            if self._order_lists.get(code) is lst:
                 self._order_lists[code] = new_lst
         self._last_append_ts = time.time()
 
     def append_deal(self, code: str, row_tuple: tuple) -> None:
-        """Append a single deal tuple (very fast)."""
+        """Append a single deal tuple — writes to list + ShmStockBuffer directly."""
         lst = self._deal_lists.get(code)
         if lst is None:
             lst = []
             self._deal_lists[code] = lst
         lst.append(row_tuple)
+        try:
+            buf = self._get_or_create_buf("deal", code)
+            buf.append_tuples([row_tuple], 2)
+        except Exception:
+            pass
         self._dirty_codes.add(code)
         self._dirty_deal.add(code)
         if len(lst) > self._max_rows:
@@ -399,51 +428,38 @@ class MemoryStore:
     # ==================== 批量预热（逐股，线程池前）====================
 
     def warm_cache_batch(self, kind: str, codes: list) -> int:
-        """Pre-warm Rust buffers for all codes.
-        Appends new rows to StockBuffer (no copy of existing data).
-        Returns number of stocks updated."""
+        """Sync warm state with buffer state.
+        Since callbacks now write directly to ShmStockBuffer, this mainly handles
+        list truncation detection and cache_len sync. Returns number of stocks updated."""
         buf_map = getattr(self, f"_{kind}_buf")
         cache_len = getattr(self, f"_{kind}_cache_len")
-        df_cache = getattr(self, f"_{kind}_df_cache")
         lists = getattr(self, f"_{kind}_lists")
-        n_cols, n_str = self._buf_config[kind]
 
         t0 = time.perf_counter()
         updated = 0
-        total_new_rows = 0
         truncated = 0
-        new_bufs = 0
         for code in codes:
             lst = lists.get(code, [])
             if not lst:
                 continue
             cl = cache_len.get(code, 0)
             cur = len(lst)
-            if cl == cur and code in df_cache:
+            if cl == cur:
                 continue
-            if cl > cur:  # list was truncated
+            if cl > cur:  # list was truncated — reset buffer
                 if code in buf_map:
                     buf_map[code].reset()
                 cl = 0
                 truncated += 1
-            new_rows = lst[cl:]
-            if new_rows:
-                buf = buf_map.get(code)
-                if buf is None:
-                    path = self._shm_path(kind, code)
-                    buf = mdl_parser.ShmStockBuffer(path, 10000, n_cols, n_str)
-                    buf_map[code] = buf
-                    new_bufs += 1
-                buf.append_tuples(new_rows, 2)  # start_col=2, skip TradingDay/Code
-                total_new_rows += len(new_rows)
+            # Buffer already has the data (appended in callback)
+            # Just sync cache_len
             cache_len[code] = cur
-            # Don't invalidate df_cache — _get_incremental handles incremental updates
             updated += 1
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if updated > 0:
             logger.info(
-                "[warm-%s] %d/%d stocks updated, +%d new rows, %d truncated, %d new_bufs | %.1fms",
-                kind, updated, len(codes), total_new_rows, truncated, new_bufs, elapsed_ms,
+                "[warm-%s] %d/%d stocks synced, %d truncated | %.1fms",
+                kind, updated, len(codes), truncated, elapsed_ms,
             )
         return updated
 

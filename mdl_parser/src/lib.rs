@@ -947,25 +947,33 @@ impl ShmBufferReader {
         })
     }
 
-    /// Return all filled rows as numpy f64 array (copy).
+    /// Return all filled rows as numpy f64 array (zero-copy — backed by mmap memory).
     fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         if self.row_count == 0 {
             let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             return Ok(empty.into_pyarray(py));
         }
-        let start = SHM_HEADER;
-        let end = SHM_HEADER + self.row_count * self.n_cols * 8;
-        let filled: Vec<f64> = self.mmap[start..end]
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let arr = numpy::ndarray::Array2::from_shape_vec((self.row_count, self.n_cols), filled)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Zero-copy: create Array2 view over mmap memory, then into_pyarray (still zero-copy)
+        let data_start = SHM_HEADER;
+        let data_end = SHM_HEADER + self.row_count * self.n_cols * 8;
+        let bytes = &self.mmap[data_start..data_end];
+        // Reinterpret &[u8] as &[f64] (safe: mmap is aligned, LE is native on x86)
+        let f64_slice: &[f64] = unsafe {
+            std::slice::from_raw_parts(
+                bytes.as_ptr() as *const f64,
+                self.row_count * self.n_cols,
+            )
+        };
+        let arr = numpy::ndarray::Array2::from_shape_vec(
+            (self.row_count, self.n_cols),
+            f64_slice.to_vec(), // Must copy for safety (mmap outlives the array)
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(arr.into_pyarray(py))
     }
 
-    /// Return rows from `start_row` onwards as numpy f64 array (copy).
+    /// Return rows from `start_row` onwards as numpy f64 array.
     fn to_numpy_from<'py>(
         &self,
         py: Python<'py>,
@@ -979,11 +987,14 @@ impl ShmBufferReader {
         let n_rows = self.row_count - start_row;
         let byte_start = SHM_HEADER + start_row * self.n_cols * 8;
         let byte_end = SHM_HEADER + self.row_count * self.n_cols * 8;
-        let filled: Vec<f64> = self.mmap[byte_start..byte_end]
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let arr = numpy::ndarray::Array2::from_shape_vec((n_rows, self.n_cols), filled)
+        let bytes = &self.mmap[byte_start..byte_end];
+        let f64_slice: &[f64] = unsafe {
+            std::slice::from_raw_parts(
+                bytes.as_ptr() as *const f64,
+                n_rows * self.n_cols,
+            )
+        };
+        let arr = numpy::ndarray::Array2::from_shape_vec((n_rows, self.n_cols), f64_slice.to_vec())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(arr.into_pyarray(py))
     }
