@@ -74,6 +74,17 @@ _market_df: pd.DataFrame = pd.DataFrame()
 _daily_basic_df: pd.DataFrame = pd.DataFrame()
 
 
+def _pin_worker_cpu(worker_cpus):
+    """Pin child process to a worker CPU (avoid migrating between cores)."""
+    try:
+        # Each worker gets a different CPU from the pool
+        idx = multiprocessing.current_process()._identity[0] - 1 if multiprocessing.current_process()._identity else 0
+        cpu = worker_cpus[idx % len(worker_cpus)]
+        os.sched_setaffinity(0, {cpu})
+    except (AttributeError, OSError):
+        pass
+
+
 def _compute_stock_cow(args):
     """Warm + build DataFrame + compute factor in child process.
     Reads from parent's MemoryStore via fork COW — zero data serialization.
@@ -807,8 +818,15 @@ class CombinedEngine:
         results = []
         errors = 0
         pool_t0 = time.perf_counter()
+
+        # Pin pool workers to CPUs excluding the callback core
+        worker_cpus = [c for c in range(os.cpu_count() or 12) if c != getattr(self, '_callback_cpu', -1)]
         ctx = multiprocessing.get_context('fork')
-        pool = ctx.Pool(processes=self._pool_workers)
+        pool = ctx.Pool(
+            processes=self._pool_workers,
+            initializer=_pin_worker_cpu,
+            initargs=(worker_cpus,),
+        )
         try:
             for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=50):
                 if err:
@@ -997,6 +1015,14 @@ class CombinedEngine:
             )
             self._archive_thread.start()
             logger.info("[combined] archive thread started: interval=%ds", self._archive_interval)
+
+        # Pin main process to CPU 0 — callbacks get dedicated core, no migration overhead
+        self._callback_cpu = 0
+        try:
+            os.sched_setaffinity(0, {self._callback_cpu})
+            logger.info("[combined] main process pinned to CPU %d", self._callback_cpu)
+        except (AttributeError, OSError) as exc:
+            logger.debug("[combined] cpu affinity not supported: %s", exc)
 
         self._connect()
 
