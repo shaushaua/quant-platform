@@ -166,7 +166,6 @@ def _zerocopy_arr(path: str):
 
 def _build_df_from_path(path, columns, trading_day, code):
     """Build DataFrame from mmap file with zero-copy numpy read.
-    Single-pass dict construction — no insert/reorder overhead.
     Only Time/UpdateTime columns are copied (f64→datetime64 conversion).
     All other float columns reference the mmap directly — no memcpy."""
     arr = _zerocopy_arr(path)
@@ -174,15 +173,20 @@ def _build_df_from_path(path, columns, trading_day, code):
         return pd.DataFrame()
     buf_cols = columns[2:]  # skip TradingDay, Code
 
-    # Build column dict in final order — avoids 2× insert + 1× reorder
-    base_ns = pd.Timestamp(trading_day).value
-    data = {'TradingDay': trading_day, 'Code': code}
-    for i, col in enumerate(buf_cols):
-        if col in ('Time', 'UpdateTime'):
-            data[col] = (base_ns + (arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
-        else:
-            data[col] = arr[:, i]  # zero-copy view into mmap
-    return pd.DataFrame(data, columns=columns)
+    # Zero-copy: DataFrame Block references the mmap-backed numpy array
+    df = pd.DataFrame(arr, columns=buf_cols, copy=False)
+
+    # Fast time conversion: int64 ns arithmetic, skip pd.to_timedelta overhead
+    base_ns = pd.Timestamp(trading_day).value  # nanoseconds since epoch
+    for col in ('Time', 'UpdateTime'):
+        if col in buf_cols:
+            idx = buf_cols.index(col)
+            # f64 seconds → int64 nanoseconds → datetime64[ns]
+            df[col] = (base_ns + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+
+    df.insert(0, 'TradingDay', trading_day)
+    df.insert(1, 'Code', code)
+    return df[columns]
 
 
 def _compute_stock_shm(args):
