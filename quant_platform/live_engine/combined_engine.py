@@ -109,13 +109,13 @@ def create_direct_callback(
 
     def _record_buf(mid, seq_id, buf):
         """Write one raw PML frame to capture file."""
-        f = DirectCallback._rec_file
-        if f is None or time.time() > DirectCallback._rec_deadline:
+        nonlocal _rec_file, _rec_count, _rec_deadline
+        if _rec_file is None or time.time() > _rec_deadline:
             return
         raw = bytes(buf)
         frame = struct.pack("<dIII", time.time(), mid, seq_id, len(raw)) + raw
-        f.write(frame)
-        DirectCallback._rec_count += 1
+        _rec_file.write(frame)
+        _rec_count += 1
 
     class DirectCallback(pymdl.MsgCallback):
 
@@ -180,7 +180,7 @@ def create_direct_callback(
 
         def OnMDLSHL2Message(self, hd, buf):
             try:
-                if DirectCallback._rec_file:
+                if _rec_file:
                     _record_buf(int(hd.MessageID), int(hd.SequenceID), buf)
                 self._observe(hd)
                 mid = int(hd.MessageID)
@@ -225,7 +225,7 @@ def create_direct_callback(
 
         def OnMDLSZL2Message(self, hd, buf):
             try:
-                if DirectCallback._rec_file:
+                if _rec_file:
                     _record_buf(int(hd.MessageID), int(hd.SequenceID), buf)
                 self._observe(hd)
                 mid = int(hd.MessageID)
