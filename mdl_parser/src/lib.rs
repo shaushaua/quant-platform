@@ -689,6 +689,323 @@ impl StockBuffer {
 }
 
 // ================================================================== //
+// Shared-memory StockBuffer (mmap-backed, zero-copy across processes) //
+// ================================================================== //
+
+use memmap2::{MmapMut, Mmap};
+use std::fs::OpenOptions;
+use std::path::PathBuf;
+
+/// mmap file layout:
+///   [0..8]   capacity (u64 LE)
+///   [8..16]  n_cols (u64 LE)
+///   [16..24] n_string_cols (u64 LE)
+///   [24..32] row_count (u64 LE) — parent writes, workers read
+///   [32..]   data: capacity × n_cols × f64 (row-major)
+const SHM_HEADER: usize = 32;
+
+/// Read a u64 from the mmap at the given byte offset.
+#[inline]
+fn read_u64_at(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+/// Write a u64 to the mmap at the given byte offset.
+#[inline]
+fn write_u64_at(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Read an f64 from the mmap at the given byte offset.
+#[inline]
+fn read_f64_at(buf: &[u8], off: usize) -> f64 {
+    f64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+/// Write an f64 to the mmap at the given byte offset.
+#[inline]
+fn write_f64_at(buf: &mut [u8], off: usize, v: f64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// mmap-backed StockBuffer for parent (read-write).
+/// Data is stored in a shared memory file (/dev/shm/quant_{kind}_{code}.mmap).
+/// Workers open the same file read-only via ShmStockBufferReader — zero-copy sharing.
+#[pyclass]
+struct ShmStockBuffer {
+    mmap: Option<MmapMut>,
+    file: std::fs::File,
+    path: PathBuf,
+    capacity: usize,
+    n_cols: usize,
+    n_string_cols: usize,
+    row_count: usize,
+}
+
+#[pymethods]
+impl ShmStockBuffer {
+    /// Create a new mmap-backed buffer file.
+    /// `path`: file path, typically `/dev/shm/quant_{kind}_{code}.mmap`
+    #[new]
+    fn new(path: String, capacity: usize, n_cols: usize, n_string_cols: usize) -> PyResult<Self> {
+        let file_size = SHM_HEADER + capacity * n_cols * 8;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("create mmap {}: {}", path, e))
+            })?;
+        file.set_len(file_size as u64).map_err(|e| {
+            pyo3::exceptions::PyOSError::new_err(format!("fallocate {}: {}", path, e))
+        })?;
+
+        let mut mmap =
+            unsafe { MmapMut::map_mut(&file) }.map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("mmap {}: {}", path, e))
+            })?;
+
+        // Write header
+        write_u64_at(&mut mmap, 0, capacity as u64);
+        write_u64_at(&mut mmap, 8, n_cols as u64);
+        write_u64_at(&mut mmap, 16, n_string_cols as u64);
+        write_u64_at(&mut mmap, 24, 0); // row_count = 0
+
+        Ok(ShmStockBuffer {
+            mmap: Some(mmap),
+            file,
+            path: PathBuf::from(path),
+            capacity,
+            n_cols,
+            n_string_cols,
+            row_count: 0,
+        })
+    }
+
+    /// Append Python tuple rows into the mmap buffer.
+    fn append_tuples(
+        &mut self,
+        _py: Python,
+        tuples: &Bound<'_, PyList>,
+        start_col: usize,
+    ) -> PyResult<()> {
+        let n_new = tuples.len();
+        if n_new == 0 {
+            return Ok(());
+        }
+        // Auto-grow if needed
+        while self.row_count + n_new > self.capacity {
+            self.grow()?;
+        }
+        let mmap = self.mmap.as_mut().unwrap();
+        for i in 0..n_new {
+            let item = tuples.get_item(i)?;
+            let tuple = item.downcast::<PyTuple>()?;
+            let row_base = SHM_HEADER + (self.row_count + i) * self.n_cols * 8;
+            for j in 0..self.n_cols {
+                let val = tuple.get_item(j + start_col)?;
+                let fval = if j < self.n_string_cols {
+                    let s = val.extract::<&str>()?;
+                    time_str_to_seconds(s)
+                } else {
+                    val.extract::<f64>()?
+                };
+                write_f64_at(mmap, row_base + j * 8, fval);
+            }
+        }
+        self.row_count += n_new;
+        let mmap = self.mmap.as_mut().unwrap();
+        write_u64_at(mmap, 24, self.row_count as u64);
+        Ok(())
+    }
+
+    /// Return filled data as numpy f64 array (copy from mmap).
+    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if self.row_count == 0 {
+            let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(empty.into_pyarray(py));
+        }
+        let mmap = self.mmap.as_ref().unwrap();
+        let start = SHM_HEADER;
+        let end = SHM_HEADER + self.row_count * self.n_cols * 8;
+        let filled: Vec<f64> = mmap[start..end]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let arr = numpy::ndarray::Array2::from_shape_vec((self.row_count, self.n_cols), filled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
+    }
+
+    /// Return rows from `start_row` onwards as numpy f64 array (copy).
+    fn to_numpy_from<'py>(
+        &self,
+        py: Python<'py>,
+        start_row: usize,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if start_row >= self.row_count {
+            let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(empty.into_pyarray(py));
+        }
+        let n_rows = self.row_count - start_row;
+        let byte_start = SHM_HEADER + start_row * self.n_cols * 8;
+        let byte_end = SHM_HEADER + self.row_count * self.n_cols * 8;
+        let mmap = self.mmap.as_ref().unwrap();
+        let filled: Vec<f64> = mmap[byte_start..byte_end]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let arr = numpy::ndarray::Array2::from_shape_vec((n_rows, self.n_cols), filled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
+    }
+
+    #[getter]
+    fn len(&self) -> usize {
+        self.row_count
+    }
+
+    #[getter]
+    fn path(&self) -> &str {
+        self.path.to_str().unwrap_or("")
+    }
+
+    /// Reset row count to 0 (data stays in mmap, will be overwritten).
+    fn reset(&mut self) {
+        self.row_count = 0;
+        if let Some(mmap) = self.mmap.as_mut() {
+            write_u64_at(mmap, 24, 0);
+        }
+    }
+}
+
+impl ShmStockBuffer {
+    /// Double capacity: drop old mapping, extend file, remap.
+    fn grow(&mut self) -> PyResult<()> {
+        let new_capacity = self.capacity * 2;
+        let new_size = SHM_HEADER + new_capacity * self.n_cols * 8;
+        // Drop old mapping (munmap)
+        self.mmap = None;
+        // Extend file
+        self.file
+            .set_len(new_size as u64)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        // Remap
+        let mut mmap = unsafe { MmapMut::map_mut(&self.file) }
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        // Update capacity in header
+        write_u64_at(&mut mmap, 0, new_capacity as u64);
+        self.mmap = Some(mmap);
+        self.capacity = new_capacity;
+        Ok(())
+    }
+}
+
+/// Read-only mmap buffer reader for worker processes.
+/// Opens an existing mmap file and reads data without modifying it.
+#[pyclass]
+struct ShmBufferReader {
+    mmap: Mmap,
+    n_cols: usize,
+    n_string_cols: usize,
+    row_count: usize,
+}
+
+#[pymethods]
+impl ShmBufferReader {
+    /// Open an existing mmap file for read-only access.
+    /// Reads header to determine dimensions and current row count.
+    #[new]
+    fn new(path: String) -> PyResult<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("open readonly {}: {}", path, e))
+            })?;
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+            pyo3::exceptions::PyOSError::new_err(format!("mmap readonly {}: {}", path, e))
+        })?;
+        if mmap.len() < SHM_HEADER {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "mmap file too small: {} bytes",
+                mmap.len()
+            )));
+        }
+        let n_cols = read_u64_at(&mmap, 8) as usize;
+        let n_string_cols = read_u64_at(&mmap, 16) as usize;
+        let row_count = read_u64_at(&mmap, 24) as usize;
+        Ok(ShmBufferReader {
+            mmap,
+            n_cols,
+            n_string_cols,
+            row_count,
+        })
+    }
+
+    /// Return all filled rows as numpy f64 array (copy).
+    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if self.row_count == 0 {
+            let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(empty.into_pyarray(py));
+        }
+        let start = SHM_HEADER;
+        let end = SHM_HEADER + self.row_count * self.n_cols * 8;
+        let filled: Vec<f64> = self.mmap[start..end]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let arr = numpy::ndarray::Array2::from_shape_vec((self.row_count, self.n_cols), filled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
+    }
+
+    /// Return rows from `start_row` onwards as numpy f64 array (copy).
+    fn to_numpy_from<'py>(
+        &self,
+        py: Python<'py>,
+        start_row: usize,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if start_row >= self.row_count {
+            let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(empty.into_pyarray(py));
+        }
+        let n_rows = self.row_count - start_row;
+        let byte_start = SHM_HEADER + start_row * self.n_cols * 8;
+        let byte_end = SHM_HEADER + self.row_count * self.n_cols * 8;
+        let filled: Vec<f64> = self.mmap[byte_start..byte_end]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let arr = numpy::ndarray::Array2::from_shape_vec((n_rows, self.n_cols), filled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
+    }
+
+    /// Refresh row_count from the file header (parent may have appended data).
+    fn refresh(&mut self) -> usize {
+        self.row_count = read_u64_at(&self.mmap, 24) as usize;
+        self.row_count
+    }
+
+    #[getter]
+    fn len(&self) -> usize {
+        self.row_count
+    }
+
+    #[getter]
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+}
+
+// ================================================================== //
 // PyO3 module                                                         //
 // ================================================================== //
 
@@ -700,5 +1017,7 @@ fn mdl_parser(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_sz_order, m)?)?;
     m.add_function(wrap_pyfunction!(parse_sz_deal, m)?)?;
     m.add_class::<StockBuffer>()?;
+    m.add_class::<ShmStockBuffer>()?;
+    m.add_class::<ShmBufferReader>()?;
     Ok(())
 }

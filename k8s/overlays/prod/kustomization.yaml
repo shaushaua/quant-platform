@@ -23,5 +23,5 @@ patches:
                     cpu: "4"
                     memory: 64Gi
                   limits:
-                    cpu: "47"
+                    cpu: "41"
                     memory: 90Gi

@@ -18,6 +18,8 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import mdl_parser
+import glob as glob_mod
+import shutil
 
 from ..core.constants import TICK_COLUMNS, ORDER_COLUMNS, DEAL_COLUMNS
 
@@ -77,14 +79,16 @@ class MemoryStore:
         self._dirty_deal: set = set()
         self._dirty_order: set = set()
 
-        # Rust pre-allocated buffer: code -> StockBuffer (f64, incremental append)
+        # Rust pre-allocated buffer: code -> ShmStockBuffer (mmap-backed, shared with workers)
         # tick: 81 - 2(TradingDay,Code) = 79 cols, first 2 are Time/UpdateTime strings
         # order: 11 - 2 = 9 cols, first 2 are Time/UpdateTime strings
         # deal: 12 - 2 = 10 cols, first 2 are Time/UpdateTime strings
-        self._tick_buf: Dict[str, mdl_parser.StockBuffer] = {}
-        self._order_buf: Dict[str, mdl_parser.StockBuffer] = {}
-        self._deal_buf: Dict[str, mdl_parser.StockBuffer] = {}
+        self._tick_buf: Dict[str, mdl_parser.ShmStockBuffer] = {}
+        self._order_buf: Dict[str, mdl_parser.ShmStockBuffer] = {}
+        self._deal_buf: Dict[str, mdl_parser.ShmStockBuffer] = {}
         self._buf_config = {"tick": (79, 2), "order": (9, 2), "deal": (10, 2)}
+        # mmap directory for shared buffers
+        self._shm_dir = os.environ.get("SHM_DIR", "/dev/shm")
 
         self._tick_cache_len: Dict[str, int] = {}
         self._order_cache_len: Dict[str, int] = {}
@@ -164,7 +168,25 @@ class MemoryStore:
             self._tick_df_rows.clear()
             self._order_df_rows.clear()
             self._deal_df_rows.clear()
+            # Clean up mmap files
+            self._cleanup_shm_files()
             logger.info(f"设置交易日: {trading_day}, 已清空历史数据")
+
+    def _shm_path(self, kind: str, code: str) -> str:
+        """Get mmap file path for a stock buffer."""
+        safe_code = code.replace('.', '_')
+        return os.path.join(self._shm_dir, f"quant_{kind}_{safe_code}.mmap")
+
+    def _cleanup_shm_files(self):
+        """Remove all quant_* mmap files from shm directory."""
+        try:
+            for f in glob_mod.glob(os.path.join(self._shm_dir, "quant_*.mmap")):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+        except Exception:
+            pass
 
     def get_trading_day(self) -> str:
         """获取当前交易日"""
@@ -408,7 +430,8 @@ class MemoryStore:
             if new_rows:
                 buf = buf_map.get(code)
                 if buf is None:
-                    buf = mdl_parser.StockBuffer(10000, n_cols, n_str)
+                    path = self._shm_path(kind, code)
+                    buf = mdl_parser.ShmStockBuffer(path, 10000, n_cols, n_str)
                     buf_map[code] = buf
                     new_bufs += 1
                 buf.append_tuples(new_rows, 2)  # start_col=2, skip TradingDay/Code
@@ -432,6 +455,12 @@ class MemoryStore:
 
     def warm_order_batch(self, codes: list) -> int:
         return self.warm_cache_batch("order", codes)
+
+    def get_buffer_paths(self, kind: str, codes: list) -> Dict[str, str]:
+        """Return {code: mmap_path} for stocks that have warm buffers.
+        Workers use these paths to open read-only mmap handles."""
+        buf_map = getattr(self, f"_{kind}_buf")
+        return {code: buf.path for code, buf in buf_map.items() if code in codes}
 
     def get_quote(self, code: str) -> dict:
         """获取单只股票最新行情"""

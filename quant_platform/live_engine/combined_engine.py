@@ -118,6 +118,98 @@ def _compute_stock_cow(args):
         return code, None, str(exc)
 
 
+# Worker-local mmap reader cache for persistent pool
+_mmap_readers: Dict[str, Any] = {}
+_tick_columns = TICK_COLUMNS
+_order_columns = ORDER_COLUMNS
+_deal_columns = DEAL_COLUMNS
+
+
+def _build_df_from_mmap(reader, columns, trading_day, code):
+    """Build a DataFrame from an mmap buffer reader."""
+    n_rows = reader.len
+    if n_rows == 0:
+        return pd.DataFrame()
+    arr = reader.to_numpy()
+    buf_cols = columns[2:]  # skip TradingDay, Code
+    base = pd.Timestamp(trading_day)
+    data = {'TradingDay': trading_day, 'Code': code}
+    for i, col in enumerate(buf_cols):
+        if col == 'Time' or col == 'UpdateTime':
+            data[col] = base + pd.to_timedelta(arr[:, i], unit='s')
+        else:
+            data[col] = arr[:, i]
+    return pd.DataFrame(data, columns=columns)
+
+
+def _compute_stock_shm(args):
+    """Build DataFrame + compute factor in persistent worker.
+    Reads from mmap files shared with parent — zero-copy, no COW."""
+    code, date_str, end_time, wall_secs, state_snap, \
+        tick_path, deal_path, order_path, trading_day = args
+    try:
+        # Open mmap readers (cached across calls)
+        tick_df = pd.DataFrame()
+        deal_df = pd.DataFrame()
+        order_df = pd.DataFrame()
+
+        if tick_path:
+            reader = _mmap_readers.get(tick_path)
+            if reader is None:
+                try:
+                    reader = mdl_parser.ShmBufferReader(tick_path)
+                    _mmap_readers[tick_path] = reader
+                except Exception:
+                    reader = None
+            if reader is not None:
+                reader.refresh()
+                tick_df = _build_df_from_mmap(reader, _tick_columns, trading_day, code)
+
+        if deal_path:
+            reader = _mmap_readers.get(deal_path)
+            if reader is None:
+                try:
+                    reader = mdl_parser.ShmBufferReader(deal_path)
+                    _mmap_readers[deal_path] = reader
+                except Exception:
+                    reader = None
+            if reader is not None:
+                reader.refresh()
+                deal_df = _build_df_from_mmap(reader, _deal_columns, trading_day, code)
+
+        if order_path:
+            reader = _mmap_readers.get(order_path)
+            if reader is None:
+                try:
+                    reader = mdl_parser.ShmBufferReader(order_path)
+                    _mmap_readers[order_path] = reader
+                except Exception:
+                    reader = None
+            if reader is not None:
+                reader.refresh()
+                order_df = _build_df_from_mmap(reader, _order_columns, trading_day, code)
+
+        stock_data = StockData(
+            code=code, date=date_str, end_time=end_time,
+            l1_tick=tick_df, l2_deal=deal_df, l2_order=order_df,
+            market=_market_df, daily_basic=_daily_basic_df,
+            state=state_snap,
+        )
+
+        result = _factor_fn(stock_data, code, date_str, end_time)
+
+        if result is not None and state_snap and state_snap.last_market_time:
+            market_secs = _time_to_seconds(state_snap.last_market_time)
+            if market_secs > 0:
+                data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
+                if abs(data_latency_ms) < 600_000:
+                    result["data_latency_ms"] = data_latency_ms
+
+        return code, result, None
+    except Exception as exc:
+        return code, None, str(exc)
+
+
 # ================================================================== #
 # Direct-parse callback — Rust parse in callback (~4μs/msg)          #
 # ================================================================== #
@@ -404,6 +496,9 @@ class CombinedEngine:
 
         # Fork-COW worker count for DataFrame build + factor computation
         self._pool_workers = min(int(os.environ.get("FACTOR_WORKERS", "11")), os.cpu_count() or 4)
+
+        # Persistent pool (created once in run(), workers stay alive across cycles)
+        self._pool: Optional[multiprocessing.pool.Pool] = None
 
         # Background factor computation (non-blocking main loop)
         self._compute_running = False
@@ -818,50 +913,76 @@ class CombinedEngine:
         t0 = time.time()
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-        # ====== All warm + factor in children — parent GIL 100% free for callbacks ======
+        # ====== Global state for workers ======
         global _factor_fn, _market_df, _daily_basic_df
         _factor_fn = self.factor_calculation
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
 
-        args = [
-            (code, date_str, end_time, wall_secs, states_snapshot.get(code))
-            for code in all_codes
-        ]
+        # Get mmap buffer paths for dirty stocks
+        tick_paths = store.get_buffer_paths("tick", all_codes)
+        deal_paths = store.get_buffer_paths("deal", all_codes)
+        order_paths = store.get_buffer_paths("order", all_codes)
 
         results = []
         errors = 0
         pool_t0 = time.perf_counter()
 
-        # Pin pool workers to CPUs excluding the callback core
-        worker_cpus = [c for c in range(os.cpu_count() or 12) if c != getattr(self, '_callback_cpu', -1)]
-        ctx = multiprocessing.get_context('fork')
-        fork_t0 = time.perf_counter()
-        pool = ctx.Pool(
-            processes=self._pool_workers,
-            initializer=_pin_worker_cpu,
-            initargs=(worker_cpus,),
-        )
-        fork_ms = (time.perf_counter() - fork_t0) * 1000
-        logger.info("[combined] pool created: %d workers, fork=%.0fms", self._pool_workers, fork_ms)
-        try:
-            for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=32):
-                if err:
-                    logger.warning("[%s] compute failed: %s", code, err)
-                    errors += 1
-                elif result is not None:
-                    results.append(result)
-        except Exception as exc:
-            logger.error("[combined] pool failed: %s", exc, exc_info=True)
-        finally:
-            pool.close()
-            pool.join()
+        # Use persistent pool if available, otherwise fall back to per-cycle fork
+        if self._pool is not None:
+            # Persistent pool + mmap: zero fork overhead
+            args = [
+                (code, date_str, end_time, wall_secs, states_snapshot.get(code),
+                 tick_paths.get(code, ""), deal_paths.get(code, ""), order_paths.get(code, ""),
+                 date_str)
+                for code in all_codes
+            ]
+            try:
+                for code, result, err in self._pool.imap_unordered(_compute_stock_shm, args, chunksize=32):
+                    if err:
+                        logger.warning("[%s] compute failed: %s", code, err)
+                        errors += 1
+                    elif result is not None:
+                        results.append(result)
+            except Exception as exc:
+                logger.error("[combined] persistent pool failed: %s", exc, exc_info=True)
+                # Fall back to COW on pool failure
+                self._pool = None
+        else:
+            # Fallback: per-cycle fork with COW (original approach)
+            worker_cpus = [c for c in range(os.cpu_count() or 12) if c != getattr(self, '_callback_cpu', -1)]
+            ctx = multiprocessing.get_context('fork')
+            fork_t0 = time.perf_counter()
+            pool = ctx.Pool(
+                processes=self._pool_workers,
+                initializer=_pin_worker_cpu,
+                initargs=(worker_cpus,),
+            )
+            fork_ms = (time.perf_counter() - fork_t0) * 1000
+            logger.info("[combined] fallback pool: %d workers, fork=%.0fms", self._pool_workers, fork_ms)
+            args = [
+                (code, date_str, end_time, wall_secs, states_snapshot.get(code))
+                for code in all_codes
+            ]
+            try:
+                for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=32):
+                    if err:
+                        logger.warning("[%s] compute failed: %s", code, err)
+                        errors += 1
+                    elif result is not None:
+                        results.append(result)
+            except Exception as exc:
+                logger.error("[combined] fallback pool failed: %s", exc, exc_info=True)
+            finally:
+                pool.close()
+                pool.join()
 
         pool_ms = (time.perf_counter() - pool_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
+        pool_type = "persistent+shm" if self._pool is not None else "fork+cow"
         logger.info(
-            "[combined] done: %d results (errors=%d) | fork=%.0fms compute=%.0fms pool=%.0fms total=%.0fms",
-            len(results), errors, fork_ms, pool_ms - fork_ms, pool_ms, elapsed_ms,
+            "[combined] done (%s): %d results (errors=%d) | compute=%.0fms total=%.0fms",
+            pool_type, len(results), errors, pool_ms, elapsed_ms,
         )
 
         # Log latency factor (lightweight, no GIL-heavy work)
@@ -1059,6 +1180,25 @@ class CombinedEngine:
         except (AttributeError, OSError) as exc:
             logger.debug("[combined] cpu affinity not supported: %s", exc)
 
+        # Create persistent worker pool (fork once, reuse across compute cycles)
+        # Parent memory is small at this point → fork is fast
+        # Workers read data via mmap shared memory, not COW
+        try:
+            worker_cpus = [c for c in range(os.cpu_count() or 12) if c != self._callback_cpu]
+            ctx = multiprocessing.get_context('fork')
+            pool_t0 = time.perf_counter()
+            self._pool = ctx.Pool(
+                processes=self._pool_workers,
+                initializer=_pin_worker_cpu,
+                initargs=(worker_cpus,),
+            )
+            fork_ms = (time.perf_counter() - pool_t0) * 1000
+            logger.info("[combined] persistent pool created: %d workers, fork=%.0fms",
+                        self._pool_workers, fork_ms)
+        except Exception as exc:
+            logger.warning("[combined] persistent pool creation failed, will use per-cycle fork: %s", exc)
+            self._pool = None
+
         self._connect()
 
         last_compute = time.time()
@@ -1131,8 +1271,16 @@ class CombinedEngine:
                 self._io_man.Shutdown()
             except Exception:
                 pass
-        # No persistent executor to shutdown — pool created per-batch in _compute_and_output
-        logger.info("[combined] engine stopped")
+        # Shutdown persistent pool
+        if self._pool is not None:
+            try:
+                self._pool.close()
+                self._pool.join()
+            except Exception:
+                pass
+            self._pool = None
+        # Clean up mmap files
+        self._memory_store._cleanup_shm_files()
         logger.info("[combined] engine stopped")
 
 
