@@ -270,6 +270,13 @@ def load_oss_data(date_str, codes_str, limit, cache_dir):
 
 # ---- Phase 2: Feed into MemoryStore (ShmStockBuffer) ----
 
+def _time_str(val):
+    """Convert datetime/Timestamp to 'YYYYMMDD HH:MM:SS.mmm' string for Rust parser."""
+    if isinstance(val, pd.Timestamp):
+        return val.strftime("%Y%m%d %H:%M:%S.") + str(val.microsecond // 1000).zfill(3)
+    return str(val)
+
+
 def feed_into_store(raw_groups, trading_day):
     """Feed DataFrames into MemoryStore via ShmStockBuffer batch writes.
     Uses buf.append_tuples() for bulk writes instead of per-row append."""
@@ -278,14 +285,19 @@ def feed_into_store(raw_groups, trading_day):
 
     t0 = time.perf_counter()
     counts = {"tick": 0, "deal": 0, "order": 0}
+    time_cols = {"Time", "UpdateTime"}
 
     for kind, columns in [("tick", TICK_COLUMNS), ("deal", DEAL_COLUMNS), ("order", ORDER_COLUMNS)]:
         groups = raw_groups.get(kind, {})
         for code, df in groups.items():
             if df.empty:
                 continue
-            # Convert DataFrame to list of tuples, batch append to ShmStockBuffer
-            tuples = [tuple(row.get(c, 0) for c in columns) for row in df.to_dict('records')]
+            # Convert DataFrame rows to tuples, datetime→string for Rust parser
+            tuples = []
+            for row in df.itertuples(index=False):
+                tup = tuple(_time_str(getattr(row, c, 0)) if c in time_cols else getattr(row, c, 0)
+                            for c in columns)
+                tuples.append(tup)
             buf = store._get_or_create_buf(kind, code)
             buf.append_tuples(tuples, 2)  # start_col=2, skip TradingDay/Code
             store._dirty_codes.add(code)
