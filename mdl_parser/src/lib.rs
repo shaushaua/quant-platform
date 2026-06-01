@@ -864,7 +864,6 @@ impl ShmStockBuffer {
         Ok(arr.into_pyarray(py))
     }
 
-    #[getter]
     fn len(&self) -> usize {
         self.row_count
     }
@@ -1023,7 +1022,6 @@ impl ShmBufferReader {
         self.row_count
     }
 
-    #[getter]
     fn len(&self) -> usize {
         self.row_count
     }
