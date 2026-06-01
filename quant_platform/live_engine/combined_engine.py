@@ -40,6 +40,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import multiprocessing
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
@@ -67,19 +68,43 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Module-level factor function for ProcessPoolExecutor (must be top-level for pickle)
+# Module-level globals: set before fork, inherited by child processes via COW
 _factor_fn: Optional[Callable] = None
+_market_df: pd.DataFrame = pd.DataFrame()
+_daily_basic_df: pd.DataFrame = pd.DataFrame()
 
 
-def _init_factor_worker(fn):
-    """Initialize child process with the factor function."""
-    global _factor_fn
-    _factor_fn = fn
+def _compute_stock_cow(args):
+    """Build DataFrame + compute factor in child process.
+    Reads from parent's MemoryStore via fork COW — zero data serialization."""
+    code, date_str, end_time, wall_secs, state_snap = args
+    try:
+        store = MemoryStore.get_instance()
 
+        # Build DataFrames (COW read from Rust buffers, no parent GIL contention)
+        tick_df = store.get_tick(code)
+        deal_df = store.get_deal(code)
+        order_df = store.get_order(code)
 
-def _run_factor_in_process(stock_data: StockData, code: str, date_str: str, end_time: str) -> Optional[dict]:
-    """Run factor_calculation in child process (no GIL contention with callbacks)."""
-    return _factor_fn(stock_data, code, date_str, end_time)
+        stock_data = StockData(
+            code=code, date=date_str, end_time=end_time,
+            l1_tick=tick_df, l2_deal=deal_df, l2_order=order_df,
+            market=_market_df, daily_basic=_daily_basic_df,
+            state=state_snap,
+        )
+
+        result = _factor_fn(stock_data, code, date_str, end_time)
+
+        if result is not None and state_snap and state_snap.last_market_time:
+            market_secs = _time_to_seconds(state_snap.last_market_time)
+            if market_secs > 0:
+                data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
+                if abs(data_latency_ms) < 600_000:
+                    result["data_latency_ms"] = data_latency_ms
+
+        return code, result, None
+    except Exception as exc:
+        return code, None, str(exc)
 
 
 # ================================================================== #
@@ -366,22 +391,15 @@ class CombinedEngine:
 
         self._load_checkpoint()
 
-        # Thread pool for DataFrame build (main process, keeps GIL time for callbacks)
-        self._df_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="df-build")
-
-        # Process pool for factor computation (separate processes, no GIL contention)
-        self._factor_executor = ProcessPoolExecutor(
-            max_workers=4,
-            initializer=_init_factor_worker,
-            initargs=(self.factor_calculation,),
-        )
+        # Fork-COW worker count for DataFrame build + factor computation
+        self._pool_workers = min(int(os.environ.get("FACTOR_WORKERS", "10")), os.cpu_count() or 4)
 
         # Background factor computation (non-blocking main loop)
         self._compute_running = False
 
         logger.info(
-            "[combined] init done: module=%s interval=%ds archive=%ds",
-            module_path, self.compute_interval, self._archive_interval,
+            "[combined] init done: module=%s interval=%ds archive=%ds pool_workers=%d",
+            module_path, self.compute_interval, self._archive_interval, self._pool_workers,
         )
 
     def trading_day(self) -> date:
@@ -746,7 +764,7 @@ class CombinedEngine:
         date_str = self._trading_day.strftime("%Y%m%d")
         end_time = now.strftime("%H%M%S")
 
-        # Snapshot StockState (shallow copy each state so compute thread sees consistent values)
+        # Snapshot StockState (shallow copy each state so fork children see consistent values)
         with self._lock:
             states_snapshot = {code: copy.copy(st) for code, st in self.states.items()}
 
@@ -760,7 +778,6 @@ class CombinedEngine:
         dirty_tick, dirty_deal, dirty_order = store.drain_dirty_typed()
 
         all_codes = dirty & states_snapshot.keys() if states_snapshot else dirty
-        codes_list = list(all_codes)
 
         # Filter per-type dirty to only stocks we'll compute
         tick_codes = list(dirty_tick & all_codes)
@@ -772,7 +789,7 @@ class CombinedEngine:
 
         t0 = time.time()
 
-        # ====== Phase 1: Pre-warm + Build StockData (main process, ThreadPoolExecutor) ======
+        # ====== Phase 1: Pre-warm only (main process, fast, minimal GIL) ======
         warm_t0 = time.perf_counter()
         warm_tick_ms = warm_deal_ms = warm_order_ms = 0.0
         if tick_codes:
@@ -791,92 +808,43 @@ class CombinedEngine:
 
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-        # Build StockData objects in thread pool (4 workers — leave GIL time for callbacks)
-        df_build_t0 = time.perf_counter()
-        stock_data_map: Dict[str, Tuple[StockData, int, int, int]] = {}  # code -> (data, tick_us, deal_us, order_us)
+        # ====== Phase 2: Fork Pool — df_build + factor in child processes (COW, no GIL) ======
+        # Set module-level globals for COW inheritance
+        global _factor_fn, _market_df, _daily_basic_df
+        _factor_fn = self.factor_calculation
+        _market_df = self._market_df
+        _daily_basic_df = self._daily_basic_df
 
-        def _build_stock_data(code):
-            t0_ = time.perf_counter()
-            tick_df = store.get_tick(code)
-            t1_ = time.perf_counter()
-            deal_df = store.get_deal(code)
-            t2_ = time.perf_counter()
-            order_df = store.get_order(code)
-            t3_ = time.perf_counter()
-            sd = StockData(
-                code=code, date=date_str, end_time=end_time,
-                l1_tick=tick_df, l2_deal=deal_df, l2_order=order_df,
-                market=self._market_df, daily_basic=self._daily_basic_df,
-                state=states_snapshot.get(code),
-            )
-            return code, sd, int((t1_ - t0_) * 1e6), int((t2_ - t1_) * 1e6), int((t3_ - t2_) * 1e6)
-
-        df_futures = {
-            self._df_executor.submit(_build_stock_data, code): code
+        phase2_t0 = time.perf_counter()
+        args = [
+            (code, date_str, end_time, wall_secs, states_snapshot.get(code))
             for code in all_codes
-        }
-        for future in as_completed(df_futures):
-            try:
-                code, sd, tick_us, deal_us, order_us = future.result()
-                stock_data_map[code] = (sd, tick_us, deal_us, order_us)
-            except Exception as exc:
-                logger.warning("[%s] build StockData failed: %s", df_futures[future], exc)
+        ]
 
-        df_build_ms = (time.perf_counter() - df_build_t0) * 1000
-        total_tick_us = sum(v[1] for v in stock_data_map.values())
-        total_deal_us = sum(v[2] for v in stock_data_map.values())
-        total_order_us = sum(v[3] for v in stock_data_map.values())
-        logger.info(
-            "[combined] phase1 done: %d stocks | warm=%.0fms (tick=%.0f deal=%.0f order=%.0f) df_build=%.0fms (tick=%.0f deal=%.0f order=%.0f)",
-            len(stock_data_map), warm_ms, warm_tick_ms, warm_deal_ms, warm_order_ms,
-            df_build_ms, total_tick_us / 1000, total_deal_us / 1000, total_order_us / 1000,
-        )
-
-        # ====== Phase 2: Factor computation (child processes, no GIL) ======
-        factor_t0 = time.perf_counter()
         results = []
-        stock_timings: List[Tuple[str, int, int]] = []  # (code, df_us, factor_us)
-
-        factor_futures = {
-            self._factor_executor.submit(
-                _run_factor_in_process, sd, code, date_str, end_time,
-            ): code
-            for code, (sd, tick_us, deal_us, order_us) in stock_data_map.items()
-        }
-        for future in as_completed(factor_futures):
-            code = factor_futures[future]
-            try:
-                result = future.result()
-                df_us = sum(stock_data_map[code][1:])  # tick_us + deal_us + order_us
-                factor_us = 0  # timing done in child process, not measurable here
-                stock_timings.append((code, df_us, 0))
-                if result is not None:
-                    # Add data latency
-                    state = states_snapshot.get(code)
-                    if state and state.last_market_time:
-                        market_secs = _time_to_seconds(state.last_market_time)
-                        if market_secs > 0:
-                            data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
-                            if abs(data_latency_ms) < 600_000:
-                                result["data_latency_ms"] = data_latency_ms
+        errors = 0
+        ctx = multiprocessing.get_context('fork')
+        pool = ctx.Pool(processes=self._pool_workers)
+        try:
+            for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=50):
+                if err:
+                    logger.warning("[%s] compute failed: %s", code, err)
+                    errors += 1
+                elif result is not None:
                     results.append(result)
-            except Exception as exc:
-                logger.warning("[%s] factor failed: %s", code, exc)
+        except Exception as exc:
+            logger.error("[combined] pool failed: %s", exc, exc_info=True)
+        finally:
+            pool.close()
+            pool.join()
 
-        factor_ms = (time.perf_counter() - factor_t0) * 1000
+        phase2_ms = (time.perf_counter() - phase2_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info(
-            "[combined] phase2 done: %d results | factor=%.0fms total=%.0fms",
-            len(result_df), factor_ms, elapsed_ms,
+            "[combined] done: %d results (errors=%d) | warm=%.0fms pool=%.0fms total=%.0fms",
+            len(result_df), errors, warm_ms, phase2_ms, elapsed_ms,
         )
-
-        # Log top-3 slowest stocks (df_build only, factor timing not available in process pool)
-        if stock_timings:
-            stock_timings.sort(key=lambda x: x[1], reverse=True)
-            slow = stock_timings[:3]
-            parts = [f"{c}: df={df_us/1000:.0f}ms" for c, df_us, _ in slow]
-            logger.info("[combined] slowest df_build: %s", " | ".join(parts))
 
         # Log buffer row counts for data health check
         store_stats = store.get_stats()
@@ -1118,8 +1086,8 @@ class CombinedEngine:
                 self._io_man.Shutdown()
             except Exception:
                 pass
-        self._df_executor.shutdown(wait=False)
-        self._factor_executor.shutdown(wait=False)
+        # No persistent executor to shutdown — pool created per-batch in _compute_and_output
+        logger.info("[combined] engine stopped")
         logger.info("[combined] engine stopped")
 
 
