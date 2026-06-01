@@ -71,6 +71,8 @@ spec:
               value: /data/factors
             - name: DAILY_BASIC_MARKET_COUNT
               value: "5"
+            - name: FACTOR_WORKERS
+              value: "46"
             # --- 原始行情归档：内存计算同时落盘，16:00 后上传 OSS ---
             - name: RAW_DATA_ARCHIVE_ENABLED
               value: "true"
