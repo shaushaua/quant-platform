@@ -1,4 +1,4 @@
-# Prod overlay: large machines, full resources
+# Prod overlay: 48-core 96GB node
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -18,10 +18,13 @@ patches:
           spec:
             containers:
               - name: combined-engine
+                env:
+                  - name: FACTOR_WORKERS
+                    value: "46"
                 resources:
                   requests:
                     cpu: "4"
                     memory: 64Gi
                   limits:
-                    cpu: "12"
+                    cpu: "47"
                     memory: 90Gi
