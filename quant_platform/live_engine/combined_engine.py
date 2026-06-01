@@ -118,88 +118,84 @@ def _compute_stock_cow(args):
         return code, None, str(exc)
 
 
-# Worker-local mmap reader cache for persistent pool
-_mmap_readers: Dict[str, Any] = {}
+# Worker-local mmap cache for zero-copy reads (persistent pool)
+_mmap_cache: Dict[str, tuple] = {}  # path -> (mmap_obj, n_cols, file_size)
 _tick_columns = TICK_COLUMNS
 _order_columns = ORDER_COLUMNS
 _deal_columns = DEAL_COLUMNS
 
 
-def _build_df_from_mmap(reader, columns, trading_day, code):
-    """Build a DataFrame from an mmap buffer reader.
+def _zerocopy_arr(path: str):
+    """Zero-copy numpy array view of mmap file. Caches mmap objects across calls.
+    Layout: [32B header][f64 data rows]. Re-opens on auto-grow."""
+    import mmap as _mmap_mod
 
-    Fast path: create DataFrame directly from 2D numpy array (single Block
-    split into columns by pandas), then patch 2 Time columns and inject
-    2 string columns. Avoids dict-per-column overhead.
-    """
-    n_rows = reader.len
-    if n_rows == 0:
+    cached = _mmap_cache.get(path)
+    if cached is not None:
+        mm, n_cols, fsz = cached
+        row_count = int.from_bytes(mm[24:32], 'little')
+        needed = 32 + row_count * n_cols * 8
+        if needed <= fsz:
+            if row_count == 0:
+                return np.empty((0, n_cols), dtype=np.float64)
+            return np.frombuffer(mm, dtype=np.float64, offset=32,
+                                count=row_count * n_cols).reshape(row_count, n_cols)
+        # File was extended (parent auto-grow) — reopen
+        mm.close()
+        _mmap_cache.pop(path, None)
+
+    # Open fresh
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        fsz = os.fstat(fd).st_size
+        mm = _mmap_mod.mmap(fd, fsz, access=_mmap_mod.ACCESS_READ)
+        os.close(fd)
+    except OSError:
+        return np.empty((0, 0), dtype=np.float64)
+
+    if fsz < 32:
+        return np.empty((0, 0), dtype=np.float64)
+    n_cols = int.from_bytes(mm[8:16], 'little')
+    _mmap_cache[path] = (mm, n_cols, fsz)
+    row_count = int.from_bytes(mm[24:32], 'little')
+    if row_count == 0:
+        return np.empty((0, n_cols), dtype=np.float64)
+    return np.frombuffer(mm, dtype=np.float64, offset=32,
+                        count=row_count * n_cols).reshape(row_count, n_cols)
+
+
+def _build_df_from_path(path, columns, trading_day, code):
+    """Build DataFrame from mmap file with zero-copy numpy read.
+    Only Time/UpdateTime columns are copied (f64→datetime64 conversion).
+    All other float columns reference the mmap directly — no memcpy."""
+    arr = _zerocopy_arr(path)
+    if arr.shape[0] == 0:
         return pd.DataFrame()
-    arr = reader.to_numpy()
     buf_cols = columns[2:]  # skip TradingDay, Code
 
-    # Build DataFrame from 2D array — pandas creates columns via internal copy
+    # Zero-copy: DataFrame Block references the mmap-backed numpy array
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
 
-    # Convert Time/UpdateTime from f64 seconds → datetime64[ns]
+    # Only 2 columns get copied (f64 seconds → datetime64[ns])
     base = pd.Timestamp(trading_day)
     for col in ('Time', 'UpdateTime'):
         if col in buf_cols:
             df[col] = base + pd.to_timedelta(df[col], unit='s')
 
-    # Inject constant string columns at front
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
-
     return df[columns]
 
 
 def _compute_stock_shm(args):
     """Build DataFrame + compute factor in persistent worker.
-    Reads from mmap files shared with parent — zero-copy, no COW."""
+    Reads mmap files with zero-copy numpy views — no Rust reader, no memcpy."""
     code, date_str, end_time, wall_secs, state_snap, \
         tick_path, deal_path, order_path, trading_day = args
     try:
-        # Open mmap readers (cached across calls)
-        tick_df = pd.DataFrame()
-        deal_df = pd.DataFrame()
-        order_df = pd.DataFrame()
-
-        if tick_path:
-            reader = _mmap_readers.get(tick_path)
-            if reader is None:
-                try:
-                    reader = mdl_parser.ShmBufferReader(tick_path)
-                    _mmap_readers[tick_path] = reader
-                except Exception:
-                    reader = None
-            if reader is not None:
-                reader.refresh()
-                tick_df = _build_df_from_mmap(reader, _tick_columns, trading_day, code)
-
-        if deal_path:
-            reader = _mmap_readers.get(deal_path)
-            if reader is None:
-                try:
-                    reader = mdl_parser.ShmBufferReader(deal_path)
-                    _mmap_readers[deal_path] = reader
-                except Exception:
-                    reader = None
-            if reader is not None:
-                reader.refresh()
-                deal_df = _build_df_from_mmap(reader, _deal_columns, trading_day, code)
-
-        if order_path:
-            reader = _mmap_readers.get(order_path)
-            if reader is None:
-                try:
-                    reader = mdl_parser.ShmBufferReader(order_path)
-                    _mmap_readers[order_path] = reader
-                except Exception:
-                    reader = None
-            if reader is not None:
-                reader.refresh()
-                order_df = _build_df_from_mmap(reader, _order_columns, trading_day, code)
+        tick_df = _build_df_from_path(tick_path, _tick_columns, trading_day, code) if tick_path else pd.DataFrame()
+        deal_df = _build_df_from_path(deal_path, _deal_columns, trading_day, code) if deal_path else pd.DataFrame()
+        order_df = _build_df_from_path(order_path, _order_columns, trading_day, code) if order_path else pd.DataFrame()
 
         stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
