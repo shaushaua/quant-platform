@@ -836,11 +836,14 @@ class CombinedEngine:
         # Pin pool workers to CPUs excluding the callback core
         worker_cpus = [c for c in range(os.cpu_count() or 12) if c != getattr(self, '_callback_cpu', -1)]
         ctx = multiprocessing.get_context('fork')
+        fork_t0 = time.perf_counter()
         pool = ctx.Pool(
             processes=self._pool_workers,
             initializer=_pin_worker_cpu,
             initargs=(worker_cpus,),
         )
+        fork_ms = (time.perf_counter() - fork_t0) * 1000
+        logger.info("[combined] pool created: %d workers, fork=%.0fms", self._pool_workers, fork_ms)
         try:
             for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=32):
                 if err:
@@ -857,8 +860,8 @@ class CombinedEngine:
         pool_ms = (time.perf_counter() - pool_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
         logger.info(
-            "[combined] done: %d results (errors=%d) | pool=%.0fms total=%.0fms",
-            len(results), errors, pool_ms, elapsed_ms,
+            "[combined] done: %d results (errors=%d) | fork=%.0fms compute=%.0fms pool=%.0fms total=%.0fms",
+            len(results), errors, fork_ms, pool_ms - fork_ms, pool_ms, elapsed_ms,
         )
 
         # Log latency factor (lightweight, no GIL-heavy work)
