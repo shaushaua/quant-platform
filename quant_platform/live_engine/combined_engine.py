@@ -355,6 +355,9 @@ class CombinedEngine:
         # Thread pool for parallel factor computation
         self._compute_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="factor")
 
+        # Background factor computation (non-blocking main loop)
+        self._compute_running = False
+
         logger.info(
             "[combined] init done: module=%s interval=%ds archive=%ds",
             module_path, self.compute_interval, self._archive_interval,
@@ -707,6 +710,15 @@ class CombinedEngine:
     # Factor computation                                                   #
     # ------------------------------------------------------------------ #
 
+    def _compute_and_output_wrapper(self) -> None:
+        """Run _compute_and_output in background, clear flag when done."""
+        try:
+            self._compute_and_output()
+        except Exception as exc:
+            logger.error("[combined] background compute failed: %s", exc, exc_info=True)
+        finally:
+            self._compute_running = False
+
     def _compute_and_output(self) -> None:
         pipe_log = get_streaming_logger()
         now = datetime.now()
@@ -764,6 +776,9 @@ class CombinedEngine:
         # Aggregate timing from all factor workers
         total_df_us = 0
         total_factor_us = 0
+        total_tick_us = 0
+        total_deal_us = 0
+        total_order_us = 0
         stock_timings: List[Tuple[str, int, int]] = []  # (code, df_us, factor_us)
 
         futures = {
@@ -775,9 +790,12 @@ class CombinedEngine:
         for future in as_completed(futures):
             code = futures[future]
             try:
-                result, df_us, factor_us = future.result()
+                result, df_us, factor_us, tick_us, deal_us, order_us = future.result()
                 total_df_us += df_us
                 total_factor_us += factor_us
+                total_tick_us += tick_us
+                total_deal_us += deal_us
+                total_order_us += order_us
                 stock_timings.append((code, df_us, factor_us))
                 if result is not None:
                     results.append(result)
@@ -787,9 +805,11 @@ class CombinedEngine:
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info(
-            "[combined] computed: %d results in %.0fms | warm=%.0fms (tick=%.0f deal=%.0f order=%.0f) df_build=%.0fms factor=%.0fms",
+            "[combined] computed: %d results in %.0fms | warm=%.0fms (tick=%.0f deal=%.0f order=%.0f) "
+            "df_build=%.0fms (tick=%.0f deal=%.0f order=%.0f) factor=%.0fms",
             len(result_df), elapsed_ms, warm_ms, warm_tick_ms, warm_deal_ms, warm_order_ms,
-            total_df_us / 1000, total_factor_us / 1000,
+            total_df_us / 1000, total_tick_us / 1000, total_deal_us / 1000, total_order_us / 1000,
+            total_factor_us / 1000,
         )
 
         # Log top-3 slowest stocks (df_build + factor)
@@ -849,7 +869,7 @@ class CombinedEngine:
                       compute_ms=round(elapsed_ms, 1))
 
     def _compute_stock(self, code: str, date_str: str, end_time: str,
-                       states_snapshot: Dict[str, StockState], wall_secs: float) -> Optional[Tuple[Optional[dict], int, int]]:
+                       states_snapshot: Dict[str, StockState], wall_secs: float) -> Optional[Tuple[Optional[dict], int, int, int, int, int]]:
         store = self._memory_store
 
         # Time DataFrame creation (list → DataFrame conversion)
@@ -861,6 +881,9 @@ class CombinedEngine:
         order_df = store.get_order(code)
         t3 = time.perf_counter()
         df_us = int((t3 - t0) * 1e6)
+        tick_us = int((t1 - t0) * 1e6)
+        deal_us = int((t2 - t1) * 1e6)
+        order_us = int((t3 - t2) * 1e6)
 
         stock_data = StockData(
             code=code,
@@ -888,7 +911,7 @@ class CombinedEngine:
                     data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
                     if abs(data_latency_ms) < 600_000:
                         result["data_latency_ms"] = data_latency_ms
-        return result, df_us, factor_us
+        return result, df_us, factor_us, tick_us, deal_us, order_us
 
     # ------------------------------------------------------------------ #
     # Checkpoint                                                           #
@@ -1022,9 +1045,14 @@ class CombinedEngine:
             now = time.time()
 
             if now - last_compute >= self.compute_interval:
-                if _is_trading_hours() and self.states:
-                    self._compute_and_output()
-                last_compute = now
+                if _is_trading_hours() and self.states and not self._compute_running:
+                    self._compute_running = True
+                    t = threading.Thread(target=self._compute_and_output_wrapper, daemon=True)
+                    t.start()
+                    last_compute = now
+                elif self._compute_running:
+                    logger.debug("[combined] previous compute still running, skipping")
+                    last_compute = now
 
             if now - last_checkpoint >= 30 and self.states and _is_trading_hours():
                 self._save_checkpoint()
