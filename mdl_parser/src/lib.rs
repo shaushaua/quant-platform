@@ -907,9 +907,12 @@ impl ShmStockBuffer {
 
 /// Read-only mmap buffer reader for worker processes.
 /// Opens an existing mmap file and reads data without modifying it.
+/// Detects parent auto-grow and remaps automatically in refresh().
 #[pyclass]
 struct ShmBufferReader {
     mmap: Mmap,
+    path: PathBuf,
+    capacity: usize,
     n_cols: usize,
     n_string_cols: usize,
     row_count: usize,
@@ -921,6 +924,7 @@ impl ShmBufferReader {
     /// Reads header to determine dimensions and current row count.
     #[new]
     fn new(path: String) -> PyResult<Self> {
+        let pb = PathBuf::from(&path);
         let file = OpenOptions::new()
             .read(true)
             .open(&path)
@@ -936,11 +940,14 @@ impl ShmBufferReader {
                 mmap.len()
             )));
         }
+        let capacity = read_u64_at(&mmap, 0) as usize;
         let n_cols = read_u64_at(&mmap, 8) as usize;
         let n_string_cols = read_u64_at(&mmap, 16) as usize;
         let row_count = read_u64_at(&mmap, 24) as usize;
         Ok(ShmBufferReader {
             mmap,
+            path: pb,
+            capacity,
             n_cols,
             n_string_cols,
             row_count,
@@ -999,8 +1006,19 @@ impl ShmBufferReader {
         Ok(arr.into_pyarray(py))
     }
 
-    /// Refresh row_count from the file header (parent may have appended data).
+    /// Refresh row_count from the file header.
+    /// If parent auto-grew the file (capacity increased), remap to cover the new area.
     fn refresh(&mut self) -> usize {
+        let new_capacity = read_u64_at(&self.mmap, 0) as usize;
+        if new_capacity > self.capacity {
+            // Parent auto-grew — remap to cover extended file
+            if let Ok(file) = OpenOptions::new().read(true).open(&self.path) {
+                if let Ok(new_mmap) = unsafe { Mmap::map(&file) } {
+                    self.mmap = new_mmap;
+                    self.capacity = new_capacity;
+                }
+            }
+        }
         self.row_count = read_u64_at(&self.mmap, 24) as usize;
         self.row_count
     }

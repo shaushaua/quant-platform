@@ -225,14 +225,7 @@ class MemoryStore:
         return buf
 
     def append_tick(self, code: str, row_tuple: tuple) -> None:
-        """Append a single tick tuple — writes to Python list + ShmStockBuffer directly."""
-        # Still append to list (needed for archive snapshot)
-        lst = self._tick_lists.get(code)
-        if lst is None:
-            lst = []
-            self._tick_lists[code] = lst
-        lst.append(row_tuple)
-        # Direct write to ShmStockBuffer (skip warm thread)
+        """Append a single tick tuple — writes to ShmStockBuffer only."""
         try:
             buf = self._get_or_create_buf("tick", code)
             buf.append_tuples([row_tuple], 2)  # start_col=2
@@ -240,19 +233,10 @@ class MemoryStore:
             pass
         self._dirty_codes.add(code)
         self._dirty_tick.add(code)
-        if len(lst) > self._max_rows:
-            new_lst = lst[-(self._max_rows // 2):]
-            if self._tick_lists.get(code) is lst:
-                self._tick_lists[code] = new_lst
         self._last_append_ts = time.time()
 
     def append_order(self, code: str, row_tuple: tuple) -> None:
-        """Append a single order tuple — writes to list + ShmStockBuffer directly."""
-        lst = self._order_lists.get(code)
-        if lst is None:
-            lst = []
-            self._order_lists[code] = lst
-        lst.append(row_tuple)
+        """Append a single order tuple — writes to ShmStockBuffer only."""
         try:
             buf = self._get_or_create_buf("order", code)
             buf.append_tuples([row_tuple], 2)
@@ -260,19 +244,10 @@ class MemoryStore:
             pass
         self._dirty_codes.add(code)
         self._dirty_order.add(code)
-        if len(lst) > self._max_rows:
-            new_lst = lst[-(self._max_rows // 2):]
-            if self._order_lists.get(code) is lst:
-                self._order_lists[code] = new_lst
         self._last_append_ts = time.time()
 
     def append_deal(self, code: str, row_tuple: tuple) -> None:
-        """Append a single deal tuple — writes to list + ShmStockBuffer directly."""
-        lst = self._deal_lists.get(code)
-        if lst is None:
-            lst = []
-            self._deal_lists[code] = lst
-        lst.append(row_tuple)
+        """Append a single deal tuple — writes to ShmStockBuffer only."""
         try:
             buf = self._get_or_create_buf("deal", code)
             buf.append_tuples([row_tuple], 2)
@@ -280,10 +255,6 @@ class MemoryStore:
             pass
         self._dirty_codes.add(code)
         self._dirty_deal.add(code)
-        if len(lst) > self._max_rows:
-            new_lst = lst[-(self._max_rows // 2):]
-            if self._deal_lists.get(code) is lst:
-                self._deal_lists[code] = new_lst
         self._last_append_ts = time.time()
 
     # ==================== 兼容写入接口（采集器调用）====================
@@ -341,12 +312,23 @@ class MemoryStore:
         Uses Rust StockBuffer for fast incremental accumulation.
         Supports incremental DataFrame update: only append new rows instead of full rebuild."""
         if code is None:
-            # All stocks combined — no cache, build from scratch (rare path)
-            lists = getattr(self, f"_{kind}_lists")
-            all_rows = []
-            for lst in lists.values():
-                all_rows.extend(lst)
-            return pd.DataFrame(all_rows, columns=columns) if all_rows else pd.DataFrame()
+            # All stocks combined — build from ShmStockBuffer (no Python lists)
+            buf_map = getattr(self, f"_{kind}_buf")
+            dfs = []
+            base = pd.Timestamp(self._trading_day)
+            for c, buf in buf_map.items():
+                if buf.len() == 0:
+                    continue
+                arr = buf.to_numpy()
+                buf_cols = columns[2:]
+                df = pd.DataFrame(arr, columns=buf_cols, copy=False)
+                for col in ('Time', 'UpdateTime'):
+                    if col in buf_cols:
+                        df[col] = base + pd.to_timedelta(df[col], unit='s')
+                df.insert(0, 'TradingDay', self._trading_day)
+                df.insert(1, 'Code', c)
+                dfs.append(df[columns])
+            return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
         df_cache = getattr(self, f"_{kind}_df_cache")
         df_rows = getattr(self, f"_{kind}_df_rows")
@@ -428,31 +410,23 @@ class MemoryStore:
     # ==================== 批量预热（逐股，线程池前）====================
 
     def warm_cache_batch(self, kind: str, codes: list) -> int:
-        """Sync warm state with buffer state.
-        Since callbacks now write directly to ShmStockBuffer, this mainly handles
-        list truncation detection and cache_len sync. Returns number of stocks updated."""
+        """Sync warm state with buffer row counts.
+        Since callbacks write directly to ShmStockBuffer and there are no Python lists,
+        this just syncs cache_len from buffer.len() for dirty tracking."""
         buf_map = getattr(self, f"_{kind}_buf")
         cache_len = getattr(self, f"_{kind}_cache_len")
-        lists = getattr(self, f"_{kind}_lists")
 
         t0 = time.perf_counter()
         updated = 0
-        truncated = 0
         for code in codes:
-            lst = lists.get(code, [])
-            if not lst:
+            buf = buf_map.get(code)
+            if buf is None:
                 continue
+            cur = buf.len()
             cl = cache_len.get(code, 0)
-            cur = len(lst)
             if cl == cur:
                 continue
-            if cl > cur:  # list was truncated — reset buffer
-                if code in buf_map:
-                    buf_map[code].reset()
-                cl = 0
-                truncated += 1
-            # Buffer already has the data (appended in callback)
-            # Just sync cache_len
+            # Sync cache_len from buffer
             cache_len[code] = cur
             updated += 1
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -528,22 +502,33 @@ class MemoryStore:
             setattr(self, attr, {code: [] for code in old})
             return result
 
-    def snapshot_incremental(self, kind: str) -> Dict[str, list]:
-        """Return new rows since last snapshot for each stock, WITHOUT clearing.
-        Tracks per-stock offset so next call only returns rows appended since then.
-        Data stays in memory for factor computation (full-day accumulation)."""
-        attr = f"_{kind}_lists"
+    def snapshot_incremental(self, kind: str) -> Dict[str, pd.DataFrame]:
+        """Return new rows since last snapshot as per-stock DataFrames.
+        Reads from ShmStockBuffer (no Python lists). Tracks per-stock buffer offset."""
+        buf_map = getattr(self, f"_{kind}_buf")
         offset_attr = f"_archive_offset_{kind}"
-        lists = getattr(self, attr)
         offsets = getattr(self, offset_attr, {})
+        columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
+        buf_cols = columns[2:]
 
+        base = pd.Timestamp(self._trading_day)
         result = {}
-        for code, lst in lists.items():
+        for code, buf in buf_map.items():
+            current = buf.len()
             start = offsets.get(code, 0)
-            if len(lst) > start:
-                # list[start:] creates a copy of the new portion
-                result[code] = list(lst[start:])
-                offsets[code] = len(lst)
+            if current <= start:
+                continue
+            arr = buf.to_numpy_from(start)
+            if arr.shape[0] == 0:
+                continue
+            df = pd.DataFrame(arr, columns=buf_cols, copy=False)
+            for col in ('Time', 'UpdateTime'):
+                if col in buf_cols:
+                    df[col] = base + pd.to_timedelta(df[col], unit='s')
+            df.insert(0, 'TradingDay', self._trading_day)
+            df.insert(1, 'Code', code)
+            result[code] = df[columns]
+            offsets[code] = current
 
         setattr(self, offset_attr, offsets)
         return result
@@ -615,12 +600,12 @@ class MemoryStore:
     def get_stats(self) -> dict:
         """获取存储统计信息"""
         with self._rw_lock:
-            tick_total = sum(len(lst) for lst in self._tick_lists.values())
-            order_total = sum(len(lst) for lst in self._order_lists.values())
-            deal_total = sum(len(lst) for lst in self._deal_lists.values())
-            tick_stocks = len(self._tick_lists)
-            order_stocks = len(self._order_lists)
-            deal_stocks = len(self._deal_lists)
+            tick_total = sum(buf.len() for buf in self._tick_buf.values())
+            order_total = sum(buf.len() for buf in self._order_buf.values())
+            deal_total = sum(buf.len() for buf in self._deal_buf.values())
+            tick_stocks = len(self._tick_buf)
+            order_stocks = len(self._order_buf)
+            deal_stocks = len(self._deal_buf)
 
             return {
                 "trading_day": self._trading_day,
@@ -647,9 +632,9 @@ class MemoryStore:
         DEAL_ROW_BYTES = len(DEAL_COLUMNS) * 8
 
         with self._rw_lock:
-            tick_rows = sum(len(lst) for lst in self._tick_lists.values())
-            order_rows = sum(len(lst) for lst in self._order_lists.values())
-            deal_rows = sum(len(lst) for lst in self._deal_lists.values())
+            tick_rows = sum(buf.len() for buf in self._tick_buf.values())
+            order_rows = sum(buf.len() for buf in self._order_buf.values())
+            deal_rows = sum(buf.len() for buf in self._deal_buf.values())
 
             tick_mem = tick_rows * TICK_ROW_BYTES
             order_mem = order_rows * ORDER_ROW_BYTES

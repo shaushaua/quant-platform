@@ -126,20 +126,32 @@ _deal_columns = DEAL_COLUMNS
 
 
 def _build_df_from_mmap(reader, columns, trading_day, code):
-    """Build a DataFrame from an mmap buffer reader."""
+    """Build a DataFrame from an mmap buffer reader.
+
+    Fast path: create DataFrame directly from 2D numpy array (single Block
+    split into columns by pandas), then patch 2 Time columns and inject
+    2 string columns. Avoids dict-per-column overhead.
+    """
     n_rows = reader.len
     if n_rows == 0:
         return pd.DataFrame()
     arr = reader.to_numpy()
     buf_cols = columns[2:]  # skip TradingDay, Code
+
+    # Build DataFrame from 2D array — pandas creates columns via internal copy
+    df = pd.DataFrame(arr, columns=buf_cols, copy=False)
+
+    # Convert Time/UpdateTime from f64 seconds → datetime64[ns]
     base = pd.Timestamp(trading_day)
-    data = {'TradingDay': trading_day, 'Code': code}
-    for i, col in enumerate(buf_cols):
-        if col == 'Time' or col == 'UpdateTime':
-            data[col] = base + pd.to_timedelta(arr[:, i], unit='s')
-        else:
-            data[col] = arr[:, i]
-    return pd.DataFrame(data, columns=columns)
+    for col in ('Time', 'UpdateTime'):
+        if col in buf_cols:
+            df[col] = base + pd.to_timedelta(df[col], unit='s')
+
+    # Inject constant string columns at front
+    df.insert(0, 'TradingDay', trading_day)
+    df.insert(1, 'Code', code)
+
+    return df[columns]
 
 
 def _compute_stock_shm(args):
@@ -659,42 +671,32 @@ class CombinedEngine:
         logger.warning("[raw-archive] disk queue not drained after %.0fs pending=%d active=%d", timeout_seconds, pending, active)
 
     def _snapshot_to_archive(self) -> None:
-        """Snapshot per-stock lists to disk for archiving."""
+        """Snapshot per-stock buffers to disk for archiving."""
         archive_day = self._trading_day
         store = self._memory_store
         t0 = time.time()
         for kind in ("tick", "deal", "order"):
-            columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
-            # Incremental snapshot: get new rows without clearing (full-day data stays in memory)
             snapshots = store.snapshot_incremental(kind)
             if not snapshots:
                 continue
-            all_rows = []
-            row_count = 0
-            for code, lst in snapshots.items():
-                all_rows.extend(lst)
-                row_count += len(lst)
-            if all_rows:
+            row_count = sum(len(df) for df in snapshots.values())
+            if row_count > 0:
                 t1 = time.time()
-                df = pd.DataFrame(all_rows, columns=columns)
+                df = pd.concat(snapshots.values(), ignore_index=True)
                 t2 = time.time()
                 self._enqueue_raw_archive(archive_day, kind, df)
-                logger.info("[archive] %s: %d stocks %d rows | snapshot=%.0fms df_build=%.0fms",
+                logger.info("[archive] %s: %d stocks %d rows | snapshot=%.0fms concat=%.0fms",
                             kind, len(snapshots), row_count, (t1 - t0) * 1000, (t2 - t1) * 1000)
 
     def _snapshot_for_day(self, trading_day: date) -> None:
         store = self._memory_store
         for kind in ("tick", "deal", "order"):
-            columns = {"tick": TICK_COLUMNS, "order": ORDER_COLUMNS, "deal": DEAL_COLUMNS}[kind]
             # Final incremental snapshot for the day (gets any remaining un-archived rows)
             snapshots = store.snapshot_incremental(kind)
             if not snapshots:
                 continue
-            all_rows = []
-            for code, lst in snapshots.items():
-                all_rows.extend(lst)
-            if all_rows:
-                df = pd.DataFrame(all_rows, columns=columns)
+            df = pd.concat(snapshots.values(), ignore_index=True)
+            if not df.empty:
                 self._enqueue_raw_archive(trading_day, kind, df)
 
     def _get_oss_bucket(self):
