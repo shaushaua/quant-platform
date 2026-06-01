@@ -86,19 +86,20 @@ def _pin_worker_cpu(worker_cpus):
 
 
 def _compute_stock_cow(args):
-    """Build DataFrame + compute factor in child process.
-    Buffers already warmed in parent before fork — children read from COW buffers.
-    No warm, no buffer creation in children — parent GIL fully available for callbacks."""
+    """Warm + build DataFrame + compute factor in child process.
+    All work happens in child (own GIL) — parent GIL is 100% free for callbacks."""
     code, date_str, end_time, wall_secs, state_snap = args
     try:
         store = MemoryStore.get_instance()
 
-        # Read from parent's pre-warmed COW buffers (no warm needed in child)
-        t_df = time.perf_counter()
+        # Warm this stock's buffers (child process, own GIL, zero parent impact)
+        store.warm_tick_batch([code])
+        store.warm_deal_batch([code])
+        store.warm_order_batch([code])
+
         tick_df = store.get_tick(code)
         deal_df = store.get_deal(code)
         order_df = store.get_order(code)
-        t_factor = time.perf_counter()
 
         stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
@@ -108,14 +109,6 @@ def _compute_stock_cow(args):
         )
 
         result = _factor_fn(stock_data, code, date_str, end_time)
-        t_done = time.perf_counter()
-
-        # Log slow stocks to identify bottleneck
-        total_ms = (t_done - t_df) * 1000
-        if total_ms > 100:
-            logger.info("[cow] %s: df=%.0fms factor=%.0fms rows=t%d/d%d/o%d",
-                        code, (t_factor - t_df)*1000, (t_done - t_factor)*1000,
-                        len(tick_df), len(deal_df), len(order_df))
 
         if result is not None and state_snap and state_snap.last_market_time:
             market_secs = _time_to_seconds(state_snap.last_market_time)
@@ -729,6 +722,9 @@ class CombinedEngine:
         while not self._stopped:
             time.sleep(self._archive_interval)
             try:
+                # Skip archive during trading hours — GIL-free for <1s data availability
+                if _is_trading_hours():
+                    continue
                 self._snapshot_to_archive()
             except Exception as exc:
                 logger.warning("[archive] snapshot failed: %s", exc)
@@ -807,21 +803,12 @@ class CombinedEngine:
         t0 = time.time()
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-        # ====== Warm in parent (incremental, ~2-5s GIL hold), then fork for factor ======
+        # ====== All warm + factor in children — parent GIL 100% free for callbacks ======
         global _factor_fn, _market_df, _daily_basic_df
         _factor_fn = self.factor_calculation
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
 
-        # Warm all dirty stocks in parent — incremental (only new rows since last warm)
-        # Children inherit warmed buffers via COW, skip warm entirely
-        warm_t0 = time.perf_counter()
-        warm_codes = list(all_codes)
-        store.warm_tick_batch(warm_codes)
-        store.warm_deal_batch(warm_codes)
-        store.warm_order_batch(warm_codes)
-        warm_ms = (time.perf_counter() - warm_t0) * 1000
-        logger.info("[combined] parent warm: %d stocks, %.0fms", len(warm_codes), warm_ms)
         args = [
             (code, date_str, end_time, wall_secs, states_snapshot.get(code))
             for code in all_codes
@@ -854,25 +841,12 @@ class CombinedEngine:
 
         pool_ms = (time.perf_counter() - pool_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
-        result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info(
             "[combined] done: %d results (errors=%d) | pool=%.0fms total=%.0fms",
-            len(result_df), errors, pool_ms, elapsed_ms,
+            len(results), errors, pool_ms, elapsed_ms,
         )
 
-        # Log buffer row counts for data health check
-        store_stats = store.get_stats()
-        buf_tick = sum(b.len() for b in store._tick_buf.values()) if store._tick_buf else 0
-        buf_deal = sum(b.len() for b in store._deal_buf.values()) if store._deal_buf else 0
-        buf_order = sum(b.len() for b in store._order_buf.values()) if store._order_buf else 0
-        logger.info(
-            "[combined] buffer rows: tick=%d (lists=%d) deal=%d (lists=%d) order=%d (lists=%d) | df_cache=%d/%d/%d",
-            buf_tick, store_stats["tick_rows"],
-            buf_deal, store_stats["deal_rows"],
-            buf_order, store_stats["order_rows"],
-            len(store._tick_df_cache), len(store._deal_df_cache), len(store._order_df_cache),
-        )
-
+        # Log latency factor (lightweight, no GIL-heavy work)
         if states_snapshot:
             compute_now = datetime.now()
             compute_wall_secs = compute_now.hour * 3600 + compute_now.minute * 60 + compute_now.second
@@ -890,23 +864,46 @@ class CombinedEngine:
             if latency_parts:
                 logger.info("[latency-factor] %s", " | ".join(latency_parts))
 
-        if self.output_path and not result_df.empty:
-            self.output_path.mkdir(parents=True, exist_ok=True)
-            out_file = self.output_path / f"{date_str}_{end_time}.csv"
-            result_df.to_csv(out_file, index=False)
-            logger.info("[combined] wrote %s", out_file)
+        # ====== Fork child for result output — parent GIL stays free ======
+        # Child inherits results list via COW, builds DataFrame, writes CSV, uploads OSS
+        if not results:
+            return
 
-        if not result_df.empty:
-            _upload_to_oss(result_df, date_str, end_time)
+        output_path = self.output_path
+        outfun = self.outfun
 
-        if self.outfun is not None:
+        # Reap previous output child if any (non-blocking)
+        try:
+            os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+        pid = os.fork()
+        if pid == 0:
+            # Child process: DataFrame + CSV + OSS + outfun (own GIL)
             try:
-                self.outfun(date_str, end_time, result_df)
+                result_df = pd.DataFrame(results)
+                if output_path and not result_df.empty:
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    out_file = output_path / f"{date_str}_{end_time}.csv"
+                    result_df.to_csv(out_file, index=False)
+                    logger.info("[combined] wrote %s", out_file)
+                if not result_df.empty:
+                    _upload_to_oss(result_df, date_str, end_time)
+                if outfun is not None:
+                    try:
+                        outfun(date_str, end_time, result_df)
+                    except Exception as exc:
+                        logger.error("[combined] outfun failed: %s", exc)
             except Exception as exc:
-                logger.error("[combined] outfun failed: %s", exc)
+                logger.error("[output-child] failed: %s", exc, exc_info=True)
+            finally:
+                os._exit(0)
+        else:
+            logger.info("[combined] output forked to child pid=%d", pid)
 
         pipe_log.log("factor_compute", date=date_str, end_time=end_time,
-                      stocks=len(all_codes), results=len(result_df),
+                      stocks=len(all_codes), results=len(results),
                       compute_ms=round(elapsed_ms, 1))
 
     # ------------------------------------------------------------------ #
