@@ -111,11 +111,29 @@ def _download_cached(bucket, key, cache_dir):
     return cached
 
 
-def _read_parquet(path, date_str):
-    """Read parquet, align columns, convert Code dtype if needed."""
+def _resolve_security_ids(code_str, id_to_code):
+    """Convert string codes like '000001.SZ' to SECURITY_ID list for DuckDB WHERE."""
+    if not code_str:
+        return None
+    codes = [c.strip() for c in code_str.split(",")]
+    # Reverse map: string code -> SECURITY_ID
+    code_to_id = {v: k for k, v in id_to_code.items()}
+    sec_ids = [code_to_id[c] for c in codes if c in code_to_id]
+    return sec_ids, codes
+
+
+def _read_parquet(path, date_str, sec_ids=None):
+    """Read parquet with optional DuckDB predicate pushdown for SECURITY_ID filter.
+    If sec_ids is provided, only reads rows where Code IN (sec_ids) — avoids OOM."""
     try:
         import duckdb
-        df = duckdb.query(f"SELECT * FROM read_parquet('{path}')").df()
+        if sec_ids:
+            ids_str = ",".join(str(i) for i in sec_ids)
+            df = duckdb.query(
+                f"SELECT * FROM read_parquet('{path}') WHERE Code IN ({ids_str})"
+            ).df()
+        else:
+            df = duckdb.query(f"SELECT * FROM read_parquet('{path}')").df()
     except Exception:
         df = pd.read_parquet(path)
 
@@ -252,16 +270,24 @@ def main():
 
     # 1c. Read & convert
     t_load = time.perf_counter()
+
+    # Resolve SECURITY_IDs for predicate pushdown (avoids loading 7GB into 8GB RAM)
+    sec_filter = None
+    if args.codes and id_to_code:
+        sec_filter, code_filter_list = _resolve_security_ids(args.codes, id_to_code)
+        if sec_filter:
+            print(f"  DuckDB predicate pushdown: {len(sec_filter)} SECURITY_IDs")
+
     raw_groups = {}
     for kind, target_cols in [("tick", TICK_COLUMNS), ("deal", DEAL_COLUMNS), ("order", ORDER_COLUMNS)]:
         if kind not in paths:
             raw_groups[kind] = {}
             continue
-        df = _read_parquet(paths[kind], date_str)
+        df = _read_parquet(paths[kind], date_str, sec_ids=sec_filter)
         df = _map_code_column(df, id_to_code)
         df = _align_columns(df, target_cols)
 
-        # Filter by requested codes
+        # Filter by requested codes (in case predicate pushdown was skipped)
         code_filter = None
         if args.codes:
             code_filter = set(c.strip() for c in args.codes.split(","))
