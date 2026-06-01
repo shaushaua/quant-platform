@@ -661,6 +661,23 @@ impl StockBuffer {
         Ok(arr.into_pyarray(py))
     }
 
+    /// Return rows from `start_row` onwards as numpy f64 array (copy).
+    /// For incremental DataFrame construction — only new rows since last read.
+    fn to_numpy_from<'py>(&self, py: Python<'py>, start_row: usize) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if start_row >= self.row_count {
+            let empty = numpy::ndarray::Array2::<f64>::from_shape_vec((0, self.n_cols), vec![])
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            return Ok(empty.into_pyarray(py));
+        }
+        let n_rows = self.row_count - start_row;
+        let start = start_row * self.n_cols;
+        let end = self.row_count * self.n_cols;
+        let filled: Vec<f64> = self.data[start..end].to_vec();
+        let arr = numpy::ndarray::Array2::from_shape_vec((n_rows, self.n_cols), filled)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(arr.into_pyarray(py))
+    }
+
     fn len(&self) -> usize {
         self.row_count
     }

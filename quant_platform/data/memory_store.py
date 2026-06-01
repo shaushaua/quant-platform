@@ -93,6 +93,10 @@ class MemoryStore:
         self._tick_df_cache: Dict[str, pd.DataFrame] = {}
         self._order_df_cache: Dict[str, pd.DataFrame] = {}
         self._deal_df_cache: Dict[str, pd.DataFrame] = {}
+        # DataFrame cache row tracking: how many rows are in each cached DataFrame
+        self._tick_df_rows: Dict[str, int] = {}
+        self._order_df_rows: Dict[str, int] = {}
+        self._deal_df_rows: Dict[str, int] = {}
 
         # 最新行情快照
         self._quotes: Dict[str, dict] = {}
@@ -157,6 +161,9 @@ class MemoryStore:
             self._tick_cache_len.clear()
             self._order_cache_len.clear()
             self._deal_cache_len.clear()
+            self._tick_df_rows.clear()
+            self._order_df_rows.clear()
+            self._deal_df_rows.clear()
             logger.info(f"设置交易日: {trading_day}, 已清空历史数据")
 
     def get_trading_day(self) -> str:
@@ -280,9 +287,8 @@ class MemoryStore:
 
     def _get_incremental(self, kind: str, code: Optional[str], columns: tuple) -> pd.DataFrame:
         """Core logic for incremental DataFrame retrieval.
-        Uses Rust StockBuffer for fast incremental accumulation,
-        converts to DataFrame only at read time.
-        After warm_cache_batch(), only DataFrame build remains (thread-safe)."""
+        Uses Rust StockBuffer for fast incremental accumulation.
+        Supports incremental DataFrame update: only append new rows instead of full rebuild."""
         if code is None:
             # All stocks combined — no cache, build from scratch (rare path)
             lists = getattr(self, f"_{kind}_lists")
@@ -292,36 +298,58 @@ class MemoryStore:
             return pd.DataFrame(all_rows, columns=columns) if all_rows else pd.DataFrame()
 
         df_cache = getattr(self, f"_{kind}_df_cache")
-        cache_len = getattr(self, f"_{kind}_cache_len")
-        lists = getattr(self, f"_{kind}_lists")
+        df_rows = getattr(self, f"_{kind}_df_rows")
         buf_map = getattr(self, f"_{kind}_buf")
 
-        lst = lists.get(code, [])
-        cached_len = cache_len.get(code, 0)
-        current_len = len(lst)
+        buf = buf_map.get(code)
+        buf_len = buf.len() if buf else 0
 
-        # No new data → return cached DataFrame directly (fast path)
-        if cached_len == current_len and code in df_cache:
+        # Fast path: cached DataFrame is up-to-date with buffer
+        if code in df_cache and df_rows.get(code, 0) == buf_len and buf_len > 0:
             return df_cache[code]
 
-        buf = buf_map.get(code)
-        if buf is None or buf.len() == 0:
+        # No data
+        if buf_len == 0 or buf is None:
             return pd.DataFrame()
 
-        # Build DataFrame from Rust buffer — single-pass construction, no column reorder
-        t0 = time.perf_counter()
-        arr = buf.to_numpy()                           # (rows, n_cols) f64
-        n_rows = arr.shape[0]
+        # Buffer was reset (list truncation) — discard cache, full rebuild
+        cached_rows = df_rows.get(code, 0)
+        if cached_rows > buf_len:
+            cached_rows = 0
+            df_cache.pop(code, None)
+
         base = pd.Timestamp(self._trading_day)
 
-        # Build all columns in correct order from the start
-        data = {}
-        data['TradingDay'] = self._trading_day
-        data['Code'] = code
+        # Incremental path: append new rows to cached DataFrame
+        if cached_rows > 0 and code in df_cache:
+            new_arr = buf.to_numpy_from(cached_rows)  # only new rows
+            if new_arr.shape[0] == 0:
+                return df_cache[code]
+
+            # Build fragment DataFrame for new rows
+            buf_cols = columns[2:]
+            new_data = {'TradingDay': self._trading_day, 'Code': code}
+            for i, col in enumerate(buf_cols):
+                if col == 'Time' or col == 'UpdateTime':
+                    new_data[col] = base + pd.to_timedelta(new_arr[:, i], unit='s')
+                else:
+                    new_data[col] = new_arr[:, i]
+            new_df = pd.DataFrame(new_data, columns=columns)
+
+            # Append to cached DataFrame
+            df = pd.concat([df_cache[code], new_df], ignore_index=True)
+            df_cache[code] = df
+            df_rows[code] = buf_len
+            return df
+
+        # Full rebuild: no cache exists
+        t0 = time.perf_counter()
+        arr = buf.to_numpy()                           # (rows, n_cols) f64
         buf_cols = columns[2:]  # skip TradingDay/Code
+        data = {'TradingDay': self._trading_day, 'Code': code}
         for i, col in enumerate(buf_cols):
             if col == 'Time' or col == 'UpdateTime':
-                data[col] = pd.to_datetime(arr[:, i], unit='s', origin=base)
+                data[col] = base + pd.to_timedelta(arr[:, i], unit='s')
             else:
                 data[col] = arr[:, i]
         df = pd.DataFrame(data, columns=columns)
@@ -331,6 +359,7 @@ class MemoryStore:
             logger.debug("[df-build-%s] %s: %d rows, %.1fms", kind, code, len(df), build_ms)
 
         df_cache[code] = df
+        df_rows[code] = buf_len
         return df
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
@@ -385,7 +414,7 @@ class MemoryStore:
                 buf.append_tuples(new_rows, 2)  # start_col=2, skip TradingDay/Code
                 total_new_rows += len(new_rows)
             cache_len[code] = cur
-            df_cache.pop(code, None)  # invalidate df_cache
+            # Don't invalidate df_cache — _get_incremental handles incremental updates
             updated += 1
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if updated > 0:
