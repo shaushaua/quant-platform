@@ -75,13 +75,19 @@ _daily_basic_df: pd.DataFrame = pd.DataFrame()
 
 
 def _compute_stock_cow(args):
-    """Build DataFrame + compute factor in child process.
-    Reads from parent's MemoryStore via fork COW — zero data serialization."""
+    """Warm + build DataFrame + compute factor in child process.
+    Reads from parent's MemoryStore via fork COW — zero data serialization.
+    No parent GIL occupation at all."""
     code, date_str, end_time, wall_secs, state_snap = args
     try:
         store = MemoryStore.get_instance()
 
-        # Build DataFrames (COW read from Rust buffers, no parent GIL contention)
+        # Warm this stock's buffers (child process, no parent GIL impact)
+        store.warm_tick_batch([code])
+        store.warm_deal_batch([code])
+        store.warm_order_batch([code])
+
+        # Build DataFrames from warmed buffers
         tick_df = store.get_tick(code)
         deal_df = store.get_deal(code)
         order_df = store.get_order(code)
@@ -774,42 +780,19 @@ class CombinedEngine:
         if not dirty:
             return
 
-        # Per-type dirty: only warm data types that actually changed
-        dirty_tick, dirty_deal, dirty_order = store.drain_dirty_typed()
+        # Drain per-type dirty (children will warm what they need)
+        store.drain_dirty_typed()
 
         all_codes = dirty & states_snapshot.keys() if states_snapshot else dirty
 
-        # Filter per-type dirty to only stocks we'll compute
-        tick_codes = list(dirty_tick & all_codes)
-        deal_codes = list(dirty_deal & all_codes)
-        order_codes = list(dirty_order & all_codes)
-
-        logger.info("[combined] computing: date=%s end_time=%s stocks=%d (tick=%d deal=%d order=%d)",
-                     date_str, end_time, len(all_codes), len(tick_codes), len(deal_codes), len(order_codes))
+        logger.info("[combined] computing: date=%s end_time=%s stocks=%d",
+                     date_str, end_time, len(all_codes))
 
         t0 = time.time()
-
-        # ====== Phase 1: Pre-warm only (main process, fast, minimal GIL) ======
-        warm_t0 = time.perf_counter()
-        warm_tick_ms = warm_deal_ms = warm_order_ms = 0.0
-        if tick_codes:
-            t1 = time.perf_counter()
-            store.warm_tick_batch(tick_codes)
-            warm_tick_ms = (time.perf_counter() - t1) * 1000
-        if deal_codes:
-            t1 = time.perf_counter()
-            store.warm_deal_batch(deal_codes)
-            warm_deal_ms = (time.perf_counter() - t1) * 1000
-        if order_codes:
-            t1 = time.perf_counter()
-            store.warm_order_batch(order_codes)
-            warm_order_ms = (time.perf_counter() - t1) * 1000
-        warm_ms = (time.perf_counter() - warm_t0) * 1000
-
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-        # ====== Phase 2: Fork Pool — df_build + factor in child processes (COW, no GIL) ======
-        # Set module-level globals for COW inheritance
+        # ====== Fork Pool — warm + df_build + factor ALL in child processes ======
+        # Parent process does ZERO computation — GIL fully available for callbacks
         global _factor_fn, _market_df, _daily_basic_df
         _factor_fn = self.factor_calculation
         _market_df = self._market_df
@@ -823,6 +806,7 @@ class CombinedEngine:
 
         results = []
         errors = 0
+        pool_t0 = time.perf_counter()
         ctx = multiprocessing.get_context('fork')
         pool = ctx.Pool(processes=self._pool_workers)
         try:
@@ -838,12 +822,12 @@ class CombinedEngine:
             pool.close()
             pool.join()
 
-        phase2_ms = (time.perf_counter() - phase2_t0) * 1000
+        pool_ms = (time.perf_counter() - pool_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
         result_df = pd.DataFrame(results) if results else pd.DataFrame()
         logger.info(
-            "[combined] done: %d results (errors=%d) | warm=%.0fms pool=%.0fms total=%.0fms",
-            len(result_df), errors, warm_ms, phase2_ms, elapsed_ms,
+            "[combined] done: %d results (errors=%d) | pool=%.0fms total=%.0fms",
+            len(result_df), errors, pool_ms, elapsed_ms,
         )
 
         # Log buffer row counts for data health check
