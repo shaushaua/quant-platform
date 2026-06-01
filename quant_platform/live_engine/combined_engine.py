@@ -86,22 +86,19 @@ def _pin_worker_cpu(worker_cpus):
 
 
 def _compute_stock_cow(args):
-    """Warm + build DataFrame + compute factor in child process.
-    Reads from parent's MemoryStore via fork COW — zero data serialization.
-    No parent GIL occupation at all."""
+    """Build DataFrame + compute factor in child process.
+    Buffers already warmed in parent before fork — children read from COW buffers.
+    No warm, no buffer creation in children — parent GIL fully available for callbacks."""
     code, date_str, end_time, wall_secs, state_snap = args
     try:
         store = MemoryStore.get_instance()
 
-        # Warm this stock's buffers (child process, no parent GIL impact)
-        store.warm_tick_batch([code])
-        store.warm_deal_batch([code])
-        store.warm_order_batch([code])
-
-        # Build DataFrames from warmed buffers
+        # Read from parent's pre-warmed COW buffers (no warm needed in child)
+        t_df = time.perf_counter()
         tick_df = store.get_tick(code)
         deal_df = store.get_deal(code)
         order_df = store.get_order(code)
+        t_factor = time.perf_counter()
 
         stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
@@ -111,6 +108,14 @@ def _compute_stock_cow(args):
         )
 
         result = _factor_fn(stock_data, code, date_str, end_time)
+        t_done = time.perf_counter()
+
+        # Log slow stocks to identify bottleneck
+        total_ms = (t_done - t_df) * 1000
+        if total_ms > 100:
+            logger.info("[cow] %s: df=%.0fms factor=%.0fms rows=t%d/d%d/o%d",
+                        code, (t_factor - t_df)*1000, (t_done - t_factor)*1000,
+                        len(tick_df), len(deal_df), len(order_df))
 
         if result is not None and state_snap and state_snap.last_market_time:
             market_secs = _time_to_seconds(state_snap.last_market_time)
@@ -791,7 +796,7 @@ class CombinedEngine:
         if not dirty:
             return
 
-        # Drain per-type dirty (children will warm what they need)
+        # Drain per-type dirty sets to prevent unbounded growth
         store.drain_dirty_typed()
 
         all_codes = dirty & states_snapshot.keys() if states_snapshot else dirty
@@ -802,14 +807,21 @@ class CombinedEngine:
         t0 = time.time()
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-        # ====== Fork Pool — warm + df_build + factor ALL in child processes ======
-        # Parent process does ZERO computation — GIL fully available for callbacks
+        # ====== Warm in parent (incremental, ~2-5s GIL hold), then fork for factor ======
         global _factor_fn, _market_df, _daily_basic_df
         _factor_fn = self.factor_calculation
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
 
-        phase2_t0 = time.perf_counter()
+        # Warm all dirty stocks in parent — incremental (only new rows since last warm)
+        # Children inherit warmed buffers via COW, skip warm entirely
+        warm_t0 = time.perf_counter()
+        warm_codes = list(all_codes)
+        store.warm_tick_batch(warm_codes)
+        store.warm_deal_batch(warm_codes)
+        store.warm_order_batch(warm_codes)
+        warm_ms = (time.perf_counter() - warm_t0) * 1000
+        logger.info("[combined] parent warm: %d stocks, %.0fms", len(warm_codes), warm_ms)
         args = [
             (code, date_str, end_time, wall_secs, states_snapshot.get(code))
             for code in all_codes
@@ -828,7 +840,7 @@ class CombinedEngine:
             initargs=(worker_cpus,),
         )
         try:
-            for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=50):
+            for code, result, err in pool.imap_unordered(_compute_stock_cow, args, chunksize=32):
                 if err:
                     logger.warning("[%s] compute failed: %s", code, err)
                     errors += 1
