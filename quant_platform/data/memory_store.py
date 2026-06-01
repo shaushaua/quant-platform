@@ -433,8 +433,8 @@ class MemoryStore:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if updated > 0:
             logger.info(
-                "[warm-%s] %d/%d stocks synced, %d truncated | %.1fms",
-                kind, updated, len(codes), truncated, elapsed_ms,
+                "[warm-%s] %d/%d stocks synced | %.1fms",
+                kind, updated, len(codes), elapsed_ms,
             )
         return updated
 
