@@ -4,14 +4,16 @@ FROM 172.24.99.176:5000/quant-platform/backtest-base:latest AS rust-builder
 ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
 ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
 
-COPY mdl_parser/ /app/mdl_parser/
-
+# Layer 1: Install Rust toolchain + maturin (cached unless Dockerfile changes)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://mirrors.ustc.edu.cn/rust-static/rustup/rustup-init.sh | sh -s -- -y --default-toolchain stable \
     && . "$HOME/.cargo/env" \
     && pip install --no-cache-dir maturin \
     && mkdir -p /root/.cargo \
-    && printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' > /root/.cargo/config.toml \
-    && cd /app/mdl_parser && maturin build --release --strip
+    && printf '[source.crates-io]\nreplace-with = "ustc"\n\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' > /root/.cargo/config.toml
+
+# Layer 2: Build mdl_parser (only re-run when mdl_parser/ changes)
+COPY mdl_parser/ /app/mdl_parser/
+RUN . "$HOME/.cargo/env" && cd /app/mdl_parser && maturin build --release --strip
 
 # Stage 2: Final image (no Rust toolchain, only the wheel)
 FROM 172.24.99.176:5000/quant-platform/backtest-base:latest
