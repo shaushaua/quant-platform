@@ -86,17 +86,13 @@ def _pin_worker_cpu(worker_cpus):
 
 
 def _compute_stock_cow(args):
-    """Warm + build DataFrame + compute factor in child process.
-    All work happens in child (own GIL) — parent GIL is 100% free for callbacks."""
+    """Build DataFrame + compute factor in child process.
+    Buffers pre-warmed by parent's continuous warm thread — children read via COW."""
     code, date_str, end_time, wall_secs, state_snap = args
     try:
         store = MemoryStore.get_instance()
 
-        # Warm this stock's buffers (child process, own GIL, zero parent impact)
-        store.warm_tick_batch([code])
-        store.warm_deal_batch([code])
-        store.warm_order_batch([code])
-
+        # Read from parent's continuously-warmed COW buffers (no warm in child)
         tick_df = store.get_tick(code)
         deal_df = store.get_deal(code)
         order_df = store.get_order(code)
@@ -407,7 +403,7 @@ class CombinedEngine:
         self._load_checkpoint()
 
         # Fork-COW worker count for DataFrame build + factor computation
-        self._pool_workers = min(int(os.environ.get("FACTOR_WORKERS", "10")), os.cpu_count() or 4)
+        self._pool_workers = min(int(os.environ.get("FACTOR_WORKERS", "11")), os.cpu_count() or 4)
 
         # Background factor computation (non-blocking main loop)
         self._compute_running = False
@@ -713,6 +709,25 @@ class CombinedEngine:
 
         logger.info("[raw-archive] %s upload finished", date_str)
         return uploaded_any and not had_error
+
+    # ------------------------------------------------------------------ #
+    # Continuous warm thread                                                #
+    # ------------------------------------------------------------------ #
+
+    def _warm_loop(self) -> None:
+        """Continuously warm Rust buffers in parent (incremental, ~50-100ms per cycle).
+        Children inherit warmed buffers via COW — skip warm entirely in children."""
+        store = self._memory_store
+        while not self._stopped:
+            time.sleep(3)
+            try:
+                codes = list(store._tick_lists.keys())
+                if codes:
+                    store.warm_tick_batch(codes)
+                    store.warm_deal_batch(codes)
+                    store.warm_order_batch(codes)
+            except Exception as exc:
+                logger.warning("[warm] continuous warm failed: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Archive loop                                                         #
@@ -1024,6 +1039,14 @@ class CombinedEngine:
             )
             self._archive_thread.start()
             logger.info("[combined] archive thread started: interval=%ds", self._archive_interval)
+
+        # Start continuous warm thread — keeps Rust buffers always up-to-date
+        # Children inherit via COW, skip warm entirely (~50-100ms GIL per 3s cycle)
+        self._warm_thread = threading.Thread(
+            target=self._warm_loop, name="continuous-warm", daemon=True,
+        )
+        self._warm_thread.start()
+        logger.info("[combined] continuous warm thread started: interval=3s")
 
         # Pin main process to CPU 0 — callbacks get dedicated core, no migration overhead
         self._callback_cpu = 0

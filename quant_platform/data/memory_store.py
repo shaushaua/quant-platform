@@ -308,20 +308,23 @@ class MemoryStore:
         if buf is None or buf.len() == 0:
             return pd.DataFrame()
 
-        # Build DataFrame from Rust buffer
+        # Build DataFrame from Rust buffer — single-pass construction, no column reorder
         t0 = time.perf_counter()
         arr = buf.to_numpy()                           # (rows, n_cols) f64
-        df = pd.DataFrame(arr, columns=columns[2:])    # skip TradingDay/Code column names
-
-        # Convert Time/UpdateTime from f64 seconds to datetime64[ns]
+        n_rows = arr.shape[0]
         base = pd.Timestamp(self._trading_day)
-        df['Time'] = pd.to_datetime(df['Time'], unit='s', origin=base)
-        df['UpdateTime'] = pd.to_datetime(df['UpdateTime'], unit='s', origin=base)
 
-        # Inject constant string columns
-        df.insert(0, 'TradingDay', self._trading_day)
-        df.insert(1, 'Code', code)
-        df = df[columns]  # reorder to standard column order
+        # Build all columns in correct order from the start
+        data = {}
+        data['TradingDay'] = self._trading_day
+        data['Code'] = code
+        buf_cols = columns[2:]  # skip TradingDay/Code
+        for i, col in enumerate(buf_cols):
+            if col == 'Time' or col == 'UpdateTime':
+                data[col] = pd.to_datetime(arr[:, i], unit='s', origin=base)
+            else:
+                data[col] = arr[:, i]
+        df = pd.DataFrame(data, columns=columns)
         build_ms = (time.perf_counter() - t0) * 1000
 
         if build_ms > 5.0:  # log slow builds (>5ms)
