@@ -45,6 +45,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from ..collector.sdk_callback import SequenceTracker
