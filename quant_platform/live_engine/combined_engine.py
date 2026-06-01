@@ -176,11 +176,13 @@ def _build_df_from_path(path, columns, trading_day, code):
     # Zero-copy: DataFrame Block references the mmap-backed numpy array
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
 
-    # Only 2 columns get copied (f64 seconds → datetime64[ns])
-    base = pd.Timestamp(trading_day)
+    # Fast time conversion: int64 ns arithmetic, skip pd.to_timedelta overhead
+    base_ns = pd.Timestamp(trading_day).value  # nanoseconds since epoch
     for col in ('Time', 'UpdateTime'):
         if col in buf_cols:
-            df[col] = base + pd.to_timedelta(df[col], unit='s')
+            idx = buf_cols.index(col)
+            # f64 seconds → int64 nanoseconds → datetime64[ns]
+            df[col] = (base_ns + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
 
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
@@ -891,8 +893,10 @@ class CombinedEngine:
         end_time = now.strftime("%H%M%S")
 
         # Snapshot StockState (shallow copy each state so fork children see consistent values)
+        snap_t0 = time.perf_counter()
         with self._lock:
             states_snapshot = {code: copy.copy(st) for code, st in self.states.items()}
+        snap_ms = (time.perf_counter() - snap_t0) * 1000
 
         # Only compute stocks that received new data since last cycle
         store = self._memory_store
@@ -978,9 +982,15 @@ class CombinedEngine:
         pool_ms = (time.perf_counter() - pool_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
         pool_type = "persistent+shm" if self._pool is not None else "fork+cow"
+        n_stocks = len(all_codes)
+        per_stock = pool_ms / max(n_stocks, 1) * (self._pool_workers if self._pool else 1)
         logger.info(
-            "[combined] done (%s): %d results (errors=%d) | compute=%.0fms total=%.0fms",
-            pool_type, len(results), errors, pool_ms, elapsed_ms,
+            "[combined] done (%s): %d results (errors=%d) | "
+            "snap=%.0fms pool=%.0fms total=%.0fms | "
+            "%d stocks × %dw → ~%.1fms/stock",
+            pool_type, len(results), errors,
+            snap_ms, pool_ms, elapsed_ms,
+            n_stocks, self._pool_workers, per_stock,
         )
 
         # Log latency factor (lightweight, no GIL-heavy work)

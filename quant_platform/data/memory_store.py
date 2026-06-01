@@ -324,7 +324,8 @@ class MemoryStore:
                 df = pd.DataFrame(arr, columns=buf_cols, copy=False)
                 for col in ('Time', 'UpdateTime'):
                     if col in buf_cols:
-                        df[col] = base + pd.to_timedelta(df[col], unit='s')
+                        idx = buf_cols.index(col)
+                        df[col] = (base.value + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
                 df.insert(0, 'TradingDay', self._trading_day)
                 df.insert(1, 'Code', c)
                 dfs.append(df[columns])
@@ -351,7 +352,7 @@ class MemoryStore:
             cached_rows = 0
             df_cache.pop(code, None)
 
-        base = pd.Timestamp(self._trading_day)
+        base_ns = pd.Timestamp(self._trading_day).value
 
         # Incremental path: append new rows to cached DataFrame
         if cached_rows > 0 and code in df_cache:
@@ -364,7 +365,7 @@ class MemoryStore:
             new_data = {'TradingDay': self._trading_day, 'Code': code}
             for i, col in enumerate(buf_cols):
                 if col == 'Time' or col == 'UpdateTime':
-                    new_data[col] = base + pd.to_timedelta(new_arr[:, i], unit='s')
+                    new_data[col] = (base_ns + (new_arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
                 else:
                     new_data[col] = new_arr[:, i]
             new_df = pd.DataFrame(new_data, columns=columns)
@@ -382,7 +383,7 @@ class MemoryStore:
         data = {'TradingDay': self._trading_day, 'Code': code}
         for i, col in enumerate(buf_cols):
             if col == 'Time' or col == 'UpdateTime':
-                data[col] = base + pd.to_timedelta(arr[:, i], unit='s')
+                data[col] = (base_ns + (arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
             else:
                 data[col] = arr[:, i]
         df = pd.DataFrame(data, columns=columns)
