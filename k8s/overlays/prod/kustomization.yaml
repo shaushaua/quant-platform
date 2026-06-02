@@ -20,7 +20,7 @@ patches:
               - name: combined-engine
                 env:
                   - name: USE_PERSISTENT_POOL
-                    value: "false"
+                    value: "true"
                 resources:
                   requests:
                     cpu: "4"
