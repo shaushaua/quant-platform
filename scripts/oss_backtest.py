@@ -111,6 +111,15 @@ def _download_cached(bucket, key, cache_dir):
     return cached
 
 
+def _normalize_code(code):
+    """Normalize code suffix: SZ→XSHE, SH→XSHG, or pass through."""
+    if code.endswith(".SZ"):
+        return code[:-3] + ".XSHE"
+    elif code.endswith(".SH"):
+        return code[:-3] + ".XSHG"
+    return code
+
+
 def _resolve_security_ids(code_str, id_to_code):
     """Convert string codes like '000001.SZ' to SECURITY_ID list for DuckDB WHERE."""
     if not code_str:
@@ -118,7 +127,7 @@ def _resolve_security_ids(code_str, id_to_code):
     codes = [c.strip() for c in code_str.split(",")]
     # Reverse map: string code -> SECURITY_ID
     code_to_id = {v: k for k, v in id_to_code.items()}
-    sec_ids = [code_to_id[c] for c in codes if c in code_to_id]
+    sec_ids = [code_to_id[_normalize_code(c)] for c in codes if _normalize_code(c) in code_to_id]
     return sec_ids, codes
 
 

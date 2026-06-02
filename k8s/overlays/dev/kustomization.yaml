@@ -18,6 +18,9 @@ patches:
           spec:
             containers:
               - name: combined-engine
+                env:
+                  - name: FACTOR_WORKERS
+                    value: "4"
                 resources:
                   requests:
                     cpu: "1"

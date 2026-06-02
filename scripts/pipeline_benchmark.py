@@ -212,6 +212,13 @@ def load_oss_data(date_str, codes_str, limit, cache_dir):
         sec_filter, _ = _resolve_security_ids(codes_str, id_to_code)
         if sec_filter:
             print(f"  DuckDB predicate pushdown: {len(sec_filter)} SECURITY_IDs")
+    elif limit > 0 and id_to_code:
+        # --limit: pick N random SECURITY_IDs from daily_basic
+        import random
+        all_ids = list(id_to_code.keys())
+        random.shuffle(all_ids)
+        sec_filter = all_ids[:limit]
+        print(f"  DuckDB predicate pushdown (--limit {limit}): {len(sec_filter)} SECURITY_IDs")
 
     # Download tick/deal/order
     t_download = time.perf_counter()
