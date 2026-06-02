@@ -317,7 +317,7 @@ class MemoryStore:
             dfs = []
             base = pd.Timestamp(self._trading_day)
             for c, buf in buf_map.items():
-                if buf.len() == 0:
+                if buf.len == 0:
                     continue
                 arr = buf.to_numpy()
                 buf_cols = columns[2:]
@@ -336,7 +336,7 @@ class MemoryStore:
         buf_map = getattr(self, f"_{kind}_buf")
 
         buf = buf_map.get(code)
-        buf_len = buf.len() if buf else 0
+        buf_len = buf.len if buf else 0
 
         # Fast path: cached DataFrame is up-to-date with buffer
         if code in df_cache and df_rows.get(code, 0) == buf_len and buf_len > 0:
@@ -423,7 +423,7 @@ class MemoryStore:
             buf = buf_map.get(code)
             if buf is None:
                 continue
-            cur = buf.len()
+            cur = buf.len
             cl = cache_len.get(code, 0)
             if cl == cur:
                 continue
@@ -515,7 +515,7 @@ class MemoryStore:
         base = pd.Timestamp(self._trading_day)
         result = {}
         for code, buf in buf_map.items():
-            current = buf.len()
+            current = buf.len
             start = offsets.get(code, 0)
             if current <= start:
                 continue
@@ -601,9 +601,9 @@ class MemoryStore:
     def get_stats(self) -> dict:
         """获取存储统计信息"""
         with self._rw_lock:
-            tick_total = sum(buf.len() for buf in self._tick_buf.values())
-            order_total = sum(buf.len() for buf in self._order_buf.values())
-            deal_total = sum(buf.len() for buf in self._deal_buf.values())
+            tick_total = sum(buf.len for buf in self._tick_buf.values())
+            order_total = sum(buf.len for buf in self._order_buf.values())
+            deal_total = sum(buf.len for buf in self._deal_buf.values())
             tick_stocks = len(self._tick_buf)
             order_stocks = len(self._order_buf)
             deal_stocks = len(self._deal_buf)
@@ -633,9 +633,9 @@ class MemoryStore:
         DEAL_ROW_BYTES = len(DEAL_COLUMNS) * 8
 
         with self._rw_lock:
-            tick_rows = sum(buf.len() for buf in self._tick_buf.values())
-            order_rows = sum(buf.len() for buf in self._order_buf.values())
-            deal_rows = sum(buf.len() for buf in self._deal_buf.values())
+            tick_rows = sum(buf.len for buf in self._tick_buf.values())
+            order_rows = sum(buf.len for buf in self._order_buf.values())
+            deal_rows = sum(buf.len for buf in self._deal_buf.values())
 
             tick_mem = tick_rows * TICK_ROW_BYTES
             order_mem = order_rows * ORDER_ROW_BYTES
