@@ -191,9 +191,9 @@ def _build_df_from_path(path, columns, trading_day, code):
 
 
 def _compute_stock_shm(args):
-    """Compute factor — builds DataFrames with single-pass dict construction."""
+    """Compute factor in persistent worker. Reads mmap via zero-copy numpy."""
     code, date_str, end_time, wall_secs, state_snap, \
-        tick_path, deal_path, order_path, trading_day = args
+        tick_path, deal_path, order_path, trading_day, factor_fn = args
     try:
         tick_df = _build_df_from_path(tick_path, _tick_columns, trading_day, code) if tick_path else pd.DataFrame()
         deal_df = _build_df_from_path(deal_path, _deal_columns, trading_day, code) if deal_path else pd.DataFrame()
@@ -206,7 +206,7 @@ def _compute_stock_shm(args):
             state=state_snap,
         )
 
-        result = _factor_fn(stock_data, code, date_str, end_time)
+        result = factor_fn(stock_data, code, date_str, end_time)
 
         if result is not None and state_snap and state_snap.last_market_time:
             market_secs = _time_to_seconds(state_snap.last_market_time)
@@ -915,7 +915,7 @@ class CombinedEngine:
         t0 = time.time()
         wall_secs = now.hour * 3600 + now.minute * 60 + now.second
 
-        # ====== Global state for workers ======
+        # ====== Global state for COW fallback workers ======
         global _factor_fn, _market_df, _daily_basic_df
         _factor_fn = self.factor_calculation
         _market_df = self._market_df
@@ -932,11 +932,11 @@ class CombinedEngine:
 
         # Use persistent pool if available, otherwise fall back to per-cycle fork
         if self._pool is not None:
-            # Persistent pool + mmap: zero fork overhead
+            # Persistent pool + mmap: pass factor_fn via args (not global, avoids SIGBUS after fork)
             args = [
                 (code, date_str, end_time, wall_secs, states_snapshot.get(code),
                  tick_paths.get(code, ""), deal_paths.get(code, ""), order_paths.get(code, ""),
-                 date_str)
+                 date_str, self.factor_calculation)
                 for code in all_codes
             ]
             try:
@@ -1191,11 +1191,8 @@ class CombinedEngine:
         # Create persistent worker pool (fork once, reuse across compute cycles)
         # Parent memory is small at this point → fork is fast
         # Workers read data via mmap shared memory, not COW
-        # IMPORTANT: set globals BEFORE fork so children inherit via COW
-        global _factor_fn, _market_df, _daily_basic_df
-        _factor_fn = self.factor_calculation
-        _market_df = self._market_df
-        _daily_basic_df = self._daily_basic_df
+        # NOTE: _factor_fn is set per-cycle in _compute_and_output, not here,
+        # because the factor module may contain Rust extensions that cause SIGBUS after fork.
         try:
             worker_cpus = [c for c in range(os.cpu_count() or 12) if c != self._callback_cpu]
             ctx = multiprocessing.get_context('fork')
