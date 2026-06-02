@@ -190,14 +190,22 @@ def _build_df_from_path(path, columns, trading_day, code):
     return df[columns]
 
 
+# Per-worker profiling state
+_df_build_ms = 0.0
+_factor_ms = 0.0
+_profile_count = 0
+
 def _compute_stock_shm(args):
     """Compute factor in persistent worker. Reads mmap via zero-copy numpy."""
+    global _df_build_ms, _factor_ms, _profile_count
     code, date_str, end_time, wall_secs, state_snap, \
         tick_path, deal_path, order_path, trading_day, factor_fn = args
     try:
+        t0 = time.perf_counter()
         tick_df = _build_df_from_path(tick_path, _tick_columns, trading_day, code) if tick_path else pd.DataFrame()
         deal_df = _build_df_from_path(deal_path, _deal_columns, trading_day, code) if deal_path else pd.DataFrame()
         order_df = _build_df_from_path(order_path, _order_columns, trading_day, code) if order_path else pd.DataFrame()
+        df_ms = (time.perf_counter() - t0) * 1000
 
         stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
@@ -206,7 +214,19 @@ def _compute_stock_shm(args):
             state=state_snap,
         )
 
+        t1 = time.perf_counter()
         result = factor_fn(stock_data, code, date_str, end_time)
+        fn_ms = (time.perf_counter() - t1) * 1000
+
+        # Accumulate profiling (log every 100 stocks per worker)
+        _df_build_ms += df_ms
+        _factor_ms += fn_ms
+        _profile_count += 1
+        if _profile_count % 200 == 0:
+            logger.info("[profile] worker=%s stocks=%d df=%.1fms factor=%.1fms total=%.1fms",
+                        multiprocessing.current_process().name, _profile_count,
+                        _df_build_ms / _profile_count, _factor_ms / _profile_count,
+                        (_df_build_ms + _factor_ms) / _profile_count)
 
         if result is not None and state_snap and state_snap.last_market_time:
             market_secs = _time_to_seconds(state_snap.last_market_time)
