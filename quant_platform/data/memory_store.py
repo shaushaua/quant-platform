@@ -123,6 +123,8 @@ class MemoryStore:
 
         # 读写锁 (使用RLock，Python 3.12兼容)
         self._rw_lock = threading.RLock()
+        # Per-kind lock for mmap buffer access (SDK callback writes, warm thread reads)
+        self._buf_locks = {kind: threading.Lock() for kind in ("tick", "order", "deal")}
 
         # 数据活性时间戳 — SDK 回调每次 append 时更新，主循环用于检测断线
         self._last_append_ts: float = 0.0
@@ -227,8 +229,9 @@ class MemoryStore:
     def append_tick(self, code: str, row_tuple: tuple) -> None:
         """Append a single tick tuple — writes to ShmStockBuffer only."""
         try:
-            buf = self._get_or_create_buf("tick", code)
-            buf.append_tuples([row_tuple], 2)  # start_col=2
+            with self._buf_locks["tick"]:
+                buf = self._get_or_create_buf("tick", code)
+                buf.append_tuples([row_tuple], 2)  # start_col=2
         except Exception:
             pass
         self._dirty_codes.add(code)
@@ -238,8 +241,9 @@ class MemoryStore:
     def append_order(self, code: str, row_tuple: tuple) -> None:
         """Append a single order tuple — writes to ShmStockBuffer only."""
         try:
-            buf = self._get_or_create_buf("order", code)
-            buf.append_tuples([row_tuple], 2)
+            with self._buf_locks["order"]:
+                buf = self._get_or_create_buf("order", code)
+                buf.append_tuples([row_tuple], 2)
         except Exception:
             pass
         self._dirty_codes.add(code)
@@ -249,8 +253,9 @@ class MemoryStore:
     def append_deal(self, code: str, row_tuple: tuple) -> None:
         """Append a single deal tuple — writes to ShmStockBuffer only."""
         try:
-            buf = self._get_or_create_buf("deal", code)
-            buf.append_tuples([row_tuple], 2)
+            with self._buf_locks["deal"]:
+                buf = self._get_or_create_buf("deal", code)
+                buf.append_tuples([row_tuple], 2)
         except Exception:
             pass
         self._dirty_codes.add(code)
@@ -311,90 +316,94 @@ class MemoryStore:
         """Core logic for incremental DataFrame retrieval.
         Uses Rust StockBuffer for fast incremental accumulation.
         Supports incremental DataFrame update: only append new rows instead of full rebuild."""
+        lock = self._buf_locks[kind]
+
         if code is None:
             # All stocks combined — build from ShmStockBuffer (no Python lists)
             buf_map = getattr(self, f"_{kind}_buf")
             dfs = []
             base = pd.Timestamp(self._trading_day)
-            for c, buf in buf_map.items():
-                if buf.len() == 0:
-                    continue
-                arr = buf.to_numpy()
-                buf_cols = columns[2:]
-                df = pd.DataFrame(arr, columns=buf_cols, copy=False)
-                for col in ('Time', 'UpdateTime'):
-                    if col in buf_cols:
-                        idx = buf_cols.index(col)
-                        df[col] = (base.value + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
-                df.insert(0, 'TradingDay', self._trading_day)
-                df.insert(1, 'Code', c)
-                dfs.append(df[columns])
+            with lock:
+                for c, buf in buf_map.items():
+                    if buf.len() == 0:
+                        continue
+                    arr = buf.to_numpy()
+                    buf_cols = columns[2:]
+                    df = pd.DataFrame(arr, columns=buf_cols, copy=False)
+                    for col in ('Time', 'UpdateTime'):
+                        if col in buf_cols:
+                            idx = buf_cols.index(col)
+                            df[col] = (base.value + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+                    df.insert(0, 'TradingDay', self._trading_day)
+                    df.insert(1, 'Code', c)
+                    dfs.append(df[columns])
             return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
         df_cache = getattr(self, f"_{kind}_df_cache")
         df_rows = getattr(self, f"_{kind}_df_rows")
         buf_map = getattr(self, f"_{kind}_buf")
 
-        buf = buf_map.get(code)
-        buf_len = buf.len() if buf else 0
+        with lock:
+            buf = buf_map.get(code)
+            buf_len = buf.len() if buf else 0
 
-        # Fast path: cached DataFrame is up-to-date with buffer
-        if code in df_cache and df_rows.get(code, 0) == buf_len and buf_len > 0:
-            return df_cache[code]
-
-        # No data
-        if buf_len == 0 or buf is None:
-            return pd.DataFrame()
-
-        # Buffer was reset (list truncation) — discard cache, full rebuild
-        cached_rows = df_rows.get(code, 0)
-        if cached_rows > buf_len:
-            cached_rows = 0
-            df_cache.pop(code, None)
-
-        base_ns = pd.Timestamp(self._trading_day).value
-
-        # Incremental path: append new rows to cached DataFrame
-        if cached_rows > 0 and code in df_cache:
-            new_arr = buf.to_numpy_from(cached_rows)  # only new rows
-            if new_arr.shape[0] == 0:
+            # Fast path: cached DataFrame is up-to-date with buffer
+            if code in df_cache and df_rows.get(code, 0) == buf_len and buf_len > 0:
                 return df_cache[code]
 
-            # Build fragment DataFrame for new rows
-            buf_cols = columns[2:]
-            new_data = {'TradingDay': self._trading_day, 'Code': code}
+            # No data
+            if buf_len == 0 or buf is None:
+                return pd.DataFrame()
+
+            # Buffer was reset (list truncation) — discard cache, full rebuild
+            cached_rows = df_rows.get(code, 0)
+            if cached_rows > buf_len:
+                cached_rows = 0
+                df_cache.pop(code, None)
+
+            base_ns = pd.Timestamp(self._trading_day).value
+
+            # Incremental path: append new rows to cached DataFrame
+            if cached_rows > 0 and code in df_cache:
+                new_arr = buf.to_numpy_from(cached_rows)  # only new rows
+                if new_arr.shape[0] == 0:
+                    return df_cache[code]
+
+                # Build fragment DataFrame for new rows
+                buf_cols = columns[2:]
+                new_data = {'TradingDay': self._trading_day, 'Code': code}
+                for i, col in enumerate(buf_cols):
+                    if col == 'Time' or col == 'UpdateTime':
+                        new_data[col] = (base_ns + (new_arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+                    else:
+                        new_data[col] = new_arr[:, i]
+                new_df = pd.DataFrame(new_data, columns=columns)
+
+                # Append to cached DataFrame
+                df = pd.concat([df_cache[code], new_df], ignore_index=True)
+                df_cache[code] = df
+                df_rows[code] = buf_len
+                return df
+
+            # Full rebuild: no cache exists
+            t0 = time.perf_counter()
+            arr = buf.to_numpy()                           # (rows, n_cols) f64
+            buf_cols = columns[2:]  # skip TradingDay/Code
+            data = {'TradingDay': self._trading_day, 'Code': code}
             for i, col in enumerate(buf_cols):
                 if col == 'Time' or col == 'UpdateTime':
-                    new_data[col] = (base_ns + (new_arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+                    data[col] = (base_ns + (arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
                 else:
-                    new_data[col] = new_arr[:, i]
-            new_df = pd.DataFrame(new_data, columns=columns)
+                    data[col] = arr[:, i]
+            df = pd.DataFrame(data, columns=columns)
+            build_ms = (time.perf_counter() - t0) * 1000
 
-            # Append to cached DataFrame
-            df = pd.concat([df_cache[code], new_df], ignore_index=True)
+            if build_ms > 5.0:  # log slow builds (>5ms)
+                logger.debug("[df-build-%s] %s: %d rows, %.1fms", kind, code, len(df), build_ms)
+
             df_cache[code] = df
             df_rows[code] = buf_len
             return df
-
-        # Full rebuild: no cache exists
-        t0 = time.perf_counter()
-        arr = buf.to_numpy()                           # (rows, n_cols) f64
-        buf_cols = columns[2:]  # skip TradingDay/Code
-        data = {'TradingDay': self._trading_day, 'Code': code}
-        for i, col in enumerate(buf_cols):
-            if col == 'Time' or col == 'UpdateTime':
-                data[col] = (base_ns + (arr[:, i] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
-            else:
-                data[col] = arr[:, i]
-        df = pd.DataFrame(data, columns=columns)
-        build_ms = (time.perf_counter() - t0) * 1000
-
-        if build_ms > 5.0:  # log slow builds (>5ms)
-            logger.debug("[df-build-%s] %s: %d rows, %.1fms", kind, code, len(df), build_ms)
-
-        df_cache[code] = df
-        df_rows[code] = buf_len
-        return df
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
         """Get tick data as DataFrame. Uses incremental cache for per-stock queries."""
@@ -416,20 +425,22 @@ class MemoryStore:
         this just syncs cache_len from buffer.len() for dirty tracking."""
         buf_map = getattr(self, f"_{kind}_buf")
         cache_len = getattr(self, f"_{kind}_cache_len")
+        lock = self._buf_locks[kind]
 
         t0 = time.perf_counter()
         updated = 0
-        for code in codes:
-            buf = buf_map.get(code)
-            if buf is None:
-                continue
-            cur = buf.len()
-            cl = cache_len.get(code, 0)
-            if cl == cur:
-                continue
-            # Sync cache_len from buffer
-            cache_len[code] = cur
-            updated += 1
+        with lock:
+            for code in codes:
+                buf = buf_map.get(code)
+                if buf is None:
+                    continue
+                cur = buf.len()
+                cl = cache_len.get(code, 0)
+                if cl == cur:
+                    continue
+                # Sync cache_len from buffer
+                cache_len[code] = cur
+                updated += 1
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if updated > 0:
             logger.info(
