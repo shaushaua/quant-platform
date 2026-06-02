@@ -1193,20 +1193,25 @@ class CombinedEngine:
         # Workers read data via mmap shared memory, not COW
         # NOTE: _factor_fn is set per-cycle in _compute_and_output, not here,
         # because the factor module may contain Rust extensions that cause SIGBUS after fork.
-        try:
-            worker_cpus = [c for c in range(os.cpu_count() or 12) if c != self._callback_cpu]
-            ctx = multiprocessing.get_context('fork')
-            pool_t0 = time.perf_counter()
-            self._pool = ctx.Pool(
-                processes=self._pool_workers,
-                initializer=_pin_worker_cpu,
-                initargs=(worker_cpus,),
-            )
-            fork_ms = (time.perf_counter() - pool_t0) * 1000
-            logger.info("[combined] persistent pool created: %d workers, fork=%.0fms",
-                        self._pool_workers, fork_ms)
-        except Exception as exc:
-            logger.warning("[combined] persistent pool creation failed, will use per-cycle fork: %s", exc)
+        use_persistent_pool = os.environ.get("USE_PERSISTENT_POOL", "true").lower() in ("1", "true", "yes")
+        if use_persistent_pool:
+            try:
+                worker_cpus = [c for c in range(os.cpu_count() or 12) if c != self._callback_cpu]
+                ctx = multiprocessing.get_context('fork')
+                pool_t0 = time.perf_counter()
+                self._pool = ctx.Pool(
+                    processes=self._pool_workers,
+                    initializer=_pin_worker_cpu,
+                    initargs=(worker_cpus,),
+                )
+                fork_ms = (time.perf_counter() - pool_t0) * 1000
+                logger.info("[combined] persistent pool created: %d workers, fork=%.0fms",
+                            self._pool_workers, fork_ms)
+            except Exception as exc:
+                logger.warning("[combined] persistent pool creation failed, will use per-cycle fork: %s", exc)
+                self._pool = None
+        else:
+            logger.info("[combined] persistent pool disabled (USE_PERSISTENT_POOL=false), using per-cycle fork")
             self._pool = None
 
         self._connect()
