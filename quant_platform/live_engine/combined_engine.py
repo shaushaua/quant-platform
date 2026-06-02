@@ -1197,14 +1197,16 @@ class CombinedEngine:
             worker_cpus = [c for c in range(os.cpu_count() or 12) if c != self._callback_cpu]
             ctx = multiprocessing.get_context('fork')
             pool_t0 = time.perf_counter()
-            self._pool = ctx.Pool(
-                processes=self._pool_workers,
-                initializer=_pin_worker_cpu,
-                initargs=(worker_cpus,),
-            )
+            # TODO: persistent pool causes SIGBUS on c8a, use per-cycle fork for now
+            self._pool = None
+            if False:  # disabled: persistent pool
+                self._pool = ctx.Pool(
+                    processes=self._pool_workers,
+                    initializer=_pin_worker_cpu,
+                    initargs=(worker_cpus,),
+                )
             fork_ms = (time.perf_counter() - pool_t0) * 1000
-            logger.info("[combined] persistent pool created: %d workers, fork=%.0fms",
-                        self._pool_workers, fork_ms)
+            logger.info("[combined] persistent pool disabled, will use per-cycle fork")
         except Exception as exc:
             logger.warning("[combined] persistent pool creation failed, will use per-cycle fork: %s", exc)
             self._pool = None
