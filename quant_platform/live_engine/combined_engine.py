@@ -1191,6 +1191,11 @@ class CombinedEngine:
         # Create persistent worker pool (fork once, reuse across compute cycles)
         # Parent memory is small at this point → fork is fast
         # Workers read data via mmap shared memory, not COW
+        # IMPORTANT: set globals BEFORE fork so children inherit via COW
+        global _factor_fn, _market_df, _daily_basic_df
+        _factor_fn = self.factor_calculation
+        _market_df = self._market_df
+        _daily_basic_df = self._daily_basic_df
         try:
             worker_cpus = [c for c in range(os.cpu_count() or 12) if c != self._callback_cpu]
             ctx = multiprocessing.get_context('fork')
