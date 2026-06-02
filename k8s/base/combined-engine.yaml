@@ -108,6 +108,8 @@ spec:
               mountPath: /data/quant/mdl_logs
             - name: raw-archive
               mountPath: /data/collector_output
+            - name: shm-buffers
+              mountPath: /data/quant/shm
           resources:
             requests:
               cpu: "1"
@@ -132,4 +134,8 @@ spec:
         - name: raw-archive
           hostPath:
             path: /data/quant/collector_output
+            type: DirectoryOrCreate
+        - name: shm-buffers
+          hostPath:
+            path: /data/quant/shm
             type: DirectoryOrCreate

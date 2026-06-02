@@ -88,7 +88,7 @@ class MemoryStore:
         self._deal_buf: Dict[str, mdl_parser.ShmStockBuffer] = {}
         self._buf_config = {"tick": (79, 2), "order": (9, 2), "deal": (10, 2)}
         # mmap directory for shared buffers
-        self._shm_dir = os.environ.get("SHM_DIR", "/dev/shm")
+        self._shm_dir = os.environ.get("SHM_DIR", "/data/quant/shm")
 
         self._tick_cache_len: Dict[str, int] = {}
         self._order_cache_len: Dict[str, int] = {}
