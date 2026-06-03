@@ -1,4 +1,4 @@
-# Prod overlay: 48-core ~90GB node
+# Prod overlay: 48-core 96GB node
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -21,10 +21,12 @@ patches:
                 env:
                   - name: USE_PERSISTENT_POOL
                     value: "true"
+                  - name: FACTOR_WORKERS
+                    value: "44"
                 resources:
                   requests:
-                    cpu: "4"
+                    cpu: "2"
                     memory: 4Gi
                   limits:
-                    cpu: "41"
-                    memory: 80Gi
+                    cpu: "46"
+                    memory: 88Gi

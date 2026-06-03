@@ -742,10 +742,21 @@ class CombinedEngine:
         now = datetime.now()
         if (now.hour, now.minute) < (upload_hour, upload_minute):
             return
-        self._snapshot_to_archive()
+        self._release_pool()
+        self._snapshot_for_day(self._trading_day)
         self._flush_disk_queue()
         if self._upload_raw_day_to_oss(self._trading_day):
             self._uploaded_today = True
+
+    def _release_pool(self) -> None:
+        """Terminate persistent pool to free ~50GB memory before DuckDB merge."""
+        if self._pool is not None:
+            logger.info("[combined] releasing persistent pool for upload...")
+            self._pool.close()
+            self._pool.join()
+            self._pool = None
+            gc.collect()
+            logger.info("[combined] pool released")
 
     def _upload_raw_day_to_oss(self, trading_day: date) -> bool:
         date_str = trading_day.strftime("%Y%m%d")
@@ -770,45 +781,189 @@ class CombinedEngine:
             logger.error("[raw-archive] duckdb unavailable, cannot merge parquet: %s", exc)
             return False
 
+        # Write Code mapping table (ID_QI -> SECURITY_ID) for DuckDB JOIN
+        map_tmp_path = disk_dir / "tmp_code_map.parquet"
+        try:
+            map_df = self._daily_basic_df[['ID_QI', 'SECURITY_ID']].drop_duplicates()
+            map_df.to_parquet(map_tmp_path, index=False)
+        except Exception as exc:
+            logger.error("[raw-archive] code map write failed: %s", exc)
+            return False
+
         uploaded_any = False
         had_error = False
-        for kind in ("order", "deal", "tick"):
-            chunk_dir = disk_dir / kind
-            if not chunk_dir.exists():
-                logger.info("[raw-archive] %s has no chunks, skip", kind)
-                continue
+
+        # --- Order (optimized: Code=Int32, Price×100=Int32, drop TradingDay/Channel) ---
+        chunk_dir = disk_dir / "order"
+        if chunk_dir.exists():
             chunks = sorted(chunk_dir.glob("*.parquet"))
-            if not chunks:
-                continue
+            if chunks:
+                tmp_file = disk_dir / "tmp_order.parquet"
+                try:
+                    tmp_file.unlink(missing_ok=True)
+                    con = duckdb.connect(":memory:")
+                    con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '8GB')}'")
+                    # epoch_us: exact microseconds since epoch (no float precision loss)
+                    con.execute("CREATE MACRO epoch_us(ts) AS (EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)")
+                    con.execute(f"""
+                        COPY (
+                            SELECT
+                                m.SECURITY_ID::INTEGER AS Code,
+                                epoch_us(o.Time) AS Time,
+                                (epoch_us(o.UpdateTime) - epoch_us(o.Time)) AS UpdateTime,
+                                o.OrderID::INTEGER AS OrderID,
+                                o.Side::TINYINT AS Side,
+                                ROUND(o.Price * 100)::INTEGER AS Price,
+                                o.Volume::BIGINT AS Volume,
+                                o.OrderType::TINYINT AS OrderType,
+                                o.SeqNum::INTEGER AS SeqNum
+                            FROM read_parquet('{chunk_dir}/*.parquet') o
+                            JOIN read_parquet('{map_tmp_path}') m
+                              ON regexp_extract(o.Code, '^\\d+') = m.ID_QI::VARCHAR
+                            ORDER BY m.SECURITY_ID, o.SeqNum
+                        ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
+                    """)
+                    con.close()
+                    oss_key = f"{prefix}/{date_str}_order.parquet"
+                    bucket.put_object_from_file(oss_key, str(tmp_file))
+                    size_mb = tmp_file.stat().st_size / 1024 / 1024
+                    logger.info("[raw-archive] uploaded order -> oss://%s/%s (%.1f MB, %d chunks)",
+                                os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"), oss_key, size_mb, len(chunks))
+                    uploaded_any = True
+                    tmp_file.unlink(missing_ok=True)
+                    for chunk in chunks:
+                        chunk.unlink()
+                except Exception as exc:
+                    had_error = True
+                    logger.error("[raw-archive] upload order failed: %s", exc, exc_info=True)
+                    tmp_file.unlink(missing_ok=True)
 
-            tmp_file = disk_dir / f"tmp_{kind}.parquet"
-            try:
-                tmp_file.unlink(missing_ok=True)
-                con = duckdb.connect(":memory:")
-                duckdb_mem = os.environ.get("ARCHIVE_DUCKDB_MEMORY", "2GB")
-                con.execute(f"SET memory_limit='{duckdb_mem}'")
-                con.execute(f"""
-                    COPY (
-                        SELECT * FROM read_parquet('{chunk_dir}/*.parquet')
-                        ORDER BY Code, SeqNum
-                    ) TO '{tmp_file}' (FORMAT PARQUET)
-                """)
-                con.close()
+        # --- Deal (optimized: Code=Int32, Price×100=Int32, drop TradingDay/Money/Channel) ---
+        chunk_dir = disk_dir / "deal"
+        if chunk_dir.exists():
+            chunks = sorted(chunk_dir.glob("*.parquet"))
+            if chunks:
+                tmp_file = disk_dir / "tmp_deal.parquet"
+                try:
+                    tmp_file.unlink(missing_ok=True)
+                    con = duckdb.connect(":memory:")
+                    con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '8GB')}'")
+                    con.execute("CREATE MACRO epoch_us(ts) AS (EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)")
+                    con.execute(f"""
+                        COPY (
+                            SELECT
+                                m.SECURITY_ID::INTEGER AS Code,
+                                epoch_us(d.Time) AS Time,
+                                (epoch_us(d.UpdateTime) - epoch_us(d.Time)) AS UpdateTime,
+                                d.SaleOrderID::INTEGER AS SaleOrderID,
+                                d.BuyOrderID::INTEGER AS BuyOrderID,
+                                d.Side::TINYINT AS Side,
+                                ROUND(d.Price * 100)::INTEGER AS Price,
+                                d.Volume::BIGINT AS Volume,
+                                d.SeqNum::INTEGER AS SeqNum
+                            FROM read_parquet('{chunk_dir}/*.parquet') d
+                            JOIN read_parquet('{map_tmp_path}') m
+                              ON regexp_extract(d.Code, '^\\d+') = m.ID_QI::VARCHAR
+                            ORDER BY m.SECURITY_ID, d.SeqNum
+                        ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
+                    """)
+                    con.close()
+                    oss_key = f"{prefix}/{date_str}_deal.parquet"
+                    bucket.put_object_from_file(oss_key, str(tmp_file))
+                    size_mb = tmp_file.stat().st_size / 1024 / 1024
+                    logger.info("[raw-archive] uploaded deal -> oss://%s/%s (%.1f MB, %d chunks)",
+                                os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"), oss_key, size_mb, len(chunks))
+                    uploaded_any = True
+                    tmp_file.unlink(missing_ok=True)
+                    for chunk in chunks:
+                        chunk.unlink()
+                except Exception as exc:
+                    had_error = True
+                    logger.error("[raw-archive] upload deal failed: %s", exc, exc_info=True)
+                    tmp_file.unlink(missing_ok=True)
 
-                oss_key = f"{prefix}/{date_str}_{kind}.parquet"
-                bucket.put_object_from_file(oss_key, str(tmp_file))
-                size_mb = tmp_file.stat().st_size / 1024 / 1024
-                logger.info("[raw-archive] uploaded %s -> oss://%s/%s (%.1f MB, %d chunks)",
-                            kind, os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"), oss_key, size_mb, len(chunks))
-                uploaded_any = True
-                tmp_file.unlink(missing_ok=True)
-                for chunk in chunks:
-                    chunk.unlink()
-            except Exception as exc:
-                had_error = True
-                logger.error("[raw-archive] upload %s failed: %s", kind, exc, exc_info=True)
-                tmp_file.unlink(missing_ok=True)
+        # --- Tick (optimized: Code=Int32, all prices×100=Int32, drop TradingDay/TotalMoney/Channel) ---
+        # Column order matches Go opt_parquet_writer.go schema:
+        #   Code, Time, UpdateTime,
+        #   CurrentPrice, TotalVolume, PreClosePrice, OpenPrice, HighestPrice, LowestPrice,
+        #   HighLimitPrice, LowLimitPrice, IOPV, TradeNum,
+        #   TotalBidVolume, TotalAskVolume, AvgBidPrice, AvgAskPrice,
+        #   AskPrice1-10, AskVolume1-10, AskNum1-10,
+        #   BidPrice1-10, BidVolume1-10, BidNum1-10,
+        #   SeqNum
+        chunk_dir = disk_dir / "tick"
+        if chunk_dir.exists():
+            chunks = sorted(chunk_dir.glob("*.parquet"))
+            if chunks:
+                tmp_file = disk_dir / "tmp_tick.parquet"
+                try:
+                    tmp_file.unlink(missing_ok=True)
+                    # AskNum/BidNum are nullable (SZ may not have them) → COALESCE to 0
+                    tick_num_int = [f'AskNum{i}' for i in range(1, 11)] + [f'BidNum{i}' for i in range(1, 11)]
 
+                    # Select expressions in exact Go schema order
+                    select_exprs = [
+                        "m.SECURITY_ID::INTEGER AS Code",
+                        "epoch_us(t.Time) AS Time",
+                        "(epoch_us(t.UpdateTime) - epoch_us(t.Time)) AS UpdateTime",
+                        # CurrentPrice
+                        f"ROUND(t.CurrentPrice * 100)::INTEGER AS CurrentPrice",
+                        # TotalVolume
+                        "t.TotalVolume::BIGINT AS TotalVolume",
+                        # PreClosePrice, OpenPrice, HighestPrice, LowestPrice, HighLimitPrice, LowLimitPrice, IOPV
+                    ] + [f"ROUND(t.{c} * 100)::INTEGER AS {c}" for c in
+                         ['PreClosePrice', 'OpenPrice', 'HighestPrice', 'LowestPrice',
+                          'HighLimitPrice', 'LowLimitPrice', 'IOPV']
+                    ] + [
+                        # TradeNum (Int32 in Go)
+                        "COALESCE(t.TradeNum, 0)::INTEGER AS TradeNum",
+                        # TotalBidVolume, TotalAskVolume
+                    ] + [f"t.{c}::BIGINT AS {c}" for c in ['TotalBidVolume', 'TotalAskVolume']
+                    ] + [f"ROUND(t.{c} * 100)::INTEGER AS {c}" for c in ['AvgBidPrice', 'AvgAskPrice']
+                    ] + [f"ROUND(t.{c} * 100)::INTEGER AS {c}" for c in
+                         [f'AskPrice{i}' for i in range(1, 11)]
+                    ] + [f"COALESCE(t.{c}, 0)::BIGINT AS {c}" for c in
+                         [f'AskVolume{i}' for i in range(1, 11)]
+                    ] + [f"COALESCE(t.{c}, 0)::INTEGER AS {c}" for c in tick_num_int[:10]
+                    ] + [f"ROUND(t.{c} * 100)::INTEGER AS {c}" for c in
+                         [f'BidPrice{i}' for i in range(1, 11)]
+                    ] + [f"COALESCE(t.{c}, 0)::BIGINT AS {c}" for c in
+                         [f'BidVolume{i}' for i in range(1, 11)]
+                    ] + [f"COALESCE(t.{c}, 0)::INTEGER AS {c}" for c in tick_num_int[10:]
+                    ] + [
+                        "t.SeqNum::INTEGER AS SeqNum",
+                    ]
+
+                    select_clause = ',\n                                '.join(select_exprs)
+                    con = duckdb.connect(":memory:")
+                    con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '8GB')}'")
+                    con.execute("CREATE MACRO epoch_us(ts) AS (EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)")
+                    con.execute(f"""
+                        COPY (
+                            SELECT
+                                {select_clause}
+                            FROM read_parquet('{chunk_dir}/*.parquet') t
+                            JOIN read_parquet('{map_tmp_path}') m
+                              ON regexp_extract(t.Code, '^\\d+') = m.ID_QI::VARCHAR
+                            ORDER BY m.SECURITY_ID, t.SeqNum
+                        ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
+                    """)
+                    con.close()
+                    oss_key = f"{prefix}/{date_str}_tick.parquet"
+                    bucket.put_object_from_file(oss_key, str(tmp_file))
+                    size_mb = tmp_file.stat().st_size / 1024 / 1024
+                    logger.info("[raw-archive] uploaded tick -> oss://%s/%s (%.1f MB, %d chunks)",
+                                os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"), oss_key, size_mb, len(chunks))
+                    uploaded_any = True
+                    tmp_file.unlink(missing_ok=True)
+                    for chunk in chunks:
+                        chunk.unlink()
+                except Exception as exc:
+                    had_error = True
+                    logger.error("[raw-archive] upload tick failed: %s", exc, exc_info=True)
+                    tmp_file.unlink(missing_ok=True)
+
+        # --- daily_basic_data (standard format, no conversion) ---
         if not self._daily_basic_df.empty:
             try:
                 buffer = io.BytesIO()
@@ -821,6 +976,17 @@ class CombinedEngine:
             except Exception as exc:
                 had_error = True
                 logger.error("[raw-archive] upload daily_basic failed: %s", exc)
+
+        # Cleanup
+        map_tmp_path.unlink(missing_ok=True)
+        # Remove empty chunk directories
+        for kind in ("order", "deal", "tick"):
+            d = disk_dir / kind
+            try:
+                if d.exists() and not list(d.iterdir()):
+                    d.rmdir()
+            except Exception:
+                pass
 
         logger.info("[raw-archive] %s upload finished", date_str)
         return uploaded_any and not had_error
@@ -852,9 +1018,6 @@ class CombinedEngine:
         while not self._stopped:
             time.sleep(self._archive_interval)
             try:
-                # Skip archive during trading hours — GIL-free for <1s data availability
-                if _is_trading_hours():
-                    continue
                 self._snapshot_to_archive()
             except Exception as exc:
                 logger.warning("[archive] snapshot failed: %s", exc)
