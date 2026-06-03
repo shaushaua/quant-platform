@@ -25,6 +25,10 @@ spec:
       nodeSelector:
         quant.lianghua.io/combined-engine: "true"
       tolerations:
+        - key: dedicated
+          operator: Equal
+          value: quant
+          effect: NoSchedule
         - key: node.kubernetes.io/disk-pressure
           operator: Exists
           effect: NoSchedule
