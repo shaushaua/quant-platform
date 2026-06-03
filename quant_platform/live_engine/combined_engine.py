@@ -297,6 +297,49 @@ def create_direct_callback(
         _cached_wall: float = 0.0
         _cached_wall_ts: float = 0.0
 
+        # MDL delivery latency tracking
+        _mdl_latencies: list = []
+        _mdl_log_ts: float = 0.0
+        _mdl_first_logged: bool = False
+
+        def _track_mdl_latency(self, raw_time, wall_secs: float) -> None:
+            """Track MDL push latency (wall clock - data time) per message."""
+            s = str(raw_time)
+            try:
+                s = s.zfill(9)
+                data_ms = int(s[0:2]) * 3600000 + int(s[2:4]) * 60000 + int(s[4:6]) * 1000 + int(s[6:9])
+            except (ValueError, IndexError):
+                return
+            latency_ms = int(wall_secs * 1000) - data_ms
+
+            # Log first message with precise wall clock (not cached)
+            if not self._mdl_first_logged:
+                self._mdl_first_logged = True
+                now_dt = datetime.now()
+                precise_ms = int((now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second) * 1000 + now_dt.microsecond / 1000)
+                first_latency = precise_ms - data_ms
+                data_time_str = f"{s[0:2]}:{s[2:4]}:{s[4:6]}.{s[6:9]}"
+                wall_time_str = now_dt.strftime("%H:%M:%S.%f")[:-3]
+                logger.info(
+                    "[mdl-first] data_time=%s wall_time=%s latency=%dms",
+                    data_time_str, wall_time_str, first_latency,
+                )
+
+            if 0 < latency_ms < 600000:
+                self._mdl_latencies.append(latency_ms)
+            now = time.time()
+            if now - self._mdl_log_ts >= 10.0:
+                self._mdl_log_ts = now
+                samples = self._mdl_latencies
+                self._mdl_latencies = []
+                if samples:
+                    samples.sort()
+                    n = len(samples)
+                    logger.info(
+                        "[mdl-latency] n=%d p50=%dms p95=%dms max=%dms",
+                        n, samples[n // 2], samples[int(n * 0.95)], samples[-1],
+                    )
+
         def _observe(self, hd) -> None:
             gap = tracker.observe(int(hd.ServiceID), int(hd.MessageID), int(hd.SequenceID))
             if gap is not None:
@@ -374,6 +417,7 @@ def create_direct_callback(
                             int(tup[29]), int(tup[59]),
                             str(tup[3]),
                         )
+                        self._track_mdl_latency(tup[3], wall_ts)
                 elif mid == MID_SH_NGTS:
                     result = mdl_parser.parse_sh_ngts(buf, trading_day)
                     if result:
@@ -386,12 +430,14 @@ def create_direct_callback(
                                 int(order_tup[5]), float(order_tup[7]),
                                 int(order_tup[8]), str(order_tup[3]),
                             )
+                            self._track_mdl_latency(order_tup[3], wall_ts)
                         if deal_tup is not None:
                             memory_store.append_deal(code, deal_tup)
                             state.update_deal_scalar(
                                 float(deal_tup[7]), float(deal_tup[8]),
                                 str(deal_tup[3]),
                             )
+                            self._track_mdl_latency(deal_tup[3], wall_ts)
             except Exception as exc:
                 logger.warning("[callback] SHL2 failed: %s", exc)
 
@@ -419,6 +465,7 @@ def create_direct_callback(
                             int(tup[29]), int(tup[59]),
                             str(tup[3]),
                         )
+                        self._track_mdl_latency(tup[3], wall_ts)
                 elif mid == MID_SZ_ORDER:
                     result = mdl_parser.parse_sz_order(buf, trading_day, seq_id)
                     if result:
@@ -430,6 +477,7 @@ def create_direct_callback(
                             int(tup[5]), float(tup[7]),
                             int(tup[8]), str(tup[3]),
                         )
+                        self._track_mdl_latency(tup[3], wall_ts)
                 elif mid == MID_SZ_DEAL:
                     result = mdl_parser.parse_sz_deal(buf, trading_day, seq_id)
                     if result:
@@ -441,6 +489,7 @@ def create_direct_callback(
                             float(tup[7]), float(tup[8]),
                             str(tup[3]),
                         )
+                        self._track_mdl_latency(tup[3], wall_ts)
             except Exception as exc:
                 logger.warning("[callback] SZL2 failed: %s", exc)
 
