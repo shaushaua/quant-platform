@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.6
-
 # Stage 1: Build Rust mdl_parser extension (cached by Docker unless mdl_parser/ changes)
 FROM 172.24.99.176:5000/quant-platform/backtest-base:latest AS rust-builder
 
