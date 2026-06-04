@@ -29,11 +29,13 @@ RUN apt-get update \
 
 # Install pymdl SDK
 COPY vendor/pymdl/pymdl-2.13.232-py3.tar.gz /tmp/
+COPY scripts/verify_mdl_layout.py /tmp/verify_mdl_layout.py
+RUN python /tmp/verify_mdl_layout.py --sdk /tmp/pymdl-2.13.232-py3.tar.gz
 RUN pip install --no-cache-dir "setuptools<70" \
     && pip install --no-cache-dir --no-build-isolation --force-reinstall /tmp/pymdl-2.13.232-py3.tar.gz \
     && pip install --no-cache-dir "setuptools>=70" \
     && python -c "import pymdl; print('pymdl import ok')" \
-    && rm -f /tmp/pymdl-2.13.232-py3.tar.gz
+    && rm -f /tmp/pymdl-2.13.232-py3.tar.gz /tmp/verify_mdl_layout.py
 
 # Install MDL Linux client (feeder_client sidecar)
 COPY vendor/mdl-client/mdl_forward_2.13.232_linux.tar.gz /tmp/

@@ -44,12 +44,12 @@ def replay(path):
 
     # Message IDs (must match combined_engine.py constants)
     # SH
-    MID_SH_TICK = 24001   # MDLMID_SHL2MarketData
-    MID_SH_NGTS = 24002   # MDLMID_NGTSTick
+    MID_SH_TICK = 4       # MDLMID_SHL2MarketData
+    MID_SH_NGTS = 24      # MDLMID_NGTSTick
     # SZ
-    MID_SZ_TICK = 300111  # MDLMID_Snapshot300111_v2
-    MID_SZ_ORDER = 300192 # MDLMID_Order300192_v2
-    MID_SZ_DEAL = 300193 # MDLMID_Transaction300191_v2
+    MID_SZ_TICK = 28      # MDLMID_Snapshot300111_v2
+    MID_SZ_ORDER = 33     # MDLMID_Order300192_v2
+    MID_SZ_DEAL = 36      # MDLMID_Transaction300191_v2
 
     # Read all frames
     print(f"Reading {path}...")

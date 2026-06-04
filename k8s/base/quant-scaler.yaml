@@ -1,0 +1,129 @@
+# quant-scaler: 自动化扩缩容，交易时段自动拉起节点+Pod，收盘后自动释放
+# 需要配置: ALIYUN_ACCESS_KEY_ID, ALIYUN_ACCESS_KEY_SECRET, COMPUTE_INSTANCE_ID
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: quant-scaler
+  namespace: quant
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: quant-scaler
+  namespace: quant
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quant-scaler
+  namespace: quant
+subjects:
+  - kind: ServiceAccount
+    name: quant-scaler
+roleRef:
+  kind: Role
+  name: quant-scaler
+  apiGroup: rbac.authorization.k8s.io
+---
+# 每个交易日 08:50 自动拉起
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: quant-scale-up
+  namespace: quant
+spec:
+  schedule: "50 8 * * 1-5"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: quant-scaler
+          restartPolicy: OnFailure
+          containers:
+            - name: scale-up
+              image: aliyunfc/fc-cli:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "[$(date)] Scaling up combined-engine..."
+
+                  # 1. Start compute node (停机不收费模式)
+                  if [ -n "$COMPUTE_INSTANCE_ID" ]; then
+                    aliyun ecs StartInstance --InstanceId $COMPUTE_INSTANCE_ID --InitLocalDisk false || true
+                    echo "[$(date)] ECS instance starting, waiting for ready..."
+                    # Wait for instance to be Running (max 5 min)
+                    for i in $(seq 1 30); do
+                      STATUS=$(aliyun ecs DescribeInstances --InstanceIds "[\"$COMPUTE_INSTANCE_ID\"]" --output cols=Status rows=Instances.Instance[] | tail -1)
+                      echo "  attempt $i: $STATUS"
+                      if [ "$STATUS" = "Running" ]; then break; fi
+                      sleep 10
+                    done
+                  fi
+
+                  # 2. Scale deployment to 1
+                  kubectl patch deployment combined-engine -p '{"spec":{"replicas":1}}'
+                  echo "[$(date)] Done. Deployment scaled to 1."
+              envFrom:
+                - secretRef:
+                    name: quant-scaler-secrets
+              env:
+                - name: COMPUTE_INSTANCE_ID
+                  value: ""  # Override in overlay
+---
+# 每个交易日 15:30 自动缩容
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: quant-scale-down
+  namespace: quant
+spec:
+  schedule: "30 15 * * 1-5"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: quant-scaler
+          restartPolicy: OnFailure
+          containers:
+            - name: scale-down
+              image: aliyunfc/fc-cli:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "[$(date)] Scaling down combined-engine..."
+
+                  # 1. Scale deployment to 0
+                  kubectl patch deployment combined-engine -p '{"spec":{"replicas":0}}'
+                  echo "[$(date)] Deployment scaled to 0."
+
+                  # 2. Stop compute node (停机不收费)
+                  if [ -n "$COMPUTE_INSTANCE_ID" ]; then
+                    sleep 30  # Wait for pod to terminate
+                    aliyun ecs StopInstance --InstanceId $COMPUTE_INSTANCE_ID --StoppedMode StopCharging
+                    echo "[$(date)] ECS instance stopping (停机不收费)."
+                  fi
+
+                  echo "[$(date)] Done."
+              envFrom:
+                - secretRef:
+                    name: quant-scaler-secrets
+              env:
+                - name: COMPUTE_INSTANCE_ID
+                  value: ""  # Override in overlay

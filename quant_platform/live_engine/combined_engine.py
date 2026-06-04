@@ -739,7 +739,12 @@ class CombinedEngine:
             out_dir.mkdir(parents=True, exist_ok=True)
             key = f"{date_str}/{kind}"
             with self._disk_queue_lock:
-                chunk_idx = self._disk_chunk_idx.get(key, 0)
+                chunk_idx = self._disk_chunk_idx.get(key)
+                if chunk_idx is None:
+                    existing = sorted(out_dir.glob("*.parquet"))
+                    chunk_idx = (
+                        max((int(p.stem) for p in existing if p.stem.isdigit()), default=-1) + 1
+                    )
                 self._disk_chunk_idx[key] = chunk_idx + 1
                 chunk_file = out_dir / f"{chunk_idx:06d}.parquet"
             df.to_parquet(chunk_file, index=False)
@@ -1072,11 +1077,15 @@ class CombinedEngine:
         while not self._stopped:
             time.sleep(3)
             try:
-                codes = list(store._tick_lists.keys())
-                if codes:
-                    store.warm_tick_batch(codes)
-                    store.warm_deal_batch(codes)
-                    store.warm_order_batch(codes)
+                tick_codes = list(store._tick_buf.keys())
+                deal_codes = list(store._deal_buf.keys())
+                order_codes = list(store._order_buf.keys())
+                if tick_codes:
+                    store.warm_tick_batch(tick_codes)
+                if deal_codes:
+                    store.warm_deal_batch(deal_codes)
+                if order_codes:
+                    store.warm_order_batch(order_codes)
             except Exception as exc:
                 logger.warning("[warm] continuous warm failed: %s", exc)
 

@@ -207,7 +207,7 @@ fn parse_sh_tick_raw(buf: &[u8], trading_day: &str, seq_id: i64) -> Option<Parse
     let avg_bid   = mdl_float(buf, 72, 3);
     let avg_ask   = mdl_float(buf, 88, 3);
     let iopv      = mdl_float(buf, 244, 3);
-    let tot_ask   = read_i64(buf, 80) as f64;
+    let tot_ask   = mdl_double(buf, 80, 3);
 
     let bid_len  = read_u32(buf, 228) as usize;
     let bid_base = 228 + read_u32(buf, 232) as usize;
@@ -277,7 +277,7 @@ fn parse_sz_tick_raw(buf: &[u8], trading_day: &str, seq_id: i64) -> Option<Parse
     let bid_base = 208 + read_u32(buf, 212) as usize;
     let ask_len  = read_u32(buf, 216) as usize;
     let ask_base = 216 + read_u32(buf, 220) as usize;
-    let item_sz: usize = 32;
+    let item_sz: usize = 28;
 
     let mut ap = [0.0f64; 10]; let mut av = [0.0f64; 10]; let mut an = [0.0f64; 10];
     let mut bp = [0.0f64; 10]; let mut bv = [0.0f64; 10]; let mut bn = [0.0f64; 10];
@@ -416,6 +416,69 @@ fn parse_sz_deal_raw(buf: &[u8], trading_day: &str, _seq_id: i64) -> Option<Pars
         price: last_px, qty: last_qty, money: last_px * last_qty,
         channel, appl_seq,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_u16(buf: &mut [u8], off: usize, v: u16) {
+        buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_i64(buf: &mut [u8], off: usize, v: i64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_mdl_string(buf: &mut [u8], meta_off: usize, data_off: usize, s: &str) {
+        put_u16(buf, meta_off, s.len() as u16);
+        put_u32(buf, meta_off + 2, (data_off - meta_off) as u32);
+        buf[data_off..data_off + s.len()].copy_from_slice(s.as_bytes());
+    }
+
+    fn put_sz_level(buf: &mut [u8], off: usize, volume: i64, price_1e6: i64, num_orders: u32) {
+        put_i64(buf, off, volume);
+        put_i64(buf, off + 8, price_1e6);
+        put_u32(buf, off + 16, num_orders);
+    }
+
+    #[test]
+    fn parses_sz_snapshot_v2_levels_with_28_byte_items() {
+        let mut buf = vec![0u8; 640];
+        put_u32(&mut buf, 0, 93000000);
+        put_u32(&mut buf, 4, 7);
+        put_mdl_string(&mut buf, 14, 300, "300175");
+        put_i64(&mut buf, 64, 5_790_000);
+        put_i64(&mut buf, 72, 5_780_000);
+        put_i64(&mut buf, 80, 5_820_000);
+        put_i64(&mut buf, 88, 5_760_000);
+
+        let bid_base = 500usize;
+        put_u32(&mut buf, 208, 2);
+        put_u32(&mut buf, 212, (bid_base - 208) as u32);
+        put_sz_level(&mut buf, bid_base, 100, 5_790_000, 3);
+        put_sz_level(&mut buf, bid_base + 28, 200, 5_780_000, 4);
+
+        let ask_base = 400usize;
+        put_u32(&mut buf, 216, 2);
+        put_u32(&mut buf, 220, (ask_base - 216) as u32);
+        put_sz_level(&mut buf, ask_base, 300, 5_800_000, 5);
+        put_sz_level(&mut buf, ask_base + 28, 400, 5_810_000, 6);
+
+        let parsed = parse_sz_tick_raw(&buf, "20260604", 42).expect("valid stock tick");
+        assert_eq!(parsed.code, "300175.XSHE");
+        assert_eq!(parsed.ask_price[0], 5.8);
+        assert_eq!(parsed.ask_price[1], 5.81);
+        assert_eq!(parsed.ask_vol[1], 400.0);
+        assert_eq!(parsed.ask_num[1], 6.0);
+        assert_eq!(parsed.bid_price[1], 5.78);
+        assert_eq!(parsed.bid_vol[1], 200.0);
+        assert_eq!(parsed.bid_num[1], 4.0);
+    }
 }
 
 // ================================================================== //
@@ -821,6 +884,11 @@ impl ShmStockBuffer {
         Ok(())
     }
 
+    /// Append one Python tuple row into the mmap buffer.
+    fn append_tuple(&mut self, tuple: &Bound<'_, PyTuple>, start_col: usize) -> PyResult<()> {
+        self.append_tuple_inner(tuple, start_col)
+    }
+
     /// Return filled data as numpy f64 array (copy from mmap).
     fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         if self.row_count == 0 {
@@ -883,6 +951,28 @@ impl ShmStockBuffer {
 }
 
 impl ShmStockBuffer {
+    fn append_tuple_inner(&mut self, tuple: &Bound<'_, PyTuple>, start_col: usize) -> PyResult<()> {
+        while self.row_count + 1 > self.capacity {
+            self.grow()?;
+        }
+        let mmap = self.mmap.as_mut().unwrap();
+        let row_base = SHM_HEADER + self.row_count * self.n_cols * 8;
+        for j in 0..self.n_cols {
+            let val = tuple.get_item(j + start_col)?;
+            let fval = if j < self.n_string_cols {
+                let s = val.extract::<&str>()?;
+                time_str_to_seconds(s)
+            } else {
+                val.extract::<f64>()?
+            };
+            write_f64_at(mmap, row_base + j * 8, fval);
+        }
+        self.row_count += 1;
+        let mmap = self.mmap.as_mut().unwrap();
+        write_u64_at(mmap, 24, self.row_count as u64);
+        Ok(())
+    }
+
     /// Double capacity: drop old mapping, extend file, remap.
     fn grow(&mut self) -> PyResult<()> {
         let new_capacity = self.capacity * 2;

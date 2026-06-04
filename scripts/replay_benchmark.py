@@ -63,11 +63,11 @@ def read_frames(path):
 
 # ---- Replay into MemoryStore ----
 
-MID_SH_TICK = 24001
-MID_SH_NGTS = 24002
-MID_SZ_TICK = 300111
-MID_SZ_ORDER = 300192
-MID_SZ_DEAL = 300193
+MID_SH_TICK = 4
+MID_SH_NGTS = 24
+MID_SZ_TICK = 28
+MID_SZ_ORDER = 33
+MID_SZ_DEAL = 36
 
 
 def replay_into_store(frames, store, trading_day):
@@ -130,16 +130,18 @@ def replay_into_store(frames, store, trading_day):
 
 def bench_warm(store):
     """Warm all Rust buffers and measure timing."""
-    codes = list(store._tick_lists.keys())
-    if not codes:
+    tick_codes = list(store._tick_buf.keys())
+    deal_codes = list(store._deal_buf.keys())
+    order_codes = list(store._order_buf.keys())
+    if not tick_codes and not deal_codes and not order_codes:
         return 0, 0
 
     t0 = time.perf_counter()
-    tick_upd = store.warm_tick_batch(codes)
-    deal_upd = store.warm_deal_batch(list(store._deal_lists.keys()))
-    order_upd = store.warm_order_batch(list(store._order_lists.keys()))
+    tick_upd = store.warm_tick_batch(tick_codes)
+    deal_upd = store.warm_deal_batch(deal_codes)
+    order_upd = store.warm_order_batch(order_codes)
     warm_ms = (time.perf_counter() - t0) * 1000
-    return len(codes), warm_ms
+    return max(len(tick_codes), len(deal_codes), len(order_codes)), warm_ms
 
 
 # ---- Compute benchmark ----

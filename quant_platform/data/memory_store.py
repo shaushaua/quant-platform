@@ -125,11 +125,18 @@ class MemoryStore:
         self._rw_lock = threading.RLock()
         # Per-kind lock for mmap buffer access (SDK callback writes, warm thread reads)
         self._buf_locks = {kind: threading.Lock() for kind in ("tick", "order", "deal")}
+        self._append_error_counts = {kind: 0 for kind in ("tick", "order", "deal")}
 
         # 数据活性时间戳 — SDK 回调每次 append 时更新，主循环用于检测断线
         self._last_append_ts: float = 0.0
 
         logger.info("MemoryStore 初始化完成 (per-stock list 存储)")
+
+    def _log_append_error(self, kind: str, code: str, exc: Exception) -> None:
+        self._append_error_counts[kind] = self._append_error_counts.get(kind, 0) + 1
+        count = self._append_error_counts[kind]
+        if count <= 5 or count in (10, 100, 1000):
+            logger.warning("[store-append] %s failed code=%s count=%d: %s", kind, code, count, exc, exc_info=True)
 
     # ==================== 交易日管理 ====================
 
@@ -231,9 +238,9 @@ class MemoryStore:
         try:
             with self._buf_locks["tick"]:
                 buf = self._get_or_create_buf("tick", code)
-                buf.append_tuples([row_tuple], 2)  # start_col=2
-        except Exception:
-            pass
+                buf.append_tuple(row_tuple, 2)  # start_col=2
+        except Exception as exc:
+            self._log_append_error("tick", code, exc)
         self._dirty_codes.add(code)
         self._dirty_tick.add(code)
         self._last_append_ts = time.time()
@@ -243,9 +250,9 @@ class MemoryStore:
         try:
             with self._buf_locks["order"]:
                 buf = self._get_or_create_buf("order", code)
-                buf.append_tuples([row_tuple], 2)
-        except Exception:
-            pass
+                buf.append_tuple(row_tuple, 2)
+        except Exception as exc:
+            self._log_append_error("order", code, exc)
         self._dirty_codes.add(code)
         self._dirty_order.add(code)
         self._last_append_ts = time.time()
@@ -255,9 +262,9 @@ class MemoryStore:
         try:
             with self._buf_locks["deal"]:
                 buf = self._get_or_create_buf("deal", code)
-                buf.append_tuples([row_tuple], 2)
-        except Exception:
-            pass
+                buf.append_tuple(row_tuple, 2)
+        except Exception as exc:
+            self._log_append_error("deal", code, exc)
         self._dirty_codes.add(code)
         self._dirty_deal.add(code)
         self._last_append_ts = time.time()
