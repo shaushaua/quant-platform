@@ -80,6 +80,8 @@ spec:
             # --- 原始行情归档：内存计算同时落盘，盘后上传 OSS ---
             - name: RAW_DATA_ARCHIVE_ENABLED
               value: "true"
+            - name: ARCHIVE_INTERVAL
+              value: "300"
             - name: RAW_DATA_UPLOAD_TIME
               value: "15:10"
             - name: COLLECTOR_DISK_OUTPUT
