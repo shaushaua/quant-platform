@@ -1085,10 +1085,34 @@ class CombinedEngine:
     # ------------------------------------------------------------------ #
 
     def _archive_loop(self) -> None:
+        _last_archive_date = ""
+        _archived_lunch = False
+        _archived_close = False
         while not self._stopped:
             time.sleep(self._archive_interval)
             try:
-                self._snapshot_to_archive()
+                today = date.today().isoformat()
+                if today != _last_archive_date:
+                    _last_archive_date = today
+                    _archived_lunch = False
+                    _archived_close = False
+
+                now = datetime.now()
+                h, m = now.hour, now.minute
+
+                # Archive at lunch break (11:35-12:00) and after close (15:05-15:30)
+                if not _archived_lunch and 11 <= h <= 11 and m >= 35:
+                    logger.info("[archive] lunch break snapshot starting...")
+                    self._snapshot_to_archive()
+                    self._flush_disk_queue()
+                    _archived_lunch = True
+                    logger.info("[archive] lunch break snapshot done")
+                elif not _archived_close and (h >= 15 and m >= 5):
+                    logger.info("[archive] post-close snapshot starting...")
+                    self._snapshot_to_archive()
+                    self._flush_disk_queue()
+                    _archived_close = True
+                    logger.info("[archive] post-close snapshot done")
             except Exception as exc:
                 logger.warning("[archive] snapshot failed: %s", exc)
 
