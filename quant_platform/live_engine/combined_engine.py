@@ -304,10 +304,33 @@ def create_direct_callback(
 
         def _track_mdl_latency(self, raw_time, wall_secs: float) -> None:
             """Track MDL push latency (wall clock - data time) per message."""
+            # Parse data time to milliseconds since midnight
+            # Format from Rust parser: "YYYYMMDD HH:MM:SS.mmm" or "HHMMSSmmm"
             s = str(raw_time)
             try:
-                s = s.zfill(9)
-                data_ms = int(s[0:2]) * 3600000 + int(s[2:4]) * 60000 + int(s[4:6]) * 1000 + int(s[6:9])
+                if ' ' in s and ':' in s:
+                    # "20260604 09:18:54.070"
+                    t = s.split(' ')[1]  # "09:18:54.070"
+                    parts = t.split(':')
+                    h = int(parts[0])
+                    m = int(parts[1])
+                    sp = parts[2].split('.')
+                    sec = int(sp[0])
+                    ms = int(sp[1].ljust(3, '0')[:3]) if len(sp) > 1 else 0
+                elif len(s) >= 17 and s[8:].isdigit():
+                    # "20260604091854070" (compact)
+                    h = int(s[8:10])
+                    m = int(s[10:12])
+                    sec = int(s[12:14])
+                    ms = int(s[14:17])
+                else:
+                    # "091854070" (HHMMSSmmm)
+                    s2 = s.zfill(9)
+                    h = int(s2[0:2])
+                    m = int(s2[2:4])
+                    sec = int(s2[4:6])
+                    ms = int(s2[6:9])
+                data_ms = h * 3600000 + m * 60000 + sec * 1000 + ms
             except (ValueError, IndexError):
                 return
             latency_ms = int(wall_secs * 1000) - data_ms
@@ -318,11 +341,9 @@ def create_direct_callback(
                 now_dt = datetime.now()
                 precise_ms = int((now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second) * 1000 + now_dt.microsecond / 1000)
                 first_latency = precise_ms - data_ms
-                data_time_str = f"{s[0:2]}:{s[2:4]}:{s[4:6]}.{s[6:9]}"
-                wall_time_str = now_dt.strftime("%H:%M:%S.%f")[:-3]
                 logger.info(
                     "[mdl-first] data_time=%s wall_time=%s latency=%dms",
-                    data_time_str, wall_time_str, first_latency,
+                    s, now_dt.strftime("%H:%M:%S.%f")[:-3], first_latency,
                 )
 
             if 0 < latency_ms < 600000:
