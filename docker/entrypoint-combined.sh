@@ -75,6 +75,37 @@ if ! (echo > /dev/tcp/127.0.0.1/9012) 2>/dev/null; then
     exit 1
 fi
 
+echo "[entrypoint] Cleaning invalid native SHM files..."
+python - <<'PY'
+import glob
+import os
+import struct
+
+magic = 0x514D444C53484D31
+removed = 0
+for path in glob.glob(os.environ.get("NATIVE_SHM_DIR", "/data/quant/shm") + "/*.mmap"):
+    try:
+        with open(path, "rb") as f:
+            header = f.read(64)
+        if len(header) < 64:
+            os.remove(path)
+            removed += 1
+            continue
+        values = struct.unpack("<QQQQQQQQ", header)
+        if values[0] != magic or values[1] != 2:
+            os.remove(path)
+            removed += 1
+    except FileNotFoundError:
+        pass
+    except Exception:
+        try:
+            os.remove(path)
+            removed += 1
+        except FileNotFoundError:
+            pass
+print(f"[entrypoint] removed invalid native SHM files: {removed}")
+PY
+
 echo "[entrypoint] Starting native-mdl-collector + native engine..."
 
 export LD_LIBRARY_PATH="/opt/native-mdl-collector/lib:${LD_LIBRARY_PATH}"
