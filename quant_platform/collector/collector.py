@@ -61,7 +61,7 @@ DELETE_SOURCE_AFTER_DAYS = int(os.environ.get("DELETE_SOURCE_AFTER_DAYS", "1"))
 DEBOUNCE_MS = int(os.environ.get("COLLECTOR_DEBOUNCE_MS", "10"))
 
 # 落盘队列最大长度，防止积压导致 OOM
-MAX_DISK_QUEUE_SIZE = int(os.environ.get("COLLECTOR_MAX_DISK_QUEUE", "50"))
+MAX_DISK_QUEUE_SIZE = 50
 
 Market = str   # "SH" | "SZ"
 DataType = str  # "order" | "deal" | "tick" | "order_deal"

@@ -42,7 +42,7 @@ def replay(path):
     """Replay captured PML data through Rust parser."""
     import mdl_parser
 
-    # Message IDs (must match combined_engine.py constants)
+    # Message IDs used by the native MDL collector path.
     # SH
     MID_SH_TICK = 4       # MDLMID_SHL2MarketData
     MID_SH_NGTS = 24      # MDLMID_NGTSTick

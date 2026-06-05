@@ -13,7 +13,7 @@ cat > "$CFG_FILE" <<CFGEOF
 {
     "feeder_client" : {
         "Publishers" : [
-            {"Type" : "TCP_SERVER", "Address" : "0.0.0.0:9012", "OutputBufferMax" : 512000},
+            {"Type" : "TCP_SERVER", "Address" : "0.0.0.0:9012", "OutputBufferMax" : ${MDL_TCP_OUTPUT_BUFFER_MAX:-2048000}},
             {
                 "Type": "WEBSOCKET_SERVER",
                 "Address": "0.0.0.0:9020",
@@ -75,6 +75,19 @@ if ! (echo > /dev/tcp/127.0.0.1/9012) 2>/dev/null; then
     exit 1
 fi
 
-# Start Python engine
-echo "[entrypoint] Starting combined engine..."
-exec python -m quant_platform.live_engine.combined_engine
+echo "[entrypoint] Starting native-mdl-collector + native engine..."
+
+export LD_LIBRARY_PATH="/opt/native-mdl-collector/lib:${LD_LIBRARY_PATH}"
+/opt/native-mdl-collector/bin/native-mdl-collector &
+collector_pid=$!
+echo "[entrypoint] native-mdl-collector started (pid=$collector_pid)"
+
+echo "[entrypoint] Starting native engine..."
+python -m quant_platform.live_engine.native_engine &
+engine_pid=$!
+
+wait -n "$collector_pid" "$engine_pid" 2>/dev/null || true
+echo "[entrypoint] One process exited, shutting down..."
+kill "$collector_pid" "$engine_pid" 2>/dev/null || true
+wait
+exit 1

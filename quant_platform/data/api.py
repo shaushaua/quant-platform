@@ -8,7 +8,7 @@
 
     data = DataAPI()
 
-    # 实时数据（从内存）
+    # 实时数据（从 native SHM）
     df_1min = data.get_all_stocks_1min()
     df_5min = data.get_all_stocks_5min()
     df_tick = data.get_tick("000001.XSHE")
@@ -24,7 +24,6 @@ from datetime import datetime
 
 import pandas as pd
 
-from .memory_store import MemoryStore
 from .shm_store import ShmStore
 from .oss_loader import OSSDataLoader
 from ..core.config import get_config
@@ -56,7 +55,7 @@ class DataAPI:
     统一数据API
     交易员直接使用，无网络调用，毫秒级访问
 
-    实时数据 -> MemoryStore (内存)
+    实时数据 -> ShmStore/native mmap
     历史数据 -> OSSLoader (本地磁盘/OSS挂载)
     """
 
@@ -77,15 +76,10 @@ class DataAPI:
         self.mode = mode
         self.config = get_config()
 
-        # 内存存储（实盘模式）
-        self._memory: Optional[MemoryStore] = None
+        # 实盘实时存储：统一走 C++ collector 写出的 native mmap。
         self._shm: Optional[ShmStore] = None
         if mode == "realtime":
-            use_shm = os.getenv("USE_SHM_STORE", "").lower() in ("1", "true", "yes")
-            if use_shm:
-                self._shm = ShmStore()
-            else:
-                self._memory = MemoryStore.get_instance()
+            self._shm = ShmStore()
 
         # OSS数据加载器
         # 回测模式下 cache_size=1：pregroup_day() 分组后会立即删除原始缓存，
@@ -106,8 +100,8 @@ class DataAPI:
         return datetime.now().strftime("%Y%m%d")
 
     def _get_realtime_store(self):
-        """返回当前生效的实时存储（ShmStore 优先，回退到 MemoryStore）。"""
-        return self._shm if self._shm is not None else self._memory
+        """返回当前生效的实时存储。"""
+        return self._shm
 
     def get_all_stocks_1min(self) -> pd.DataFrame:
         """
@@ -310,7 +304,7 @@ class DataAPI:
         if end_dt < start_dt:
             start_dt, end_dt = end_dt, start_dt
 
-        if self.mode == "realtime" and self._memory is not None:
+        if self.mode == "realtime" and self._get_realtime_store() is not None:
             today = datetime.now().date()
             if start_dt.date() == today and end_dt.date() == today:
                 df = self._get_realtime_df(data_type, codes)

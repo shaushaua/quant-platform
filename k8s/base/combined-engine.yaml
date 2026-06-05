@@ -42,7 +42,7 @@ spec:
         - name: combined-engine
           image: 172.24.99.176:5000/quant-platform/combined-engine:latest
           env:
-            # --- pymdl SDK (local feeder_client sidecar) ---
+            # --- MDL feeder_client + native C++ collector ---
             - name: MDL_USE_LOCAL_CLIENT
               value: "true"
             # MDL_TOKEN 从 secret 注入，供 feeder_client.cfg 使用
@@ -60,6 +60,12 @@ spec:
               value: "50000"
             - name: MDL_QUEUE_HARD_LIMIT
               value: "200000"
+            - name: MDL_LOCAL_SPLIT_SUBS
+              value: "true"
+            - name: MDL_TCP_OUTPUT_BUFFER_MAX
+              value: "2048000"
+            - name: MDL_TRACK_ORDER_DEAL_STATE
+              value: "false"
             - name: MDL_LOG_PATH
               value: /data/quant/mdl_logs/mdl
             # --- 因子计算 ---
@@ -69,6 +75,8 @@ spec:
               value: "60"
             - name: DATA_FLUSH_INTERVAL
               value: "0.01"
+            - name: SHM_STORE_BACKEND
+              value: "native"
             - name: UNIVERSE
               value: ""
             - name: FACTOR_OUTPUT_PATH
@@ -76,7 +84,7 @@ spec:
             - name: DAILY_BASIC_MARKET_COUNT
               value: "5"
             - name: FACTOR_WORKERS
-              value: "40"
+              value: "16"
             # --- 原始行情归档：内存计算同时落盘，盘后上传 OSS ---
             - name: RAW_DATA_ARCHIVE_ENABLED
               value: "true"
@@ -86,22 +94,37 @@ spec:
               value: "15:10"
             - name: COLLECTOR_DISK_OUTPUT
               value: /data/collector_output
-            - name: COLLECTOR_MAX_DISK_QUEUE
-              value: "200"
-            # --- PML 录制（调试用，录完关掉）---
+            # --- PML 录制（调试用，默认关闭，避免热路径复制 raw buffer）---
             - name: PML_RECORD_DIR
-              value: /data/collector_output/pml_rec
+              value: ""
             - name: PML_RECORD_SECONDS
-              value: "60"
+              value: "0"
             # --- 通用 ---
+            - name: ENGINE_MODE
+              value: "native"
             - name: TZ
               value: Asia/Shanghai
             - name: LOG_LEVEL
               value: INFO
+            - name: PYTHONWARNINGS
+              value: ignore::DeprecationWarning
             - name: PIPELINE_LOG_DIR
               value: /data/quant/pipeline_logs
             - name: PIPELINE_LOG_FALLBACK_DIR
               value: /tmp/quant_pipeline_logs
+            # --- Native C++ collector (ENGINE_MODE=native 时生效) ---
+            - name: NATIVE_SHM_DIR
+              value: /data/quant/shm
+            - name: NATIVE_ROWS_PER_STOCK
+              value: "200000"
+            - name: NATIVE_TICK_ROWS_PER_STOCK
+              value: "50000"
+            - name: NATIVE_ORDER_ROWS_PER_STOCK
+              value: "3000000"
+            - name: NATIVE_DEAL_ROWS_PER_STOCK
+              value: "3000000"
+            - name: NATIVE_MDL_IO_THREADS
+              value: "4"
           envFrom:
             - secretRef:
                 name: quant-secrets
@@ -118,11 +141,11 @@ spec:
               mountPath: /data/quant/shm
           resources:
             requests:
-              cpu: "1"
-              memory: 2Gi
-            limits:
               cpu: "4"
-              memory: 6Gi
+              memory: 16Gi
+            limits:
+              cpu: "32"
+              memory: 90Gi
               # Override in overlays: k8s/overlays/dev or k8s/overlays/prod
       volumes:
         - name: factor-output

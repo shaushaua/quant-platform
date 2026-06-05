@@ -10,7 +10,7 @@ TAG ?= $(shell date +%Y%m%d%H%M%S)
 all: build push
 
 # ============================================================
-# Build Docker image (Rust build happens inside Docker)
+# Build Docker image (native C++ collector build happens inside Docker)
 # ============================================================
 build:
 	@echo "==> Building Docker image..."

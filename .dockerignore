@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+!vendor/mdl-sdk/libs/linux/libmdl_api.so
 .Python
 *.egg-info/
 dist/

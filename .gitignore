@@ -26,6 +26,9 @@ test_*.py
 # Rust build artifacts
 mdl_parser/target/
 
+# C++ build artifacts
+native_mdl_collector/build/
+
 # IDE
 .idea/
 .vscode/
