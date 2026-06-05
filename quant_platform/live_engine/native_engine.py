@@ -51,6 +51,7 @@ from .streaming_engine import (
     _upload_to_oss,
 )
 from .pipeline_logger import get_streaming_logger
+from .schedule import ComputationSchedule, build_schedules_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,9 @@ class NativeEngine:
         self._states: Dict[str, StockState] = {}
         self.factor_calculation: Optional[Callable] = None
         self.outfun: Optional[Callable] = None
+        self.inference_fn: Optional[Callable] = None
+        self._prev_day_factors: Optional[pd.DataFrame] = None
+        self._schedules: list = []  # List[ComputationSchedule]
         self._last_codes: List[str] = []
         self._last_compute: float = 0.0
         self._data_flush_interval: float = float(os.environ.get("DATA_FLUSH_INTERVAL", "0.01"))
@@ -275,6 +279,78 @@ class NativeEngine:
         self._market_df = pd.DataFrame()
         logger.info("[native] daily_basic: %d stocks, market: %d entries",
                      len(self._daily_basic_df), len(self._market_df))
+
+    def _load_prev_day_factors(self) -> None:
+        """Load previous trading day's factor output for inference.
+        Priority: OSS daily result > local CSV fallback.
+        """
+        # Try OSS first
+        oss_df = self._load_prev_day_from_oss()
+        if oss_df is not None:
+            self._prev_day_factors = oss_df
+            return
+
+        # Fallback: local CSV
+        if self.output_path is None:
+            return
+        prev_dir = self.output_path
+        if not prev_dir.exists():
+            return
+        prev_csvs = sorted(
+            [f for f in prev_dir.glob("*.csv")
+             if not f.name.endswith("_positions.csv")],
+            key=lambda f: f.name,
+            reverse=True,
+        )
+        today_prefix = self.trading_day + "_"
+        prev_csvs = [f for f in prev_csvs if not f.name.startswith(today_prefix)]
+        # Prefer daily CSV
+        daily_csvs = [f for f in prev_csvs if f.name.endswith("_daily.csv")]
+        target = daily_csvs[0] if daily_csvs else (prev_csvs[0] if prev_csvs else None)
+        if target:
+            try:
+                self._prev_day_factors = pd.read_csv(target)
+                logger.info("[native] loaded prev day factors from local: %s (%d rows)",
+                            target.name, len(self._prev_day_factors))
+            except Exception as exc:
+                logger.warning("[native] failed to load prev day factors: %s", exc)
+
+    def _load_prev_day_from_oss(self) -> Optional[pd.DataFrame]:
+        """Load previous trading day's daily factor result from OSS."""
+        try:
+            import json as _json
+            import oss2
+            endpoint = os.environ.get("OSS_ENDPOINT", "")
+            ak_id = os.environ.get("OSS_ACCESS_KEY_ID", "")
+            ak_secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
+            if not all([endpoint, ak_id, ak_secret]):
+                return None
+            prefix = os.environ.get("OSS_LIVE_PREFIX", "live-factors")
+            bucket_name = os.environ.get("OSS_RESULT_BUCKET", "stock-mdl-data-result")
+            auth = oss2.Auth(ak_id, ak_secret)
+            ep = endpoint.replace("https://", "").replace("http://", "")
+            bucket = oss2.Bucket(auth, ep, bucket_name)
+            today = datetime.strptime(self.trading_day, "%Y%m%d")
+            from datetime import timedelta
+            for i in range(1, 6):
+                candidate = (today - timedelta(days=i)).strftime("%Y%m%d")
+                key = f"{prefix}/{candidate[:4]}/{candidate[:6]}/{candidate}/daily.json"
+                try:
+                    payload = bucket.get_object(key)
+                    data = _json.loads(payload.read())
+                    if data:
+                        df = pd.DataFrame(data)
+                        logger.info("[native] loaded prev day daily factors from OSS: %s (%d rows)",
+                                    key, len(df))
+                        return df
+                except oss2.exceptions.NoSuchKey:
+                    continue
+                except Exception:
+                    continue
+            logger.info("[native] no daily factor result found on OSS for previous 5 days")
+        except Exception as exc:
+            logger.warning("[native] OSS prev day load failed: %s", exc)
+        return None
 
     def _scan_shm_files(self) -> Dict[str, Dict[int, str]]:
         """Scan SHM directory, return {code: {kind: path}}.
@@ -705,26 +781,24 @@ class NativeEngine:
                     break
                 time.sleep(1)
 
-    def _compute_and_output(self) -> None:
-        with self._compute_lock:
-            self._compute_and_output_locked()
-
-    def _compute_and_output_wrapper(self) -> None:
-        """Run _compute_and_output in background, clear flag when done."""
+    def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         try:
-            self._compute_and_output()
+            with self._compute_lock:
+                self._compute_and_output_locked(schedule)
         except Exception as exc:
             logger.error("[combined] background compute failed: %s", exc, exc_info=True)
         finally:
-            self._compute_running = False
+            if schedule is None or schedule.name == "minute":
+                self._compute_running = False
 
-    def _compute_and_output_locked(self) -> None:
-        if not _is_trading_hours():
+    def _compute_and_output_locked(self, schedule: Optional[ComputationSchedule] = None) -> None:
+        is_daily = schedule is not None and schedule.is_daily_result
+        if not is_daily and not _is_trading_hours():
             return
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        end_time = now_dt.strftime("%H%M%S")
+        end_time = "daily" if is_daily else now_dt.strftime("%H%M%S")
         self._round_count += 1
 
         files_by_code = self._scan_shm_files()
@@ -736,12 +810,16 @@ class NativeEngine:
         dirty_codes, states_snapshot = self._sync_states(files_by_code, wall_secs)
         snap_ms = (time.perf_counter() - snap_t0) * 1000
 
-        if not dirty_codes:
+        # Daily: compute ALL stocks (no dirty tracking)
+        if is_daily:
+            all_codes = sorted(files_by_code.keys())
+        elif not dirty_codes:
             return
-
-        all_codes = sorted(dirty_codes)
-        logger.info("[combined] computing: date=%s end_time=%s dirty=%d total=%d",
-                    date_str, end_time, len(all_codes), len(files_by_code))
+        else:
+            all_codes = sorted(dirty_codes)
+        logger.info("[combined] computing: date=%s end_time=%s dirty=%d total=%d schedule=%s",
+                    date_str, end_time, len(all_codes), len(files_by_code),
+                    schedule.name if schedule else "minute")
 
         t0 = time.time()
 
@@ -819,17 +897,28 @@ class NativeEngine:
         if not results:
             return
 
-        self._write_results(results, date_str, end_time)
+        # Store daily result for next day's prev_day (before fork, in main process)
+        if is_daily:
+            self._prev_day_factors = pd.DataFrame(results)
+            logger.info("[daily] stored daily result (%d rows) as prev_day_factors",
+                        len(self._prev_day_factors))
+
+        self._write_results(results, date_str, end_time, schedule=schedule)
         pipe_log.log("factor_compute", date=date_str, end_time=end_time,
                      stocks=len(all_codes), results=len(results),
                      compute_ms=round(elapsed_ms, 1))
 
-    def _write_results(self, results: list, date_str: str, end_time: str) -> None:
+    def _write_results(self, results: list, date_str: str, end_time: str,
+                        schedule: Optional[ComputationSchedule] = None) -> None:
         """Write factor results to CSV and upload to OSS."""
         if not results:
             return
+        is_daily = schedule is not None and schedule.is_daily_result
         output_path = self.output_path
         outfun = self.outfun
+        inference_fn = self.inference_fn
+        daily_basic_df = self._daily_basic_df
+        prev_day_factors = self._prev_day_factors
         try:
             os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
@@ -841,11 +930,26 @@ class NativeEngine:
                     result_df = pd.DataFrame(results)
                     if output_path and not result_df.empty:
                         output_path.mkdir(parents=True, exist_ok=True)
-                        out_file = output_path / f"{date_str}_{end_time}.csv"
+                        if is_daily:
+                            out_file = output_path / f"{date_str}_daily.csv"
+                        else:
+                            out_file = output_path / f"{date_str}_{end_time}.csv"
                         result_df.to_csv(out_file, index=False)
                         logger.info("[combined] wrote %s", out_file)
                     if not result_df.empty:
                         _upload_to_oss(result_df, date_str, end_time)
+                    # Inference: only for minute-level (not daily)
+                    if not is_daily and inference_fn is not None and not result_df.empty:
+                        try:
+                            positions_df = inference_fn(date_str, end_time, prev_day_factors, result_df, daily_basic_df)
+                            if positions_df is not None and not positions_df.empty:
+                                if output_path:
+                                    pos_file = output_path / f"{date_str}_{end_time}_positions.csv"
+                                    positions_df.to_csv(pos_file, index=False)
+                                    logger.info("[inference] wrote %d positions to %s",
+                                                len(positions_df), pos_file)
+                        except Exception as exc:
+                            logger.error("[inference] failed: %s", exc, exc_info=True)
                     if outfun is not None:
                         try:
                             outfun(date_str, end_time, result_df)
@@ -886,8 +990,29 @@ class NativeEngine:
             logger.error("[native] FACTOR_MODULE not set!")
             return
 
+        # Load inference module (optional)
+        inference_module = os.environ.get("INFERENCE_MODULE", "")
+        if inference_module:
+            try:
+                imod = importlib.import_module(inference_module)
+                self.inference_fn = getattr(imod, "inference", None)
+                if self.inference_fn:
+                    logger.info("[native] loaded inference: %s", inference_module)
+                else:
+                    logger.warning("[native] inference module %s has no 'inference' function", inference_module)
+            except Exception as exc:
+                logger.error("[native] failed to load inference module %s: %s", inference_module, exc)
+
         # Init pool
         self._init_pool()
+
+        # Load previous day factors (for inference)
+        if self.inference_fn is not None:
+            self._load_prev_day_factors()
+
+        # Build computation schedules from config
+        self._schedules = build_schedules_from_env()
+        logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
         if self._raw_archive_enabled:
             self._archive_thread = threading.Thread(
@@ -897,22 +1022,26 @@ class NativeEngine:
             )
             self._archive_thread.start()
 
-        logger.info("[native] entering main loop (interval=%ds)", self.compute_interval)
+        logger.info("[native] entering main loop")
 
         while True:
             try:
                 now = time.time()
-                if now - self._last_compute >= self.compute_interval:
-                    if _is_trading_hours() and not self._compute_running:
-                        self._compute_running = True
-                        t = threading.Thread(target=self._compute_and_output_wrapper, daemon=True)
+                now_dt = datetime.now()
+                for schedule in self._schedules:
+                    if schedule.should_run(now, now_dt, self.trading_day):
+                        if schedule.name == "minute" and self._compute_running:
+                            continue
+                        if schedule.name == "minute":
+                            self._compute_running = True
+                        schedule.mark_run(now, self.trading_day)
+                        logger.info("[native] dispatching schedule=%s", schedule.name)
+                        t = threading.Thread(
+                            target=self._compute_and_output,
+                            args=(schedule,),
+                            daemon=True,
+                        )
                         t.start()
-                        self._last_compute = now
-                    elif self._compute_running:
-                        self._last_compute = now
-                    else:
-                        self._last_compute = now
-
                 time.sleep(1)
             except KeyboardInterrupt:
                 logger.info("[native] interrupted")

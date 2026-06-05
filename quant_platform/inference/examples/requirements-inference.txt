@@ -1,0 +1,23 @@
+# Runtime dependencies for scripts/infer_model.py and model.joblib inference.
+# Keep this file small so production/dev does not need the full quant-platform stack.
+
+# Dataframe + parquet IO for OSS daily_basic files.
+numpy>=1.26,<3
+pandas>=2.1,<3
+pyarrow>=14,<22
+
+# OSS object listing/download.
+oss2>=2.18,<3
+
+# model.joblib loading and embedded feature_transform callable payload.
+joblib>=1.3,<2
+cloudpickle>=2.2,<4
+
+# Required for the current OLS model artifact.
+# If the saved model changes, install that model package too, and preferably
+# keep the version close to the training environment.
+scikit-learn>=1.3,<2
+
+# Optional future model packages:
+# lightgbm>=4,<5
+# xgboost>=1.7,<3

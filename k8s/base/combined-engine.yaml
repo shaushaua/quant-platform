@@ -71,8 +71,14 @@ spec:
             # --- 因子计算 ---
             - name: FACTOR_MODULE
               value: "quant_platform.factor.examples.protected_eillen_strategy"
+            - name: INFERENCE_MODULE
+              value: ""
             - name: COMPUTE_INTERVAL
               value: "60"
+            - name: COMPUTE_SCHEDULES
+              value: "minute"
+            - name: DAILY_FACTOR_TRIGGER_TIME
+              value: "15:10"
             - name: DATA_FLUSH_INTERVAL
               value: "0.01"
             - name: SHM_STORE_BACKEND

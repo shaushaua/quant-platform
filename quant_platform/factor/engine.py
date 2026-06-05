@@ -60,6 +60,7 @@ def calc_factors_by_date_range(
     processes: int = 1,
     factor_data_handler: Optional[Callable] = None,
     outfun: Optional[Callable] = None,
+    inference_handler: Optional[Callable] = None,
     oss_base_path: Optional[str] = None,
 ) -> None:
     """
@@ -84,11 +85,13 @@ def calc_factors_by_date_range(
         processes:            并行进程数（暂保留参数，当前单进程实现）。
         factor_data_handler:  单票因子计算函数，签名见上。
         outfun:               批次结果处理函数，签名 outfun(date, end_time, test)。
+        inference_handler:    推理函数，签名 inference(date, end_time, result_df, daily_basic_df) -> DataFrame。
         oss_base_path:        OSS 数据根路径，None 时读环境变量。
     """
     api = DataAPI(mode="backtest", oss_base_path=oss_base_path)
     _calc_fn = factor_data_handler
     _out_fn = outfun
+    _infer_fn = inference_handler
 
     # 交易日列表
     try:
@@ -121,6 +124,8 @@ def calc_factors_by_date_range(
         len(trading_days), len(_end_times),
         f"{len(_securities)} 只股票" if is_explicit_list else "全市场流式模式",
     )
+
+    _prev_day_result: Optional[pd.DataFrame] = None
 
     for date in trading_days:
         # 全市场模式：从 daily_basic 获取股票列表
@@ -213,11 +218,22 @@ def calc_factors_by_date_range(
                     del bundle
 
                 test = _merge_results(all_res)
+                if _infer_fn is not None and test is not None and not test.empty:
+                    try:
+                        _daily = daily_basic if not is_explicit_list else pd.DataFrame()
+                        positions = _infer_fn(date, end_time, _prev_day_result, test, _daily)
+                        if positions is not None and not positions.empty:
+                            logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
+                    except Exception as e:
+                        logger.error("inference 异常 date=%s end_time=%s: %s", date, end_time, e)
                 if _out_fn is not None:
                     try:
                         _out_fn(date, end_time, test)
                     except Exception as e:
                         logger.error("outfun 异常 date=%s end_time=%s: %s", date, end_time, e)
+                # Keep last end_time's result as prev_day for next date
+                if test is not None and not test.empty:
+                    _prev_day_result = test
         else:
             # 传统模式：预加载全市场数据（适用于小规模股票列表）
             bundle = _load_day_bundle(date, factor_info, api, _securities)
@@ -263,6 +279,15 @@ def calc_factors_by_date_range(
 
             test = _merge_results(all_res)
 
+            if _infer_fn is not None and test is not None and not test.empty:
+                try:
+                    _daily = api.get_daily_data(date, "daily_basic") if is_explicit_list else daily_basic
+                    positions = _infer_fn(date, end_time, _prev_day_result, test, _daily)
+                    if positions is not None and not positions.empty:
+                        logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
+                except Exception as e:
+                    logger.error("inference 异常 date=%s end_time=%s: %s", date, end_time, e)
+
             if _out_fn is not None:
                 try:
                     _out_fn(date, end_time, test)
@@ -270,6 +295,10 @@ def calc_factors_by_date_range(
                     logger.error(
                         "outfun 异常 date=%s end_time=%s: %s", date, end_time, e
                     )
+
+        # Keep last end_time's result as prev_day for next date
+        if test is not None and not test.empty:
+            _prev_day_result = test
 
     logger.info("因子计算完成")
 
