@@ -9,10 +9,14 @@ NATIVE_SHM_DIR.  This class keeps the existing DataAPI dependency on ShmStore.
 from __future__ import annotations
 
 from typing import Dict, List, Optional
+from pathlib import Path
+import os
 
 import pandas as pd
 
 from .native_realtime_store import NativeRealtimeStore
+
+SHM_BASE = Path(os.environ.get("SHM_STORE_PATH", "/dev/shm/store"))
 
 
 class ShmStore:
