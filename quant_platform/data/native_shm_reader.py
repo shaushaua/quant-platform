@@ -165,6 +165,38 @@ class NativeShmReader:
 
         raise RuntimeError(f"mmap generation conflict after {max_retries} retries: {self.path}")
 
+    def view_rows(self, max_retries: int = 10) -> np.ndarray:
+        """Return a zero-copy view of all committed rows.
+
+        Rows are append-only in the native writer.  Existing row bytes are never
+        mutated after row_count is published, so factor workers can safely keep a
+        read-only view over the mmap while the writer appends later rows.
+        """
+        for attempt in range(max_retries):
+            gen1 = struct.unpack_from("<Q", self._mmap, 56)[0]
+            if gen1 % 2 == 1:
+                time.sleep(0.000001)
+                continue
+
+            row_count = struct.unpack_from("<Q", self._mmap, 40)[0]
+            n_cols = struct.unpack_from("<Q", self._mmap, 32)[0]
+
+            if row_count == 0:
+                return np.empty((0, n_cols), dtype=np.float64)
+
+            data = np.frombuffer(
+                self._mmap,
+                dtype=np.float64,
+                offset=SHM_HEADER_SIZE,
+                count=row_count * n_cols,
+            ).reshape(row_count, n_cols)
+
+            gen2 = struct.unpack_from("<Q", self._mmap, 56)[0]
+            if gen1 == gen2:
+                return data
+
+        raise RuntimeError(f"mmap generation conflict after {max_retries} retries: {self.path}")
+
     def refresh(self) -> int:
         """Refresh row_count from the file header. Returns new row_count."""
         self._refresh_header()

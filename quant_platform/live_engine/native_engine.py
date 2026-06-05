@@ -17,6 +17,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import copy
 import gc
 import importlib
 import logging
@@ -49,6 +50,7 @@ from .streaming_engine import (
     _time_to_seconds,
     _upload_to_oss,
 )
+from .pipeline_logger import get_streaming_logger
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +58,8 @@ logger = logging.getLogger(__name__)
 _factor_fn: Optional[Callable] = None
 _market_df: pd.DataFrame = pd.DataFrame()
 _daily_basic_df: pd.DataFrame = pd.DataFrame()
-_worker_frames: Dict[str, Dict[int, pd.DataFrame]] = {}
-_worker_offsets: Dict[Tuple[str, int], int] = {}
-_worker_states: Dict[str, StockState] = {}
+_reader_cache: Dict[str, NativeShmReader] = {}
+_base_ns: int = 0  # pd.Timestamp(trading_day).value, set once per day
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -72,6 +73,15 @@ def _env_bool(name: str, default: bool) -> bool:
 _tick_columns = TICK_COLUMNS
 _order_columns = ORDER_COLUMNS
 _deal_columns = DEAL_COLUMNS
+_tick_buf_cols = TICK_COLUMNS[2:]
+_order_buf_cols = ORDER_COLUMNS[2:]
+_deal_buf_cols = DEAL_COLUMNS[2:]
+_tick_time_idx = _tick_buf_cols.index('Time')       # 0
+_tick_updtime_idx = _tick_buf_cols.index('UpdateTime')  # 1
+_deal_time_idx = _deal_buf_cols.index('Time')       # 0
+_deal_updtime_idx = _deal_buf_cols.index('UpdateTime')  # 1
+_order_time_idx = _order_buf_cols.index('Time')       # 0
+_order_updtime_idx = _order_buf_cols.index('UpdateTime')  # 1
 _columns_by_kind = {
     KIND_TICK: TICK_COLUMNS,
     KIND_ORDER: ORDER_COLUMNS,
@@ -85,6 +95,7 @@ _kind_names = {
 
 
 def _build_df_from_native(reader: NativeShmReader, columns: list,
+                          buf_cols: list, time_idx: int, updtime_idx: int,
                           trading_day: str, code: str) -> pd.DataFrame:
     """Build DataFrame from native SHM reader.
 
@@ -94,25 +105,21 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
     Reads the full current-day buffer so factor code receives all data
     accumulated up to this round.
     """
-    arr = reader.read_rows()
+    arr = reader.view_rows()
     if arr.shape[0] == 0:
         return pd.DataFrame()
-
-    buf_cols = columns[2:]  # skip TradingDay, Code
 
     # Zero-copy DataFrame over numpy array
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
 
     # Fast time conversion: f64 seconds → datetime64[ns]
-    base_ns = pd.Timestamp(trading_day).value
-    for col in ('Time', 'UpdateTime'):
-        if col in buf_cols:
-            idx = buf_cols.index(col)
-            df[col] = (base_ns + (arr[:, idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+    base_ns = _base_ns
+    df.iloc[:, time_idx] = (base_ns + (arr[:, time_idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+    df.iloc[:, updtime_idx] = (base_ns + (arr[:, updtime_idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
 
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
-    return df[columns]
+    return df
 
 
 def _read_native_df_for_worker(path: str, kind: int, code: str, trading_day: str,
@@ -140,33 +147,34 @@ def _read_native_df_for_worker(path: str, kind: int, code: str, trading_day: str
 
 # ── Worker function for parallel factor computation ────────────────
 
-def _compute_stock_native(args):
-    """Compute factor for one stock, reading full current-day native mmap."""
-    global _factor_fn, _market_df, _daily_basic_df
+def _cached_reader(path: str) -> NativeShmReader:
+    reader = _reader_cache.get(path)
+    if reader is None:
+        reader = NativeShmReader(path)
+        _reader_cache[path] = reader
+    return reader
 
-    (code, date_str, end_time, wall_secs, state_snap,
-     tick_reader_path, order_reader_path, deal_reader_path,
-     trading_day) = args[:9]
 
+_df_build_ms = 0.0
+_factor_ms = 0.0
+_profile_count = 0
+
+
+def _compute_stock_shm(args):
+    """Old combined-engine compute path over native mmap files.
+
+    Each call builds full current-day DataFrames from mmap views and passes the
+    main-process StockState snapshot into the factor, matching the old
+    _compute_stock_shm contract as closely as possible.
+    """
+    global _factor_fn, _market_df, _daily_basic_df, _df_build_ms, _factor_ms, _profile_count
+    code, date_str, end_time, wall_secs, state_snap, tick_path, deal_path, order_path, trading_day, factor_fn = args
     try:
-        tick_df = pd.DataFrame()
-        deal_df = pd.DataFrame()
-        order_df = pd.DataFrame()
-
-        if tick_reader_path:
-            r = NativeShmReader(tick_reader_path)
-            tick_df = _build_df_from_native(r, _tick_columns, trading_day, code)
-            r.close()
-
-        if deal_reader_path:
-            r = NativeShmReader(deal_reader_path)
-            deal_df = _build_df_from_native(r, _deal_columns, trading_day, code)
-            r.close()
-
-        if order_reader_path:
-            r = NativeShmReader(order_reader_path)
-            order_df = _build_df_from_native(r, _order_columns, trading_day, code)
-            r.close()
+        t0 = time.perf_counter()
+        tick_df = _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code) if tick_path else pd.DataFrame()
+        deal_df = _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code) if deal_path else pd.DataFrame()
+        order_df = _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code) if order_path else pd.DataFrame()
+        df_ms = (time.perf_counter() - t0) * 1000
 
         stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
@@ -175,97 +183,28 @@ def _compute_stock_native(args):
             state=state_snap,
         )
 
-        result = _factor_fn(stock_data, code, date_str, end_time)
+        t1 = time.perf_counter()
+        result = factor_fn(stock_data, code, date_str, end_time)
+        fn_ms = (time.perf_counter() - t1) * 1000
+
+        _df_build_ms += df_ms
+        _factor_ms += fn_ms
+        _profile_count += 1
+        if _profile_count % 200 == 0:
+            logger.info("[profile] worker=%s stocks=%d df=%.1fms factor=%.1fms total=%.1fms",
+                        multiprocessing.current_process().name, _profile_count,
+                        _df_build_ms / _profile_count, _factor_ms / _profile_count,
+                        (_df_build_ms + _factor_ms) / _profile_count)
+
+        if result is not None and state_snap and state_snap.last_market_time:
+            market_secs = _time_to_seconds(state_snap.last_market_time)
+            if market_secs > 0:
+                data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
+                if abs(data_latency_ms) < 600_000:
+                    result["data_latency_ms"] = data_latency_ms
         return code, result, None
     except Exception as exc:
         return code, None, str(exc)
-
-
-def _append_frame(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
-    if new.empty:
-        return old
-    if old.empty:
-        return new
-    return pd.concat([old, new], ignore_index=True, copy=False)
-
-
-def _update_state_from_increment(code: str, kind: int, df: pd.DataFrame, wall_secs: float) -> StockState:
-    state = _worker_states.get(code)
-    if state is None:
-        state = StockState(code=code)
-        _worker_states[code] = state
-    if df.empty:
-        return state
-    if kind == KIND_TICK:
-        state.update_tick(df)
-    elif kind == KIND_DEAL:
-        state.update_deal(df)
-    elif kind == KIND_ORDER:
-        state.update_order(df)
-    state.last_update_ts = wall_secs
-    return state
-
-
-def _compute_shard_cached(args):
-    """Compute a fixed code shard using per-process DataFrame caches.
-
-    Each pool has one process, so _worker_frames/_worker_offsets persist for
-    the same shard across rounds.  This preserves full-current-day factor
-    inputs without rereading every mmap file from row 0 each round.
-    """
-    global _factor_fn, _market_df, _daily_basic_df, _worker_frames, _worker_offsets
-    shard_items, date_str, end_time, wall_secs, trading_day = args
-
-    results = []
-    errors = 0
-    for code, kinds in shard_items:
-        try:
-            frames = _worker_frames.setdefault(code, {
-                KIND_TICK: pd.DataFrame(),
-                KIND_ORDER: pd.DataFrame(),
-                KIND_DEAL: pd.DataFrame(),
-            })
-            state = _worker_states.get(code) or StockState(code=code)
-            _worker_states[code] = state
-
-            for kind in (KIND_TICK, KIND_ORDER, KIND_DEAL):
-                path = kinds.get(kind)
-                if not path:
-                    continue
-                offset_key = (path, kind)
-                start = _worker_offsets.get(offset_key, 0)
-                try:
-                    reader = NativeShmReader(path)
-                    current = reader.refresh()
-                    reader.close()
-                except Exception:
-                    continue
-                if current < start:
-                    start = 0
-                    _worker_offsets[offset_key] = 0
-                    frames[kind] = pd.DataFrame()
-                if current <= start:
-                    continue
-                df_new = _read_native_df_for_worker(path, kind, code, trading_day, start, current)
-                _worker_offsets[offset_key] = current
-                if not df_new.empty:
-                    frames[kind] = _append_frame(frames[kind], df_new)
-                    state = _update_state_from_increment(code, kind, df_new, wall_secs)
-
-            stock_data = StockData(
-                code=code, date=date_str, end_time=end_time,
-                l1_tick=frames.get(KIND_TICK, pd.DataFrame()),
-                l2_deal=frames.get(KIND_DEAL, pd.DataFrame()),
-                l2_order=frames.get(KIND_ORDER, pd.DataFrame()),
-                market=_market_df, daily_basic=_daily_basic_df,
-                state=state,
-            )
-            result = _factor_fn(stock_data, code, date_str, end_time)
-            if result is not None:
-                results.append(result)
-        except Exception:
-            errors += 1
-    return results, errors, len(shard_items)
 
 
 # ── Native Engine ──────────────────────────────────────────────────
@@ -278,11 +217,14 @@ class NativeEngine:
         self.compute_interval = int(os.environ.get("COMPUTE_INTERVAL", "60"))
         self.factor_module = os.environ.get("FACTOR_MODULE", "")
         self.factor_output_path = os.environ.get("FACTOR_OUTPUT_PATH", "/data/factors")
+        self.output_path = Path(self.factor_output_path) if self.factor_output_path else None
         self.n_workers = int(os.environ.get("FACTOR_WORKERS", "40"))
         self.trading_day: str = ""
         self._pool: Optional[multiprocessing.Pool] = None
         self._daily_cache: Optional[DailyBasicCache] = None
         self._states: Dict[str, StockState] = {}
+        self.factor_calculation: Optional[Callable] = None
+        self.outfun: Optional[Callable] = None
         self._last_codes: List[str] = []
         self._last_compute: float = 0.0
         self._data_flush_interval: float = float(os.environ.get("DATA_FLUSH_INTERVAL", "0.01"))
@@ -296,6 +238,10 @@ class NativeEngine:
         self._stopped = False
         self._archive_thread: Optional[threading.Thread] = None
         self._compute_lock = threading.Lock()
+        self._compute_running = False
+        self._state_offsets: Dict[Tuple[str, int], int] = {}
+        self._main_readers: Dict[str, NativeShmReader] = {}
+        self._cached_shm_files: Optional[Dict[str, Dict[int, str]]] = None
 
     def _init_pool(self) -> None:
         """Create persistent worker pool."""
@@ -331,14 +277,164 @@ class NativeEngine:
                      len(self._daily_basic_df), len(self._market_df))
 
     def _scan_shm_files(self) -> Dict[str, Dict[int, str]]:
-        """Scan SHM directory, return {code: {kind: path}}."""
+        """Scan SHM directory, return {code: {kind: path}}.
+        Result is cached after first call — files don't change during the day."""
+        if self._cached_shm_files is not None:
+            return self._cached_shm_files
         files = scan_shm_dir(self.shm_dir)
         by_code: Dict[str, Dict[int, str]] = {}
         for (code, kind), path in files.items():
             if code not in by_code:
                 by_code[code] = {}
             by_code[code][kind] = path
+        self._cached_shm_files = by_code
         return by_code
+
+    @staticmethod
+    def _raw_time_from_seconds(seconds: float) -> str:
+        if seconds <= 0:
+            return ""
+        total_ms = int(seconds * 1000)
+        h, rem = divmod(total_ms, 3600_000)
+        m, rem = divmod(rem, 60_000)
+        s, ms = divmod(rem, 1000)
+        return f"{h:02d}{m:02d}{s:02d}{ms:03d}"
+
+    def _get_cached_reader(self, path: str) -> Optional[NativeShmReader]:
+        """Get or create a cached NativeShmReader for the main process."""
+        reader = self._main_readers.get(path)
+        if reader is not None:
+            return reader
+        try:
+            reader = NativeShmReader(path)
+            self._main_readers[path] = reader
+            return reader
+        except Exception:
+            return None
+
+    def _sync_states(self, files_by_code: Dict[str, Dict[int, str]],
+                     wall_secs: float) -> Tuple[set, Dict[str, StockState]]:
+        """Update main-process StockState from native mmap increments.
+
+        Returns (dirty_codes, states_snapshot). dirty_codes contains only codes
+        that received new data since last round — callers should only dispatch
+        factor tasks for these stocks.
+
+        Uses cached readers and vectorized numpy ops to minimize overhead.
+        """
+        dirty_codes: set = set()
+
+        for code, kinds in files_by_code.items():
+            state = self._states.get(code)
+            if state is None:
+                state = StockState(code=code)
+                self._states[code] = state
+
+            for kind in (KIND_TICK, KIND_DEAL, KIND_ORDER):
+                path = kinds.get(kind)
+                if not path:
+                    continue
+                offset_key = (path, kind)
+                start = self._state_offsets.get(offset_key, 0)
+
+                reader = self._get_cached_reader(path)
+                if reader is None:
+                    continue
+                try:
+                    current = reader.refresh()
+                except Exception:
+                    continue
+                if current <= start:
+                    continue
+
+                arr = reader.view_rows()[start:current]
+                n = arr.shape[0]
+                if n == 0:
+                    self._state_offsets[offset_key] = current
+                    continue
+
+                dirty_codes.add(code)
+                state.last_update_ts = wall_secs
+
+                if kind == KIND_TICK:
+                    self._update_tick_vectorized(state, arr)
+                elif kind == KIND_DEAL:
+                    self._update_deal_vectorized(state, arr)
+                elif kind == KIND_ORDER:
+                    self._update_order_vectorized(state, arr)
+
+                # Commit offset only after state update succeeds
+                self._state_offsets[offset_key] = current
+
+        return dirty_codes, {code: copy.copy(self._states[code]) for code in dirty_codes}
+
+    @staticmethod
+    def _update_tick_vectorized(state: StockState, arr: np.ndarray) -> None:
+        """Vectorized tick state update from numpy rows (zero-copy view)."""
+        state.tick_count += arr.shape[0]
+
+        prices = arr[:, 2]  # CurrentPrice
+        nonzero = prices[prices > 0]
+        if len(nonzero) > 0:
+            if state.open == 0.0:
+                state.open = float(nonzero[0])
+            state.latest_price = float(nonzero[-1])
+            state.high = max(state.high, float(nonzero.max()))
+            low_val = float(nonzero.min())
+            if low_val < state.low:
+                state.low = low_val
+
+        pre_close = float(arr[-1, 5])
+        if pre_close > 0:
+            state.pre_close = pre_close
+        ask1 = float(arr[-1, 17])
+        if ask1 > 0:
+            state.ask1 = ask1
+        bid1 = float(arr[-1, 47])
+        if bid1 > 0:
+            state.bid1 = bid1
+        state.ask_volume1 = int(arr[-1, 27])
+        state.bid_volume1 = int(arr[-1, 57])
+
+        raw_time = NativeEngine._raw_time_from_seconds(float(arr[-1, 1]))
+        state.last_tick_time = raw_time
+        state._update_market_time_raw(raw_time)
+
+    @staticmethod
+    def _update_deal_vectorized(state: StockState, arr: np.ndarray) -> None:
+        """Vectorized deal state update from numpy rows (zero-copy view)."""
+        n = arr.shape[0]
+        state.deal_count += n
+        prices = arr[:, 5]   # Price
+        volumes = arr[:, 6]  # Volume
+        state.cum_amount += float(np.dot(prices, volumes))
+        state.cum_volume += int(volumes.sum())
+
+        raw_time = NativeEngine._raw_time_from_seconds(float(arr[-1, 1]))
+        state.last_deal_time = raw_time
+        state._update_market_time_raw(raw_time)
+
+    @staticmethod
+    def _update_order_vectorized(state: StockState, arr: np.ndarray) -> None:
+        """Vectorized order state update from numpy rows (zero-copy view)."""
+        n = arr.shape[0]
+        state.order_count += n
+
+        sides = arr[:, 3]   # Side: 0=buy, 1=sell
+        volumes = arr[:, 5]  # Volume
+        order_types = arr[:, 6]  # OrderType
+
+        buy_mask = sides == 0
+        sell_mask = sides == 1
+        state.buy_order_count += int(buy_mask.sum())
+        state.sell_order_count += int(sell_mask.sum())
+        state.buy_order_volume += int(volumes[buy_mask].sum())
+        state.sell_order_volume += int(volumes[sell_mask].sum())
+        state.cancel_count += int((order_types == 5).sum())
+
+        raw_time = NativeEngine._raw_time_from_seconds(float(arr[-1, 1]))
+        state.last_order_time = raw_time
+        state._update_market_time_raw(raw_time)
 
     def _read_native_df(self, path: str, kind: int, code: str,
                         start_row: int = 0, end_row: Optional[int] = None) -> pd.DataFrame:
@@ -576,13 +672,32 @@ class NativeEngine:
 
     def _archive_loop(self) -> None:
         logger.info("[native-archive] background archive loop started interval=%ds", self._archive_interval)
+        last_archive_date = ""
+        archived_lunch = False
+        archived_close = False
         while not self._stopped:
             try:
+                today = date.today().isoformat()
+                if today != last_archive_date:
+                    last_archive_date = today
+                    archived_lunch = False
+                    archived_close = False
+
                 files_by_code = self._scan_shm_files()
                 if files_by_code:
-                    if not _is_trading_hours():
+                    now = datetime.now()
+                    h, m = now.hour, now.minute
+                    if not archived_lunch and h == 11 and m >= 35:
+                        logger.info("[native-archive] lunch break snapshot starting...")
+                        self._archive_native_incremental(files_by_code)
+                        archived_lunch = True
+                        logger.info("[native-archive] lunch break snapshot done")
+                    elif not archived_close and h >= 15 and m >= 5:
+                        logger.info("[native-archive] post-close snapshot starting...")
                         self._archive_native_incremental(files_by_code)
                         self._check_raw_upload_time(files_by_code)
+                        archived_close = True
+                        logger.info("[native-archive] post-close snapshot done")
             except Exception as exc:
                 logger.error("[native-archive] loop error: %s", exc, exc_info=True)
             for _ in range(max(1, self._archive_interval)):
@@ -591,81 +706,156 @@ class NativeEngine:
                 time.sleep(1)
 
     def _compute_and_output(self) -> None:
-        """Run one round of factor computation."""
         with self._compute_lock:
             self._compute_and_output_locked()
+
+    def _compute_and_output_wrapper(self) -> None:
+        """Run _compute_and_output in background, clear flag when done."""
+        try:
+            self._compute_and_output()
+        except Exception as exc:
+            logger.error("[combined] background compute failed: %s", exc, exc_info=True)
+        finally:
+            self._compute_running = False
 
     def _compute_and_output_locked(self) -> None:
         if not _is_trading_hours():
             return
-        t0 = time.perf_counter()
-        wall_secs = time.time()
-        end_time = datetime.now().strftime("%H:%M:%S")
+        pipe_log = get_streaming_logger()
+        now_dt = datetime.now()
+        date_str = self.trading_day
+        end_time = now_dt.strftime("%H%M%S")
         self._round_count += 1
 
-        # Scan mmap files
         files_by_code = self._scan_shm_files()
-        codes = sorted(files_by_code.keys())
-        if not codes:
+        if not files_by_code:
             return
 
-        n_shards = max(1, min(self.n_workers, len(codes)))
-        shards: List[List[Tuple[str, Dict[int, str]]]] = [[] for _ in range(n_shards)]
-        for idx, code in enumerate(codes):
-            shards[idx % n_shards].append((code, files_by_code[code]))
-        tasks = [(shard, self.trading_day, end_time, wall_secs, self.trading_day) for shard in shards if shard]
+        snap_t0 = time.perf_counter()
+        wall_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+        dirty_codes, states_snapshot = self._sync_states(files_by_code, wall_secs)
+        snap_ms = (time.perf_counter() - snap_t0) * 1000
 
-        # Parallel compute
+        if not dirty_codes:
+            return
+
+        all_codes = sorted(dirty_codes)
+        logger.info("[combined] computing: date=%s end_time=%s dirty=%d total=%d",
+                    date_str, end_time, len(all_codes), len(files_by_code))
+
+        t0 = time.time()
+
+        global _factor_fn, _market_df, _daily_basic_df, _base_ns
+        _factor_fn = self.factor_calculation
+        _market_df = self._market_df
+        _daily_basic_df = self._daily_basic_df
+        _base_ns = pd.Timestamp(date_str).value
+
+        tick_paths = {code: files_by_code[code].get(KIND_TICK, "") for code in all_codes}
+        deal_paths = {code: files_by_code[code].get(KIND_DEAL, "") for code in all_codes}
+        order_paths = {code: files_by_code[code].get(KIND_ORDER, "") for code in all_codes}
+
+        tasks = [
+            (code, date_str, end_time, wall_secs, states_snapshot.get(code),
+             tick_paths.get(code, ""), deal_paths.get(code, ""), order_paths.get(code, ""),
+             date_str, self.factor_calculation)
+            for code in all_codes
+        ]
+
         results = []
         errors = 0
-        snap_start = time.perf_counter()
+        pool_t0 = time.perf_counter()
 
         if self._pool is not None:
-            for shard_results, shard_errors, _ in self._pool.imap(_compute_shard_cached, tasks, chunksize=1):
-                errors += shard_errors
-                results.extend(shard_results)
+            try:
+                for code, result, err in self._pool.imap_unordered(_compute_stock_shm, tasks, chunksize=32):
+                    if err:
+                        logger.warning("[%s] compute failed: %s", code, err)
+                        errors += 1
+                    elif result is not None:
+                        results.append(result)
+            except Exception as exc:
+                logger.error("[combined] persistent pool failed: %s", exc, exc_info=True)
+                self._pool = None
         else:
             for task in tasks:
-                shard_results, shard_errors, _ = _compute_shard_cached(task)
-                errors += shard_errors
-                results.extend(shard_results)
+                code, result, err = _compute_stock_shm(task)
+                if err:
+                    logger.warning("[%s] compute failed: %s", code, err)
+                    errors += 1
+                elif result is not None:
+                    results.append(result)
 
-        snap_ms = (time.perf_counter() - snap_start) * 1000
-        total_ms = (time.perf_counter() - t0) * 1000
+        pool_ms = (time.perf_counter() - pool_t0) * 1000
+        elapsed_ms = (time.time() - t0) * 1000
+        pool_type = "persistent+shm" if self._pool is not None else "inline"
+        n_stocks = len(all_codes)
+        per_stock = pool_ms / max(n_stocks, 1) * self.n_workers
+        logger.info(
+            "[combined] done (%s): %d results (errors=%d) | "
+            "snap=%.0fms pool=%.0fms total=%.0fms | "
+            "%d stocks × %dw → ~%.1fms/stock",
+            pool_type, len(results), errors,
+            snap_ms, pool_ms, elapsed_ms,
+            n_stocks, self.n_workers, per_stock,
+        )
 
-        if results:
-            per_stock_ms = total_ms / len(codes) if codes else 0
-            logger.info("[native] round=%d done: %d results (errors=%d) | total=%.0fms | "
-                         "%d stocks → ~%.1fms/stock",
-                         self._round_count, len(results), errors, total_ms,
-                         len(codes), per_stock_ms)
+        if states_snapshot:
+            compute_now = datetime.now()
+            compute_wall_secs = compute_now.hour * 3600 + compute_now.minute * 60 + compute_now.second
+            latency_parts = []
+            for sc in list(states_snapshot.keys())[:3]:
+                st = states_snapshot.get(sc)
+                if st and st.last_market_time:
+                    mkt_secs = _time_to_seconds(st.last_market_time)
+                    if mkt_secs > 0:
+                        latency_parts.append(
+                            f"{sc}: 行情={st.last_market_time} "
+                            f"因子计算延迟={round((compute_wall_secs - mkt_secs) * 1000, 1)}ms"
+                        )
+            if latency_parts:
+                logger.info("[latency-factor] %s", " | ".join(latency_parts))
 
-            # Write results to CSV
-            self._write_results(results, end_time)
-
-    def _write_results(self, results: list, end_time: str) -> None:
-        """Write factor results to CSV and upload to OSS."""
         if not results:
             return
 
-        df = pd.DataFrame(results)
-        os.makedirs(self.factor_output_path, exist_ok=True)
+        self._write_results(results, date_str, end_time)
+        pipe_log.log("factor_compute", date=date_str, end_time=end_time,
+                     stocks=len(all_codes), results=len(results),
+                     compute_ms=round(elapsed_ms, 1))
 
-        ts = end_time.replace(":", "")
-        csv_path = os.path.join(self.factor_output_path,
-                                 f"{self.trading_day}_{ts}.csv")
-        df.to_csv(csv_path, index=False)
-
-        # Upload to OSS in background (fork)
+    def _write_results(self, results: list, date_str: str, end_time: str) -> None:
+        """Write factor results to CSV and upload to OSS."""
+        if not results:
+            return
+        output_path = self.output_path
+        outfun = self.outfun
+        try:
+            os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            pass
         try:
             pid = os.fork()
             if pid == 0:
-                # Child: upload and exit
                 try:
-                    _upload_to_oss(df, self.trading_day, end_time)
-                except Exception as e:
-                    print(f"[native-oss] upload error: {e}", file=sys.stderr)
-                os._exit(0)
+                    result_df = pd.DataFrame(results)
+                    if output_path and not result_df.empty:
+                        output_path.mkdir(parents=True, exist_ok=True)
+                        out_file = output_path / f"{date_str}_{end_time}.csv"
+                        result_df.to_csv(out_file, index=False)
+                        logger.info("[combined] wrote %s", out_file)
+                    if not result_df.empty:
+                        _upload_to_oss(result_df, date_str, end_time)
+                    if outfun is not None:
+                        try:
+                            outfun(date_str, end_time, result_df)
+                        except Exception as exc:
+                            logger.error("[combined] outfun failed: %s", exc)
+                except Exception as exc:
+                    logger.error("[output-child] failed: %s", exc, exc_info=True)
+                finally:
+                    os._exit(0)
+            logger.info("[combined] output forked to child pid=%d", pid)
         except OSError:
             pass
 
@@ -689,6 +879,8 @@ class NativeEngine:
         if self.factor_module:
             mod = importlib.import_module(self.factor_module)
             _factor_fn = mod.factor_calculation
+            self.factor_calculation = mod.factor_calculation
+            self.outfun = getattr(mod, "outfun", None)
             logger.info("[native] loaded factor: %s", self.factor_module)
         else:
             logger.error("[native] FACTOR_MODULE not set!")
@@ -711,8 +903,12 @@ class NativeEngine:
             try:
                 now = time.time()
                 if now - self._last_compute >= self.compute_interval:
-                    if _is_trading_hours():
-                        self._compute_and_output()
+                    if _is_trading_hours() and not self._compute_running:
+                        self._compute_running = True
+                        t = threading.Thread(target=self._compute_and_output_wrapper, daemon=True)
+                        t.start()
+                        self._last_compute = now
+                    elif self._compute_running:
                         self._last_compute = now
                     else:
                         self._last_compute = now
