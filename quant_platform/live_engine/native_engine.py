@@ -208,9 +208,11 @@ class NativeEngine:
 
     def _load_daily_basic(self) -> None:
         """Load daily basic data from MySQL."""
-        self._daily_cache = DailyBasicCache()
-        self._daily_basic_df = self._daily_cache.get_daily_basic(self.trading_day)
-        self._market_df = self._daily_cache.get_market_info()
+        market_count = int(os.environ.get("DAILY_BASIC_MARKET_COUNT", "1"))
+        self._daily_cache = DailyBasicCache(market_count=market_count)
+        self._daily_cache.load(self.trading_day)
+        self._daily_basic_df = self._daily_cache.get_daily_basic()
+        self._market_df = pd.DataFrame()
         logger.info("[native] daily_basic: %d stocks, market: %d entries",
                      len(self._daily_basic_df), len(self._market_df))
 
