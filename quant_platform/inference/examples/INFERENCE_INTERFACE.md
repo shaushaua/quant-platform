@@ -15,6 +15,8 @@ def inference(date_str: str, end_time: str,
               prev_day_factors_df: pd.DataFrame,
               intraday_factors_df: pd.DataFrame,
               daily_basic_df: pd.DataFrame,
+              trading_universe_df: pd.DataFrame,
+              index_composition_df: pd.DataFrame,
               portfolio_context: PortfolioContext | None = None) -> pd.DataFrame:
     """
     引擎每轮调用一次。
@@ -26,6 +28,10 @@ def inference(date_str: str, end_time: str,
         intraday_factors_df:  当轮因子计算结果（分钟级特征）
         daily_basic_df:       daily_basic 市场数据
                               (risk factors, industry factors, daily features)
+        trading_universe_df:  当前交易股票池。至少包含 code；通常还包含 ID_QI、
+                              SECURITY_ID 等从 daily_basic 补充的标识列。
+        index_composition_df: 指数成分/权重等分股数据。当前生成函数先占位，
+                              未配置时为空 DataFrame。
         portfolio_context:    当前账户上下文。实盘由引擎注入；回测/无配置时为 None。
                               老版本 inference 不声明该参数也兼容。
 
@@ -41,7 +47,7 @@ def inference(date_str: str, end_time: str,
     """
 ```
 
-## 四份输入数据
+## 六份输入数据
 
 ### 1. prev_day_factors_df — 前一交易日日频因子
 
@@ -87,7 +93,37 @@ def inference(date_str: str, end_time: str,
 | `Agriculture`, `Banks`, `Steel`, ... | 行业分类因子 |
 | `open`, `high`, `low`, `close`, `volume`, ... | 日线特征 |
 
-### 4. portfolio_context — 当前账户上下文
+### 4. trading_universe_df — 当前交易股票池
+
+`trading_universe_df` 是本轮推理允许参与选股/下单的标的集合。它和
+`intraday_factors_df` 不完全等价：`intraday_factors_df` 是本轮算出来的因子结果，
+`trading_universe_df` 是引擎传入的交易 universe，推理模块应以它作为最终过滤边界。
+
+常见列：
+
+| 列 | 说明 |
+|----|------|
+| `code` | 标准股票代码或引擎当前代码格式 |
+| `ID_QI` | 6 位股票代码，如 `000001` |
+| `SECURITY_ID` | 整数 ID，如 daily_basic 中可用 |
+| `ts_code` | daily_basic 中的代码列，如可用 |
+
+### 5. index_composition_df — 指数成分分股数据
+
+`index_composition_df` 用于传入指数成分、权重、成分调整等分股数据。当前接口已预留，
+默认生成函数先返回空 DataFrame；后续可以在
+`quant_platform.inference.interface.compute_index_composition()` 中补充具体生成逻辑。
+
+建议列：
+
+| 列 | 说明 |
+|----|------|
+| `index_code` | 指数代码 |
+| `code` | 成分股代码 |
+| `weight` | 成分权重 |
+| `as_of` | 数据日期/快照时间 |
+
+### 6. portfolio_context — 当前账户上下文
 
 该参数用于把 QMT 当前持仓、资金、委托、成交传给交易员推理模块。引擎负责从
 QMT 数据导出文件 / SFTP / 后续 broker adapter 获取账户快照，交易员模块只消费
@@ -190,7 +226,8 @@ def _get_model():
 
 ```python
 def inference(date_str, end_time, prev_day_factors_df, intraday_factors_df,
-              daily_basic_df, portfolio_context=None):
+              daily_basic_df, trading_universe_df, index_composition_df,
+              portfolio_context=None):
     artifact = _get_model()
     model = artifact["model"]
     features = artifact["features"]
@@ -199,6 +236,13 @@ def inference(date_str, end_time, prev_day_factors_df, intraday_factors_df,
 
     # 用 intraday_factors_df 作为主要输入
     df = normalize_factor_keys(intraday_factors_df)
+    if trading_universe_df is not None and not trading_universe_df.empty:
+        df = df[df["code"].astype(str).isin(trading_universe_df["code"].astype(str))]
+
+    # 如需使用指数成分/权重
+    if index_composition_df is not None and not index_composition_df.empty:
+        # ... merge index composition ...
+        pass
 
     # 如需合并前一日因子
     if prev_day_factors_df is not None and not prev_day_factors_df.empty:

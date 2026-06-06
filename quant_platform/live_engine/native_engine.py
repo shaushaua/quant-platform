@@ -45,7 +45,11 @@ from ..data.native_shm_reader import (
 )
 from ..data.mysql_loader import DailyBasicCache
 from ..factor.base import StockData, StockState
-from ..inference.interface import call_inference
+from ..inference.interface import (
+    call_inference,
+    compute_index_composition,
+    compute_trading_universe,
+)
 from .streaming_engine import (
     _is_trading_hours,
     _time_to_seconds,
@@ -947,6 +951,16 @@ class NativeEngine:
                             portfolio_context = None
                             if portfolio_context_fn is not None:
                                 portfolio_context = portfolio_context_fn(date_str, end_time)
+                            universe_extra = {
+                                "date": date_str,
+                                "end_time": end_time,
+                                "codes": _result_codes(result_df),
+                                "factor_result": result_df,
+                            }
+                            trading_universe_df = compute_trading_universe(
+                                daily_basic_df, universe_extra)
+                            index_composition_df = compute_index_composition(
+                                daily_basic_df, universe_extra)
                             positions_df = call_inference(
                                 inference_fn,
                                 date_str,
@@ -954,6 +968,8 @@ class NativeEngine:
                                 prev_day_factors,
                                 result_df,
                                 daily_basic_df,
+                                trading_universe_df,
+                                index_composition_df,
                                 portfolio_context,
                             )
                             if positions_df is not None and not positions_df.empty:
@@ -1178,6 +1194,14 @@ def _push_to_qmt(positions_df: pd.DataFrame, date_str: str, end_time: str) -> No
                 pass
         if ssh is not None:
             ssh.close()
+
+
+def _result_codes(result_df: pd.DataFrame) -> List[str]:
+    """Extract code values from a factor result DataFrame."""
+    for col in ("code", "Code", "stock_code"):
+        if col in result_df.columns:
+            return result_df[col].dropna().astype(str).tolist()
+    return []
 
 
 def _worker_init(factor_module: str, daily_basic_df: pd.DataFrame,

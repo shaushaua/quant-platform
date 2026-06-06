@@ -41,7 +41,11 @@ import pandas as pd
 
 from .base import StockData
 from ..data.api import DataAPI
-from ..inference.interface import call_inference
+from ..inference.interface import (
+    call_inference,
+    compute_index_composition,
+    compute_trading_universe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +91,8 @@ def calc_factors_by_date_range(
         factor_data_handler:  单票因子计算函数，签名见上。
         outfun:               批次结果处理函数，签名 outfun(date, end_time, test)。
         inference_handler:    推理函数，签名 inference(date, end_time, prev_day_factors,
-                              result_df, daily_basic_df[, portfolio_context]) -> DataFrame。
+                              result_df, daily_basic_df, trading_universe_df,
+                              index_composition_df[, portfolio_context]) -> DataFrame。
         oss_base_path:        OSS 数据根路径，None 时读环境变量。
     """
     api = DataAPI(mode="backtest", oss_base_path=oss_base_path)
@@ -236,6 +241,14 @@ def calc_factors_by_date_range(
                             daily_basic_for_inference)
                         if is_explicit_list and daily_basic_for_inference is None:
                             daily_basic_for_inference = _daily
+                        universe_extra = {
+                            "date": date,
+                            "end_time": end_time,
+                            "codes": _securities,
+                            "factor_result": test,
+                        }
+                        trading_universe_df = compute_trading_universe(_daily, universe_extra)
+                        index_composition_df = compute_index_composition(_daily, universe_extra)
                         positions = call_inference(
                             _infer_fn,
                             date,
@@ -243,6 +256,8 @@ def calc_factors_by_date_range(
                             prev_day_for_inference,
                             test,
                             _daily,
+                            trading_universe_df,
+                            index_composition_df,
                             None,
                         )
                         if positions is not None and not positions.empty:
@@ -312,6 +327,14 @@ def calc_factors_by_date_range(
                             daily_basic_for_inference)
                         if is_explicit_list and daily_basic_for_inference is None:
                             daily_basic_for_inference = _daily
+                        universe_extra = {
+                            "date": date,
+                            "end_time": end_time,
+                            "codes": _securities,
+                            "factor_result": test,
+                        }
+                        trading_universe_df = compute_trading_universe(_daily, universe_extra)
+                        index_composition_df = compute_index_composition(_daily, universe_extra)
                         positions = call_inference(
                             _infer_fn,
                             date,
@@ -319,6 +342,8 @@ def calc_factors_by_date_range(
                             prev_day_for_inference,
                             test,
                             _daily,
+                            trading_universe_df,
+                            index_composition_df,
                             None,
                         )
                         if positions is not None and not positions.empty:
