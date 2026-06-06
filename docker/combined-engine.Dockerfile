@@ -47,7 +47,8 @@ RUN chmod +x /app/entrypoint-combined.sh
 COPY quant_platform/ ./quant_platform/
 
 # Inference dependencies (for trader-provided inference modules)
-RUN pip install --no-cache-dir joblib>=1.3,<2 cloudpickle>=2.2,<4 scikit-learn>=1.3,<2
+# paramiko: SFTP push to QMT Windows machine
+RUN pip install --no-cache-dir "joblib>=1.3,<2" "cloudpickle>=2.2,<4" "scikit-learn>=1.3,<2" "paramiko>=3.0,<4"
 
 ENV LD_LIBRARY_PATH=/opt/native-mdl-collector/lib:/opt/mdl-client
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2

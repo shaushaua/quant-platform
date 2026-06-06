@@ -79,6 +79,19 @@ spec:
               value: "minute"
             - name: DAILY_FACTOR_TRIGGER_TIME
               value: "15:10"
+            # --- QMT SFTP push ---
+            - name: QMT_SFTP_HOST
+              value: ""
+            - name: QMT_SFTP_PORT
+              value: "22"
+            - name: QMT_SFTP_USER
+              value: "quant"
+            - name: QMT_SFTP_KEY
+              value: ""
+            - name: QMT_SFTP_DIR
+              value: "D:\\\\qmt_inbox"
+            - name: QMT_SFTP_TIMEOUT
+              value: "10"
             - name: DATA_FLUSH_INTERVAL
               value: "0.01"
             - name: SHM_STORE_BACKEND

@@ -45,6 +45,7 @@ from ..data.native_shm_reader import (
 )
 from ..data.mysql_loader import DailyBasicCache
 from ..factor.base import StockData, StockState
+from ..inference.interface import call_inference
 from .streaming_engine import (
     _is_trading_hours,
     _time_to_seconds,
@@ -227,6 +228,7 @@ class NativeEngine:
         self.factor_calculation: Optional[Callable] = None
         self.outfun: Optional[Callable] = None
         self.inference_fn: Optional[Callable] = None
+        self.portfolio_context_fn: Optional[Callable] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._schedules: list = []  # List[ComputationSchedule]
         self._last_codes: List[str] = []
@@ -914,9 +916,11 @@ class NativeEngine:
         if not results:
             return
         is_daily = schedule is not None and schedule.is_daily_result
+        run_inference = True if schedule is None else schedule.run_inference
         output_path = self.output_path
         outfun = self.outfun
         inference_fn = self.inference_fn
+        portfolio_context_fn = self.portfolio_context_fn
         daily_basic_df = self._daily_basic_df
         prev_day_factors = self._prev_day_factors
         try:
@@ -938,16 +942,28 @@ class NativeEngine:
                         logger.info("[combined] wrote %s", out_file)
                     if not result_df.empty:
                         _upload_to_oss(result_df, date_str, end_time)
-                    # Inference: only for minute-level (not daily)
-                    if not is_daily and inference_fn is not None and not result_df.empty:
+                    if run_inference and inference_fn is not None and not result_df.empty:
                         try:
-                            positions_df = inference_fn(date_str, end_time, prev_day_factors, result_df, daily_basic_df)
+                            portfolio_context = None
+                            if portfolio_context_fn is not None:
+                                portfolio_context = portfolio_context_fn(date_str, end_time)
+                            positions_df = call_inference(
+                                inference_fn,
+                                date_str,
+                                end_time,
+                                prev_day_factors,
+                                result_df,
+                                daily_basic_df,
+                                portfolio_context,
+                            )
                             if positions_df is not None and not positions_df.empty:
                                 if output_path:
                                     pos_file = output_path / f"{date_str}_{end_time}_positions.csv"
                                     positions_df.to_csv(pos_file, index=False)
                                     logger.info("[inference] wrote %d positions to %s",
                                                 len(positions_df), pos_file)
+                                # Push to QMT via SFTP
+                                _push_to_qmt(positions_df, date_str, end_time)
                         except Exception as exc:
                             logger.error("[inference] failed: %s", exc, exc_info=True)
                     if outfun is not None:
@@ -1002,6 +1018,23 @@ class NativeEngine:
                     logger.warning("[native] inference module %s has no 'inference' function", inference_module)
             except Exception as exc:
                 logger.error("[native] failed to load inference module %s: %s", inference_module, exc)
+
+        # Load portfolio context provider (optional). The provider owns broker/QMT
+        # file access and should expose get_portfolio_context(date_str, end_time).
+        portfolio_context_module = os.environ.get("PORTFOLIO_CONTEXT_MODULE", "")
+        if portfolio_context_module:
+            try:
+                pmod = importlib.import_module(portfolio_context_module)
+                self.portfolio_context_fn = getattr(pmod, "get_portfolio_context", None)
+                if self.portfolio_context_fn:
+                    logger.info("[native] loaded portfolio context: %s", portfolio_context_module)
+                else:
+                    logger.warning("[native] portfolio context module %s has no "
+                                   "'get_portfolio_context' function",
+                                   portfolio_context_module)
+            except Exception as exc:
+                logger.error("[native] failed to load portfolio context module %s: %s",
+                             portfolio_context_module, exc)
 
         # Init pool
         self._init_pool()
@@ -1062,6 +1095,89 @@ class NativeEngine:
         except Exception as exc:
             logger.warning("[native] final archive/upload failed: %s", exc)
         self._release_pool()
+
+
+def _push_to_qmt(positions_df: pd.DataFrame, date_str: str, end_time: str) -> None:
+    """Push positions CSV to QMT Windows machine via SFTP.
+
+    Env vars:
+        QMT_SFTP_HOST:   Windows machine IP (required)
+        QMT_SFTP_PORT:   SSH port (default 22)
+        QMT_SFTP_USER:   SSH username
+        QMT_SFTP_KEY:    Path to SSH private key file
+        QMT_SFTP_DIR:    Remote directory (default D:\\qmt_inbox)
+        QMT_SFTP_PASS:   SSH password (alternative to key)
+        QMT_SFTP_TIMEOUT: SSH/SFTP timeout seconds (default 10)
+    """
+    host = os.environ.get("QMT_SFTP_HOST", "")
+    if not host:
+        return  # not configured
+
+    import io
+    try:
+        import paramiko
+    except ImportError:
+        logger.error("[qmt] paramiko not installed, skip SFTP push")
+        return
+
+    ssh = None
+    sftp = None
+    try:
+        port = int(os.environ.get("QMT_SFTP_PORT", "22"))
+        user = os.environ.get("QMT_SFTP_USER", "quant")
+        key_path = os.environ.get("QMT_SFTP_KEY", "")
+        password = os.environ.get("QMT_SFTP_PASS", "")
+        remote_dir = os.environ.get("QMT_SFTP_DIR", "D:\\\\qmt_inbox")
+        timeout = float(os.environ.get("QMT_SFTP_TIMEOUT", "10"))
+
+        connect_kwargs = {
+            "hostname": host,
+            "port": port,
+            "username": user,
+            "timeout": timeout,
+            "banner_timeout": timeout,
+            "auth_timeout": timeout,
+            "look_for_keys": False,
+            "allow_agent": False,
+        }
+        if key_path and Path(key_path).exists():
+            connect_kwargs["key_filename"] = key_path
+            if password:
+                connect_kwargs["password"] = password
+        elif key_path:
+            logger.warning("[qmt] QMT_SFTP_KEY does not exist: %s", key_path)
+            if password:
+                connect_kwargs["password"] = password
+            else:
+                logger.error("[qmt] no usable QMT_SFTP_KEY or QMT_SFTP_PASS configured")
+                return
+        elif password:
+            connect_kwargs["password"] = password
+        else:
+            logger.error("[qmt] no QMT_SFTP_KEY or QMT_SFTP_PASS configured")
+            return
+
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(**connect_kwargs)
+        sftp = ssh.open_sftp()
+        clean_dir = remote_dir.rstrip("\\/")
+        sep = "\\" if "\\" in remote_dir else "/"
+        remote_file = f"{clean_dir}{sep}{date_str}_{end_time}_positions.csv"
+        csv_bytes = positions_df.to_csv(index=False).encode("utf-8")
+        sftp.putfo(io.BytesIO(csv_bytes), remote_file)
+        logger.info("[qmt] pushed %d positions to %s:%s (%d bytes)",
+                    len(positions_df), host, remote_file, len(csv_bytes))
+    except Exception as exc:
+        logger.error("[qmt] SFTP push failed: %s", exc)
+    finally:
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        if ssh is not None:
+            ssh.close()
 
 
 def _worker_init(factor_module: str, daily_basic_df: pd.DataFrame,

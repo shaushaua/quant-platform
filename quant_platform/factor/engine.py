@@ -34,15 +34,14 @@
 
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 from .base import StockData
 from ..data.api import DataAPI
+from ..inference.interface import call_inference
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +65,15 @@ def calc_factors_by_date_range(
     """
     按日期范围批量计算因子。
 
-    引擎内部执行顺序：
+    引擎内部执行顺序（每只股票只 filter 一次，多个 end_time 复用）：
         for date in trading_days:
+            for code in securities:
+                filtered = filter(bundle, code)      # 只做一次
+                for end_time in end_times:
+                    data = StockData(filtered, end_time)  # 轻量 copy
+                    res  = factor_data_handler(data, code, date, end_time)
             for end_time in end_times:
-                for code in securities:
-                    data  = _build_stock_data(date, end_time, code, factor_info)
-                    res   = factor_data_handler(data, code, date, end_time)
-                test = merge(all_res)          # → pd.DataFrame
+                test = merge(end_time_results[end_time])  # → pd.DataFrame
                 outfun(date, end_time, test)
 
     Args:
@@ -85,7 +86,8 @@ def calc_factors_by_date_range(
         processes:            并行进程数（暂保留参数，当前单进程实现）。
         factor_data_handler:  单票因子计算函数，签名见上。
         outfun:               批次结果处理函数，签名 outfun(date, end_time, test)。
-        inference_handler:    推理函数，签名 inference(date, end_time, result_df, daily_basic_df) -> DataFrame。
+        inference_handler:    推理函数，签名 inference(date, end_time, prev_day_factors,
+                              result_df, daily_basic_df[, portfolio_context]) -> DataFrame。
         oss_base_path:        OSS 数据根路径，None 时读环境变量。
     """
     api = DataAPI(mode="backtest", oss_base_path=oss_base_path)
@@ -128,6 +130,10 @@ def calc_factors_by_date_range(
     _prev_day_result: Optional[pd.DataFrame] = None
 
     for date in trading_days:
+        prev_day_for_inference = _prev_day_result
+        last_result_for_date: Optional[pd.DataFrame] = None
+        daily_basic_for_inference: Optional[pd.DataFrame] = None
+
         # 全市场模式：从 daily_basic 获取股票列表
         if not is_explicit_list:
             daily_basic = api.get_daily_data(date, "daily_basic")
@@ -155,73 +161,90 @@ def calc_factors_by_date_range(
             # 分批加载模式：将全市场股票分批，每批下载一次文件并过滤
             # 避免每只股票单独下载（O(N×4GB)），也避免全量加载 OOM
             # 默认每批 200 只，内存占用约 600MB~1GB/批（deal+tick 合计）
+            #
+            # 循环顺序：batch → code → end_time
+            # 每只股票只 filter 一次，多个 end_time 复用已过滤数据
             BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "200"))
             batches = [_securities[i:i+BATCH_SIZE] for i in range(0, len(_securities), BATCH_SIZE)]
             logger.info("分批加载模式：%d 只股票分 %d 批处理（每批 %d 只）",
                         len(_securities), len(batches), BATCH_SIZE)
 
-            for end_time in _end_times:
-                all_res: list = []
+            # per-end_time result collectors
+            end_time_results: dict = {et: [] for et in _end_times}
 
-                for batch_idx, batch_codes in enumerate(batches):
-                    logger.info("处理批次 %d/%d：%d 只股票", batch_idx+1, len(batches), len(batch_codes))
-                    import time as _time
-                    _t_load = _time.time()
-                    bundle = _load_day_bundle(date, factor_info, api, batch_codes)
-                    _load_elapsed = _time.time() - _t_load
-                    logger.info("[Perf] batch %d/%d _load_day_bundle=%.2fs", batch_idx+1, len(batches), _load_elapsed)
-                    if not is_explicit_list:
-                        bundle.market = daily_basic
+            for batch_idx, batch_codes in enumerate(batches):
+                import time as _time
+                _t_load = _time.time()
+                market_override = (
+                    daily_basic if not is_explicit_list and _uses_current_day_market(factor_info)
+                    else None
+                )
+                bundle = _load_day_bundle(date, factor_info, api, batch_codes,
+                                          market_override=market_override)
+                _load_elapsed = _time.time() - _t_load
+                logger.info("[Perf] batch %d/%d _load_day_bundle=%.2fs", batch_idx+1, len(batches), _load_elapsed)
+                if is_explicit_list and daily_basic_for_inference is None and _uses_current_day_market(factor_info):
+                    daily_basic_for_inference = bundle.market
 
-                    for code in batch_codes:
-                        try:
-                            # 检查是否需要历史窗口
-                            hist_bundles = None
-                            lookback_days = factor_info.get("lookback_days")
-                            if lookback_days:
-                                # lookback_days 支持两种格式：
-                                # - 整数：如 5，自动转换为 [0, 1, 2, 3, 4]（当天 + 前4天）
-                                # - 列表：如 [0, 1, 5]，精确指定哪些天
-                                day_offsets = None
-                                if isinstance(lookback_days, int):
-                                    day_offsets = list(range(0, lookback_days))
-                                elif isinstance(lookback_days, list):
-                                    day_offsets = lookback_days
+                # 预解析 security_id（构建映射字典，O(N) 而非 O(N²)）
+                _id_map = _build_security_id_map(bundle.market)
+                security_id_map = {code: _id_map.get(_code_to_id_qi(code)) for code in batch_codes}
 
-                                if day_offsets:
-                                    # 先从当天的 market 获取 security_id
-                                    id_qi = code.split(".")[0].zfill(6)
-                                    security_id = None
-                                    if not bundle.market.empty:
-                                        rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
-                                        if not rows.empty and "SECURITY_ID" in bundle.market.columns:
-                                            security_id = int(rows.iloc[0]["SECURITY_ID"])
-                                    hist_bundles = _load_history_bundle_by_offsets(date, day_offsets, factor_info, api, code, security_id)
+                # 批量加载历史数据（同一批次共享下载）
+                day_offsets = _parse_day_offsets(factor_info)
+                hist_offsets = _history_load_offsets(day_offsets)
+                hist_by_code: Dict[str, list] = {}
+                if hist_offsets:
+                    hist_by_code = _load_history_bundles_batch(
+                        date, hist_offsets, factor_info, api, batch_codes, security_id_map)
 
-                            stock_data = _build_stock_data(bundle, code, date, end_time, factor_info, api, hist_bundles)
+                for code in batch_codes:
+                    try:
+                        security_id = security_id_map[code]
+
+                        # filter + restore 一次，多个 end_time 复用
+                        fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
+                        if day_offsets:
+                            hist_bundles = _combine_history_bundles(
+                                date, day_offsets, fc, hist_by_code.get(code, []))
+                            _attach_history_to_filtered(fc, hist_bundles)
+
+                        for end_time in _end_times:
+                            stock_data = _stock_data_from_filtered(fc, date, end_time)
                             if _calc_fn is not None:
-                                import time as _time
                                 _t_calc = _time.time()
                                 res = _calc_fn(stock_data, code, date, end_time)
                                 _calc_elapsed = _time.time() - _t_calc
                                 if _calc_elapsed > 1.0:
                                     logger.info("[Perf] %s factor_calculation=%.2fs", code, _calc_elapsed)
                                 if res is not None:
-                                    all_res.append(res)
-                        except Exception as e:
-                            logger.warning(
-                                "因子计算异常 date=%s end_time=%s code=%s: %s",
-                                date, end_time, code, e,
-                            )
+                                    end_time_results[end_time].append(res)
+                    except Exception as e:
+                        logger.warning("因子计算异常 date=%s code=%s: %s", date, code, e)
 
-                    # 批次完成后释放大 DataFrame，避免内存积累
-                    del bundle
+                # 批次完成后释放大 DataFrame，避免内存积累
+                del bundle
 
-                test = _merge_results(all_res)
+            # 按 end_time 汇总结果、运行推理、调用 outfun
+            for end_time in _end_times:
+                test = _merge_results(end_time_results[end_time])
                 if _infer_fn is not None and test is not None and not test.empty:
                     try:
-                        _daily = daily_basic if not is_explicit_list else pd.DataFrame()
-                        positions = _infer_fn(date, end_time, _prev_day_result, test, _daily)
+                        _daily = _daily_basic_for_inference(
+                            api, date, is_explicit_list,
+                            daily_basic if not is_explicit_list else None,
+                            daily_basic_for_inference)
+                        if is_explicit_list and daily_basic_for_inference is None:
+                            daily_basic_for_inference = _daily
+                        positions = call_inference(
+                            _infer_fn,
+                            date,
+                            end_time,
+                            prev_day_for_inference,
+                            test,
+                            _daily,
+                            None,
+                        )
                         if positions is not None and not positions.empty:
                             logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
                     except Exception as e:
@@ -231,74 +254,89 @@ def calc_factors_by_date_range(
                         _out_fn(date, end_time, test)
                     except Exception as e:
                         logger.error("outfun 异常 date=%s end_time=%s: %s", date, end_time, e)
-                # Keep last end_time's result as prev_day for next date
                 if test is not None and not test.empty:
-                    _prev_day_result = test
+                    last_result_for_date = test
         else:
             # 传统模式：预加载全市场数据（适用于小规模股票列表）
-            bundle = _load_day_bundle(date, factor_info, api, _securities)
+            # 循环顺序：code → end_time，每只股票只 filter 一次
+            market_override = (
+                daily_basic if not is_explicit_list and _uses_current_day_market(factor_info)
+                else None
+            )
+            bundle = _load_day_bundle(date, factor_info, api, _securities,
+                                      market_override=market_override)
+            if is_explicit_list and _uses_current_day_market(factor_info):
+                daily_basic_for_inference = bundle.market
 
-            for end_time in _end_times:
-                all_res: list = []
+            end_time_results: dict = {et: [] for et in _end_times}
 
-                for code in _securities:
-                    try:
-                        # 检查是否需要历史窗口
-                        hist_bundles = None
-                        lookback_days = factor_info.get("lookback_days")
-                        if lookback_days:
-                            # lookback_days 支持两种格式：
-                            # - 整数：如 5，自动转换为 [0, 1, 2, 3, 4]（当天 + 前4天）
-                            # - 列表：如 [0, 1, 5]，精确指定哪些天
-                            day_offsets = None
-                            if isinstance(lookback_days, int):
-                                day_offsets = list(range(0, lookback_days))
-                            elif isinstance(lookback_days, list):
-                                day_offsets = lookback_days
+            # 预解析 security_id + 批量加载历史
+            _id_map = _build_security_id_map(bundle.market)
+            security_id_map = {code: _id_map.get(_code_to_id_qi(code)) for code in _securities}
+            day_offsets = _parse_day_offsets(factor_info)
+            hist_offsets = _history_load_offsets(day_offsets)
+            hist_by_code: Dict[str, list] = {}
+            if hist_offsets:
+                hist_by_code = _load_history_bundles_batch(
+                    date, hist_offsets, factor_info, api, _securities, security_id_map)
 
-                            if day_offsets:
-                                # 先从当天的 market 获取 security_id
-                                id_qi = code.split(".")[0].zfill(6)
-                                security_id = None
-                                if not bundle.market.empty:
-                                    rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
-                                    if not rows.empty and "SECURITY_ID" in bundle.market.columns:
-                                        security_id = int(rows.iloc[0]["SECURITY_ID"])
-                                hist_bundles = _load_history_bundle_by_offsets(date, day_offsets, factor_info, api, code, security_id)
+            for code in _securities:
+                try:
+                    security_id = security_id_map[code]
 
-                        stock_data = _build_stock_data(bundle, code, date, end_time, factor_info, api, hist_bundles)
+                    # filter + restore 一次，多个 end_time 复用
+                    fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
+                    if day_offsets:
+                        hist_bundles = _combine_history_bundles(
+                            date, day_offsets, fc, hist_by_code.get(code, []))
+                        _attach_history_to_filtered(fc, hist_bundles)
+
+                    for end_time in _end_times:
+                        stock_data = _stock_data_from_filtered(fc, date, end_time)
                         if _calc_fn is not None:
                             res = _calc_fn(stock_data, code, date, end_time)
                             if res is not None:
-                                all_res.append(res)
-                    except Exception as e:
-                        logger.warning(
-                            "因子计算异常 date=%s end_time=%s code=%s: %s",
-                            date, end_time, code, e,
+                                end_time_results[end_time].append(res)
+                except Exception as e:
+                    logger.warning("因子计算异常 date=%s code=%s: %s", date, code, e)
+
+            # 按 end_time 汇总结果、运行推理、调用 outfun
+            for end_time in _end_times:
+                test = _merge_results(end_time_results[end_time])
+
+                if _infer_fn is not None and test is not None and not test.empty:
+                    try:
+                        _daily = _daily_basic_for_inference(
+                            api, date, is_explicit_list,
+                            daily_basic if not is_explicit_list else None,
+                            daily_basic_for_inference)
+                        if is_explicit_list and daily_basic_for_inference is None:
+                            daily_basic_for_inference = _daily
+                        positions = call_inference(
+                            _infer_fn,
+                            date,
+                            end_time,
+                            prev_day_for_inference,
+                            test,
+                            _daily,
+                            None,
                         )
+                        if positions is not None and not positions.empty:
+                            logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
+                    except Exception as e:
+                        logger.error("inference 异常 date=%s end_time=%s: %s", date, end_time, e)
 
-            test = _merge_results(all_res)
+                if _out_fn is not None:
+                    try:
+                        _out_fn(date, end_time, test)
+                    except Exception as e:
+                        logger.error("outfun 异常 date=%s end_time=%s: %s", date, end_time, e)
 
-            if _infer_fn is not None and test is not None and not test.empty:
-                try:
-                    _daily = api.get_daily_data(date, "daily_basic") if is_explicit_list else daily_basic
-                    positions = _infer_fn(date, end_time, _prev_day_result, test, _daily)
-                    if positions is not None and not positions.empty:
-                        logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
-                except Exception as e:
-                    logger.error("inference 异常 date=%s end_time=%s: %s", date, end_time, e)
+                if test is not None and not test.empty:
+                    last_result_for_date = test
 
-            if _out_fn is not None:
-                try:
-                    _out_fn(date, end_time, test)
-                except Exception as e:
-                    logger.error(
-                        "outfun 异常 date=%s end_time=%s: %s", date, end_time, e
-                    )
-
-        # Keep last end_time's result as prev_day for next date
-        if test is not None and not test.empty:
-            _prev_day_result = test
+        if last_result_for_date is not None and not last_result_for_date.empty:
+            _prev_day_result = last_result_for_date
 
     logger.info("因子计算完成")
 
@@ -327,7 +365,8 @@ class _DayBundle:
         self.market = market
 
 
-def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: List[str] = None) -> _DayBundle:
+def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: List[str] = None,
+                     market_override: Optional[pd.DataFrame] = None) -> _DayBundle:
     """
     按 factor_info 加载当日全市场四分数据。
     只加载 factor_info 中声明需要的数据类型，减少不必要 IO。
@@ -344,7 +383,7 @@ def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: Lis
     l2_order = _safe_load("order", codes=codes) if factor_info.get("need_l2_order") else pd.DataFrame()
     l2_deal  = _safe_load("deal",  codes=codes) if factor_info.get("need_l2_deal")  else pd.DataFrame()
     l1_tick  = _safe_load("tick",  codes=codes) if factor_info.get("need_l1_tick")  else pd.DataFrame()
-    market   = _safe_load("daily_basic")
+    market = market_override if market_override is not None else _safe_load("daily_basic")
 
     logger.info(
         "[数据加载] date=%s codes=%d order=%d行 deal=%d行 tick=%d行 market=%d行",
@@ -443,192 +482,274 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     return df
 
 
-def _load_history_bundle_by_offsets(
-    target_date: str,
-    day_offsets: List[int],
-    factor_info: Dict,
-    api: DataAPI,
-    code: str,
-    security_id: Optional[int],
-) -> List[_DayBundle]:
-    """
-    根据日期偏移列表加载历史数据包。
-
-    Args:
-        target_date: 目标日期（如 "20250110"）
-        day_offsets: 日期偏移列表，[0]=当天, [1]=1天前, [2]=2天前
-                     例如 [0, 1, 2] 表示加载当天、1天前、2天前
-        factor_info: 数据需求配置
-        api: DataAPI 实例
-        code: 股票代码（如 "000001.SZ"）
-        security_id: SECURITY_ID 整数
-
-    Returns:
-        List[_DayBundle]，按 day_offsets 顺序排列
-        例如 day_offsets=[0,1], target_date="20250110"，
-        返回 [bundle_20250110, bundle_20250109]
-    """
-    if not day_offsets:
-        return []
-
-    bundles = []
-    # 计算需要加载的最大偏移量，用于获取交易日列表
+def _resolve_hist_dates(target_date: str, day_offsets: List[int], api: DataAPI) -> List[Optional[str]]:
+    """根据 day_offsets 计算历史交易日列表。"""
     max_offset = max(day_offsets) if day_offsets else 0
 
     try:
-        # 获取足够大的交易日范围
         start_date = _shift_date_str(target_date, -max_offset - 10)
         all_trading_days = api.get_trading_days(start_date, target_date)
     except Exception:
-        # 回退到简单的日期递推
         all_trading_days = []
         d = _shift_date_str(target_date, -max_offset - 10)
         while d <= target_date:
             all_trading_days.append(d)
             d = _shift_date_str(d, 1)
 
-    # 找到目标日期在交易日列表中的索引
     try:
         target_idx = all_trading_days.index(target_date)
     except ValueError:
         target_idx = len(all_trading_days) - 1
 
-    # 根据 day_offsets 加载对应日期的数据
+    hist_dates = []
     for offset in day_offsets:
         if offset < 0:
+            hist_dates.append(None)
             continue
         hist_idx = target_idx - offset
-        if 0 <= hist_idx < len(all_trading_days):
-            hist_date = all_trading_days[hist_idx]
+        hist_dates.append(all_trading_days[hist_idx] if 0 <= hist_idx < len(all_trading_days) else None)
+    return hist_dates
 
+
+def _load_history_bundles_batch(
+    target_date: str,
+    day_offsets: List[int],
+    factor_info: Dict,
+    api: DataAPI,
+    batch_codes: List[str],
+    security_id_map: Dict[str, Optional[int]],
+) -> Dict[str, List[_DayBundle]]:
+    """批量加载历史数据：同一批次所有 code 共享下载，按 code 过滤分发。
+
+    对每个历史日期只下载一次（传 batch_codes），然后按 code 分发。
+    避免 N 个 code × M 个历史日 = N×M 次下载。
+
+    Returns:
+        dict: {code: List[_DayBundle]} 按 day_offsets 顺序排列
+    """
+    hist_dates = _resolve_hist_dates(target_date, day_offsets, api)
+
+    result: Dict[str, List[_DayBundle]] = {code: [] for code in batch_codes}
+    filtered_cache: Dict[str, Dict[str, _DayBundle]] = {}
+
+    for hist_date in hist_dates:
+        if hist_date is None:
+            for code in batch_codes:
+                result[code].append(_DayBundle(
+                    date="", l2_order=pd.DataFrame(), l2_deal=pd.DataFrame(),
+                    l1_tick=pd.DataFrame(), market=pd.DataFrame(),
+                ))
+            continue
+
+        filtered_for_date = filtered_cache.get(hist_date)
+        if filtered_for_date is None:
             def _safe_load(data_type: str) -> pd.DataFrame:
                 try:
-                    df = api.get_daily_data(hist_date, data_type, codes=[code])
-                    return df
+                    return api.get_daily_data(hist_date, data_type, codes=batch_codes)
                 except Exception as e:
-                    logger.debug("加载历史 %s %s %s 失败: %s", hist_date, code, data_type, e)
+                    logger.debug("加载历史 %s %s 失败: %s", hist_date, data_type, e)
                     return pd.DataFrame()
 
-            l2_order = _safe_load("order") if factor_info.get("need_l2_order") else pd.DataFrame()
-            l2_deal = _safe_load("deal") if factor_info.get("need_l2_deal") else pd.DataFrame()
-            l1_tick = _safe_load("tick") if factor_info.get("need_l1_tick") else pd.DataFrame()
-            market = _safe_load("daily_basic")
-
-            bundles.append(_DayBundle(
+            full = _DayBundle(
                 date=hist_date,
-                l2_order=l2_order,
-                l2_deal=l2_deal,
-                l1_tick=l1_tick,
-                market=market,
-            ))
+                l2_order=_safe_load("order") if factor_info.get("need_l2_order") else pd.DataFrame(),
+                l2_deal=_safe_load("deal") if factor_info.get("need_l2_deal") else pd.DataFrame(),
+                l1_tick=_safe_load("tick") if factor_info.get("need_l1_tick") else pd.DataFrame(),
+                market=pd.DataFrame(),
+            )
 
-    return bundles
+            filtered_for_date = {}
+            for code in batch_codes:
+                security_id = security_id_map.get(code)
+                fc = _filter_code_from_bundle(full, code, security_id, factor_info)
+                filtered_for_date[code] = _DayBundle(
+                    date=hist_date,
+                    l2_order=fc.l2_order,
+                    l2_deal=fc.l2_deal,
+                    l1_tick=fc.l1_tick,
+                    market=fc.market,
+                )
+            filtered_cache[hist_date] = filtered_for_date
+            del full
+
+        for code in batch_codes:
+            result[code].append(filtered_for_date[code])
+
+    return result
 
 
-def _build_stock_data(
+class _FilteredCode:
+    """单只股票的已过滤数据（全天），可按 end_time 重复创建 StockData。"""
+    __slots__ = ("code", "security_id", "l2_order", "l2_deal", "l1_tick",
+                 "market", "l2_order_hist", "l2_deal_hist", "l1_tick_hist")
+
+    def __init__(self, code: str, security_id: Optional[int],
+                 l2_order: pd.DataFrame, l2_deal: pd.DataFrame,
+                 l1_tick: pd.DataFrame, market: pd.DataFrame,
+                 l2_order_hist: list, l2_deal_hist: list, l1_tick_hist: list):
+        self.code = code
+        self.security_id = security_id
+        self.l2_order = l2_order
+        self.l2_deal = l2_deal
+        self.l1_tick = l1_tick
+        self.market = market
+        self.l2_order_hist = l2_order_hist
+        self.l2_deal_hist = l2_deal_hist
+        self.l1_tick_hist = l1_tick_hist
+
+
+def _resolve_security_id(market_df: pd.DataFrame, code: str,
+                        _id_map: Optional[Dict[str, int]] = None) -> Optional[int]:
+    """从 daily_basic(market) 中查找 code 对应的 SECURITY_ID 整数。"""
+    if market_df.empty or "ID_QI" not in market_df.columns or "SECURITY_ID" not in market_df.columns:
+        return None
+    id_qi = _code_to_id_qi(code)
+    if _id_map is not None:
+        return _id_map.get(id_qi)
+    rows = market_df[market_df["ID_QI"].astype(str).str.zfill(6) == id_qi]
+    if not rows.empty:
+        return int(rows.iloc[0]["SECURITY_ID"])
+    return None
+
+
+def _build_security_id_map(market_df: pd.DataFrame) -> Dict[str, int]:
+    """一次性构建 ID_QI → SECURITY_ID 映射，避免逐股全表扫描。"""
+    if market_df.empty or "ID_QI" not in market_df.columns or "SECURITY_ID" not in market_df.columns:
+        return {}
+    id_qi = market_df["ID_QI"].astype(str).str.zfill(6)
+    return dict(zip(id_qi, market_df["SECURITY_ID"].astype(int)))
+
+
+def _filter_code_from_bundle(
     bundle: _DayBundle,
     code: str,
-    date: str,
-    end_time: str,
+    security_id: Optional[int] = None,
     factor_info: Optional[Dict] = None,
-    api: Optional[DataAPI] = None,
     hist_bundles: Optional[List[_DayBundle]] = None,
-) -> StockData:
-    """
-    从全市场数据包中过滤出单只股票的数据，组装成 StockData。
-    过滤列优先尝试 "Code"，其次 "stock_code"。
-    大文件（tick/order/deal）的 Code 列是 SECURITY_ID 整数，
-    需从 market(daily_basic) 的 ID_QI/SECURITY_ID 映射转换。
+) -> _FilteredCode:
+    """从全市场数据包中过滤出单只股票的全天数据（只做一次）。
 
-    Args:
-        bundle: 当日数据包
-        code: 股票代码
-        date: 日期
-        end_time: 时间切片
-        factor_info: 数据需求配置（用于历史窗口）
-        api: DataAPI 实例（用于历史窗口）
-        hist_bundles: 历史数据包列表（用于历史窗口）
+    包含 _restore_oss_precision + 历史 lookback，结果可在多个 end_time 间复用。
+    security_id 由调用方通过 _resolve_security_id 预先查找，避免重复。
     """
-    # 从 market 数据推导 security_id（整数）
-    id_qi = code.split(".")[0].zfill(6)  # "000001.SZ" -> "000001"
-    security_id: Optional[int] = None
-    if not bundle.market.empty and "ID_QI" in bundle.market.columns and "SECURITY_ID" in bundle.market.columns:
-        rows = bundle.market[bundle.market["ID_QI"].astype(str) == id_qi]
-        if not rows.empty:
-            security_id = int(rows.iloc[0]["SECURITY_ID"])
-            logger.debug("[ID映射] %s -> SECURITY_ID=%d", code, security_id)
-        else:
-            logger.warning("[ID映射] %s 未在 daily_basic 中找到 SECURITY_ID", code)
 
     def _filter(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        # 1) 大文件列: Code (整数 SECURITY_ID)
         for col in ("Code", "stock_code", "code"):
             if col in df.columns:
                 if pd.api.types.is_integer_dtype(df[col]) and security_id is not None:
                     return df[df[col] == security_id].reset_index(drop=True)
-                return df[df[col] == code].reset_index(drop=True)
-        # 2) daily_basic 列: SECURITY_ID (整数) 或 ID_QI (6位字符串)
+                exact = df[df[col] == code]
+                if not exact.empty:
+                    return exact.reset_index(drop=True)
+                id_qi = _code_to_id_qi(code)
+                normalized = df[col].astype(str).str.split(".").str[0].str.zfill(6)
+                return df[normalized == id_qi].reset_index(drop=True)
         if "SECURITY_ID" in df.columns and security_id is not None:
             return df[df["SECURITY_ID"] == security_id].reset_index(drop=True)
         if "ID_QI" in df.columns:
-            return df[df["ID_QI"].astype(str) == id_qi].reset_index(drop=True)
-        return df  # 无可识别的 code 列时原样返回
+            id_qi = _code_to_id_qi(code)
+            return df[df["ID_QI"].astype(str).str.zfill(6) == id_qi].reset_index(drop=True)
+        return df
 
-    l2_order_data = _restore_oss_precision(_filter(bundle.l2_order), code)
-    l2_deal_data = _restore_oss_precision(_filter(bundle.l2_deal), code)
-    l1_tick_data = _restore_oss_precision(_filter(bundle.l1_tick), code)
-    market_data = _filter(bundle.market)
+    l2_order = _restore_oss_precision(_filter(bundle.l2_order), code)
+    l2_deal = _restore_oss_precision(_filter(bundle.l2_deal), code)
+    l1_tick = _restore_oss_precision(_filter(bundle.l1_tick), code)
+    market = _filter(bundle.market)
 
-    if any(len(d) > 0 for d in [l2_order_data, l2_deal_data, l1_tick_data, market_data]):
-        price_col = "Price"
+    l2_order_hist: list = []
+    l2_deal_hist: list = []
+    l1_tick_hist: list = []
+
+    if hist_bundles:
+        for hist_bundle in hist_bundles:
+            l2_order_hist.append(hist_bundle.l2_order)
+            l2_deal_hist.append(hist_bundle.l2_deal)
+            l1_tick_hist.append(hist_bundle.l1_tick)
+
+    return _FilteredCode(code, security_id, l2_order, l2_deal, l1_tick, market,
+                         l2_order_hist, l2_deal_hist, l1_tick_hist)
+
+
+def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str) -> StockData:
+    """从已过滤数据创建 StockData（轻量，每个 end_time 调用一次）。"""
+    if any(len(d) > 0 for d in [fc.l2_order, fc.l2_deal, fc.l1_tick, fc.market]):
         price_sample = None
-        if not l2_deal_data.empty and price_col in l2_deal_data.columns:
-            price_sample = l2_deal_data[price_col].iloc[0]
-        elif not l2_order_data.empty and price_col in l2_order_data.columns:
-            price_sample = l2_order_data[price_col].iloc[0]
+        if not fc.l2_deal.empty and "Price" in fc.l2_deal.columns:
+            price_sample = fc.l2_deal["Price"].iloc[0]
+        elif not fc.l2_order.empty and "Price" in fc.l2_order.columns:
+            price_sample = fc.l2_order["Price"].iloc[0]
         logger.info(
-            "[StockData] %s date=%s order=%d行 deal=%d行 tick=%d行 market=%d行 Price样本=%s",
-            code, date, len(l2_order_data), len(l2_deal_data),
-            len(l1_tick_data), len(market_data),
+            "[StockData] %s date=%s end_time=%s order=%d行 deal=%d行 tick=%d行 "
+            "market=%d行 Price样本=%s",
+            fc.code, date, end_time, len(fc.l2_order), len(fc.l2_deal),
+            len(fc.l1_tick), len(fc.market),
             f"{price_sample:.2f}" if price_sample is not None else "N/A",
         )
-
-    # 构建历史列表（如果启用 lookback_days）
-    l2_order_hist = []
-    l2_deal_hist = []
-    l1_tick_hist = []
-
-    if factor_info and factor_info.get("lookback_days", 0) > 0 and hist_bundles:
-        # hist_bundles 已是按日期升序排列的历史数据包
-        for hist_bundle in hist_bundles:
-            l2_order_hist.append(_restore_oss_precision(_filter(hist_bundle.l2_order), code))
-            l2_deal_hist.append(_restore_oss_precision(_filter(hist_bundle.l2_deal), code))
-            l1_tick_hist.append(_restore_oss_precision(_filter(hist_bundle.l1_tick), code))
-
-        logger.debug(
-            "[历史窗口] %s date=%s offsets=%s 历史列表长度: order=%d deal=%d tick=%d",
-            code, date, factor_info.get("lookback_days"),
-            len(l2_order_hist), len(l2_deal_hist), len(l1_tick_hist),
-        )
-
-    # 深拷贝所有 DataFrame，策略代码可能使用链式赋值修改数据，
-    # pandas 2.x CoW 下链式赋值修改的是临时副本，导致结果全 NaN。
-    # 给策略独立副本避免此问题。
     return StockData(
-        code=code,
+        code=fc.code,
         date=date,
         end_time=end_time,
-        l2_order=l2_order_data.copy(),
-        l2_deal=l2_deal_data.copy(),
-        l1_tick=l1_tick_data.copy(),
-        market=market_data.copy(),
-        daily_basic=market_data.copy(),
-        l2_order_hist=[df.copy() for df in l2_order_hist],
-        l2_deal_hist=[df.copy() for df in l2_deal_hist],
-        l1_tick_hist=[df.copy() for df in l1_tick_hist],
+        l2_order=fc.l2_order.copy(),
+        l2_deal=fc.l2_deal.copy(),
+        l1_tick=fc.l1_tick.copy(),
+        market=fc.market.copy(),
+        daily_basic=fc.market.copy(),
+        l2_order_hist=[df.copy() for df in fc.l2_order_hist],
+        l2_deal_hist=[df.copy() for df in fc.l2_deal_hist],
+        l1_tick_hist=[df.copy() for df in fc.l1_tick_hist],
     )
+
+
+def _history_load_offsets(day_offsets: Optional[List[int]]) -> List[int]:
+    """Return offsets that require an extra historical load.
+
+    Offset 0 is the target day and is already available in the current bundle.
+    """
+    if not day_offsets:
+        return []
+    return [offset for offset in day_offsets if offset != 0]
+
+
+def _combine_history_bundles(
+    date: str,
+    day_offsets: List[int],
+    fc: _FilteredCode,
+    loaded_bundles: List[_DayBundle],
+) -> List[_DayBundle]:
+    """Combine current-day filtered data with separately loaded history.
+
+    The returned list preserves the factor_info["lookback_days"] offset order:
+    [0, 1, 2] means [today, previous trading day, two trading days ago].
+    """
+    loaded_iter = iter(loaded_bundles)
+    combined: List[_DayBundle] = []
+    for offset in day_offsets:
+        if offset == 0:
+            combined.append(_DayBundle(
+                date=date,
+                l2_order=fc.l2_order,
+                l2_deal=fc.l2_deal,
+                l1_tick=fc.l1_tick,
+                market=fc.market,
+            ))
+        else:
+            combined.append(next(loaded_iter, _DayBundle(
+                date="",
+                l2_order=pd.DataFrame(),
+                l2_deal=pd.DataFrame(),
+                l1_tick=pd.DataFrame(),
+                market=pd.DataFrame(),
+            )))
+    return combined
+
+
+def _attach_history_to_filtered(fc: _FilteredCode, hist_bundles: List[_DayBundle]) -> None:
+    """Attach lookback lists to a filtered code object without re-filtering."""
+    fc.l2_order_hist = [bundle.l2_order for bundle in hist_bundles]
+    fc.l2_deal_hist = [bundle.l2_deal for bundle in hist_bundles]
+    fc.l1_tick_hist = [bundle.l1_tick for bundle in hist_bundles]
 
 
 def _merge_results(all_res: list) -> pd.DataFrame:
@@ -639,6 +760,26 @@ def _merge_results(all_res: list) -> pd.DataFrame:
     if not all_res:
         return pd.DataFrame()
     return pd.DataFrame(all_res)
+
+
+def _daily_basic_for_inference(
+    api: DataAPI,
+    date: str,
+    is_explicit_list: bool,
+    daily_basic: Optional[pd.DataFrame],
+    cached_daily_basic: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Return current-day daily_basic for inference without per-end_time reloads."""
+    if not is_explicit_list:
+        return daily_basic if daily_basic is not None else pd.DataFrame()
+    if cached_daily_basic is not None:
+        return cached_daily_basic
+    return api.get_daily_data(date, "daily_basic")
+
+
+def _uses_current_day_market(factor_info: Dict) -> bool:
+    """Return True when bundle.market is current-day daily_basic, not history."""
+    return int(factor_info.get("market_count", 1)) <= 1
 
 
 def _shift_date_str(date_str: str, days: int) -> str:
@@ -659,3 +800,20 @@ def _fallback_trading_days(start_date: str, end_date: str) -> List[str]:
             dates.append(cur.strftime(fmt))
         cur += timedelta(days=1)
     return dates
+
+
+def _parse_day_offsets(factor_info: Dict) -> Optional[List[int]]:
+    """从 factor_info 解析 lookback_days，返回 day_offsets 列表或 None。"""
+    lookback_days = factor_info.get("lookback_days")
+    if not lookback_days:
+        return None
+    if isinstance(lookback_days, int):
+        return list(range(0, lookback_days))
+    if isinstance(lookback_days, list):
+        return lookback_days
+    return None
+
+
+def _code_to_id_qi(code) -> str:
+    """Normalize code-like values to six-digit ID_QI."""
+    return str(code).split(".")[0].zfill(6)

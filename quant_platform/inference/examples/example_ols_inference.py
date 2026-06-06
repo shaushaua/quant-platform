@@ -816,7 +816,8 @@ if __name__ == "__main__":
 # The NativeEngine calls this function when INFERENCE_MODULE points to this file.
 #
 # Contract:
-#   inference(date_str, end_time, prev_day_factors, intraday_factors, daily_basic_df) -> pd.DataFrame
+#   inference(date_str, end_time, prev_day_factors, intraday_factors,
+#             daily_basic_df, portfolio_context=None) -> pd.DataFrame
 #   Returns: DataFrame with at least columns [code, pred, position]
 #
 _MODEL_ARTIFACT = None  # lazy-loaded on first call
@@ -825,7 +826,8 @@ _MODEL_ARTIFACT = None  # lazy-loaded on first call
 def inference(date_str: str, end_time: str,
               prev_day_factors_df: pd.DataFrame,
               intraday_factors_df: pd.DataFrame,
-              daily_basic_df: pd.DataFrame = None) -> pd.DataFrame:
+              daily_basic_df: pd.DataFrame = None,
+              portfolio_context=None) -> pd.DataFrame:
     """Called by engine after each factor computation round.
 
     Args:
@@ -836,6 +838,8 @@ def inference(date_str: str, end_time: str,
         intraday_factors_df: Current round's factor results (intraday, minute-level).
         daily_basic_df: Engine's daily_basic DataFrame with market data
                         (risk factors, industry factors, daily features).
+        portfolio_context: Optional current account snapshot supplied by the engine.
+                           It may contain positions/account/orders/deals DataFrames.
 
     Returns:
         DataFrame with code, pred, position columns.
@@ -851,6 +855,12 @@ def inference(date_str: str, end_time: str,
 
     # Use intraday factors as primary input
     df = normalize_factor_keys(intraday_factors_df)
+
+    if portfolio_context is not None:
+        current_positions = getattr(portfolio_context, "positions", pd.DataFrame())
+        if current_positions is not None and not current_positions.empty:
+            print(f"[inference] current account positions={len(current_positions)} "
+                  f"as_of={getattr(portfolio_context, 'as_of', '')}")
 
     # Merge previous day's factors if available
     if prev_day_factors_df is not None and not prev_day_factors_df.empty:

@@ -14,7 +14,8 @@
 def inference(date_str: str, end_time: str,
               prev_day_factors_df: pd.DataFrame,
               intraday_factors_df: pd.DataFrame,
-              daily_basic_df: pd.DataFrame) -> pd.DataFrame:
+              daily_basic_df: pd.DataFrame,
+              portfolio_context: PortfolioContext | None = None) -> pd.DataFrame:
     """
     引擎每轮调用一次。
 
@@ -25,6 +26,8 @@ def inference(date_str: str, end_time: str,
         intraday_factors_df:  当轮因子计算结果（分钟级特征）
         daily_basic_df:       daily_basic 市场数据
                               (risk factors, industry factors, daily features)
+        portfolio_context:    当前账户上下文。实盘由引擎注入；回测/无配置时为 None。
+                              老版本 inference 不声明该参数也兼容。
 
     返回:
         DataFrame, 至少包含以下列:
@@ -38,7 +41,7 @@ def inference(date_str: str, end_time: str,
     """
 ```
 
-## 三份输入数据
+## 四份输入数据
 
 ### 1. prev_day_factors_df — 前一交易日日频因子
 
@@ -83,6 +86,51 @@ def inference(date_str: str, end_time: str,
 | `BETA`, `MOMENTUM`, `SIZE`, ... | 10 个 risk factors |
 | `Agriculture`, `Banks`, `Steel`, ... | 行业分类因子 |
 | `open`, `high`, `low`, `close`, `volume`, ... | 日线特征 |
+
+### 4. portfolio_context — 当前账户上下文
+
+该参数用于把 QMT 当前持仓、资金、委托、成交传给交易员推理模块。引擎负责从
+QMT 数据导出文件 / SFTP / 后续 broker adapter 获取账户快照，交易员模块只消费
+这个只读对象，不直接读 QMT 文件、不直接下单。
+
+`portfolio_context` 类型为 `quant_platform.inference.interface.PortfolioContext`：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `account_id` | str | 资金账号 |
+| `broker` | str | 来源，如 `qmt` |
+| `account_type` | str | 账号类型，如 `2` 股票、`3` 信用 |
+| `as_of` | str | 快照时间，如 `20260607 09:35:00` |
+| `source` | str | 快照来源，如 `sftp://.../exports` |
+| `positions` | DataFrame | 当前持仓 |
+| `account` | DataFrame | 当前资金/资产 |
+| `orders` | DataFrame | 当日委托 |
+| `deals` | DataFrame | 当日成交 |
+| `meta` | dict | 额外元信息，如文件 mtime、延迟、校验状态 |
+
+建议标准化后的 `positions` 至少包含：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `code` | str | 标准股票代码，如 `600000.SH` |
+| `current_volume` | int | 当前持仓数量 |
+| `available_volume` | int | 当前可卖数量 |
+| `market_value` | float | 当前市值 |
+| `cost_price` | float | 成本价，可选 |
+| `last_price` | float | 最新价，可选 |
+
+建议标准化后的 `account` 至少包含：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `account_id` | str | 资金账号 |
+| `total_asset` | float | 总资产 |
+| `available_cash` | float | 可用资金 |
+| `market_value` | float | 持仓市值 |
+
+交易员模块可以用它做当前仓位感知，例如避免重复买入、限制卖出数量、根据现金
+调整目标仓位。但最终仍建议返回“目标仓位/目标股数”，由引擎或 QMT adapter
+统一转换成 QMT 下单文件。
 
 ## 输出 DataFrame 格式
 
@@ -141,7 +189,8 @@ def _get_model():
 ### 2. 实现 inference()
 
 ```python
-def inference(date_str, end_time, prev_day_factors_df, intraday_factors_df, daily_basic_df):
+def inference(date_str, end_time, prev_day_factors_df, intraday_factors_df,
+              daily_basic_df, portfolio_context=None):
     artifact = _get_model()
     model = artifact["model"]
     features = artifact["features"]
@@ -162,6 +211,10 @@ def inference(date_str, end_time, prev_day_factors_df, intraday_factors_df, dail
     x = build_feature_matrix(df, features, medians, feature_transform)
     df["pred"] = model.predict(x)
     df["position"] = make_tail_positions(df["pred"], df["_date"], tail_frac=0.10)
+
+    if portfolio_context is not None and not portfolio_context.positions.empty:
+        current_pos = portfolio_context.positions[["code", "current_volume", "available_volume"]]
+        df = df.merge(current_pos, on="code", how="left")
 
     return df[df["position"] != 0.0][["code", "pred", "position"]]
 ```
@@ -189,7 +242,18 @@ quant_platform/inference/examples/
 ```yaml
 - name: INFERENCE_MODULE
   value: "quant_platform.inference.examples.my_inference"
+- name: PORTFOLIO_CONTEXT_MODULE
+  value: "quant_platform.broker.qmt_context"
 ```
+
+`PORTFOLIO_CONTEXT_MODULE` 可选。配置后模块需实现：
+
+```python
+def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
+    ...
+```
+
+如果不配置，`portfolio_context` 为 `None`，旧交易员模块不受影响。
 
 **回测**：代码调用
 ```python
@@ -205,8 +269,9 @@ calc_factors_by_date_range(
 
 ## 注意事项
 
-1. **不要在 `inference()` 里读写文件** — 引擎已处理输出
+1. **不要在 `inference()` 里读写文件** — 引擎已处理因子、市场数据和账户上下文
 2. **推理模块应自包含** — 不依赖 `quant_platform` 其他模块
 3. **异常自行捕获** — 返回空 DataFrame，不要抛异常
 4. **性能** — 推理在 fork 子进程中执行（实盘），尽量 < 5 秒
 5. **模型文件** — bake 进 Docker 镜像，避免运行时下载
+6. **不要在推理模块直接下单** — 返回目标，由引擎/QMT adapter 统一转换
