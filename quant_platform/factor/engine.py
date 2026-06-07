@@ -249,7 +249,7 @@ def calc_factors_by_date_range(
                             # --- PARALLEL: reuse pool, submit+harvest pipeline ---
                             _t_par = _time.time()
                             n_codes = 0
-                            max_inflight = processes  # limit pending futures to control memory on 4C8G workers
+                            max_inflight = processes * 2  # allow pipelining: main filters ahead while workers compute
                             futures = {}
                             submitted_at = {}
 
@@ -265,19 +265,32 @@ def calc_factors_by_date_range(
 
                                 try:
                                     security_id = security_id_map[code]
-                                    fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
+                                    _t_filter = _time.time()
+                                    fc = _filter_code_from_bundle(
+                                        bundle, code, security_id, factor_info,
+                                        _perf_log=(n_codes < 10))
+                                    _t_filter_elapsed = _time.time() - _t_filter
                                     if day_offsets:
                                         hist_bundles = _combine_history_bundles(
                                             date, day_offsets, fc, hist_by_code.get(code, []))
                                         _attach_history_to_filtered(fc, hist_bundles)
+                                    _t_ser = _time.time()
+                                    fc_dict = _filtered_code_to_dict(fc)
+                                    _t_pickle = _time.time()
                                     future = pool.submit(
                                         _compute_code_all_endtimes,
-                                        _filtered_code_to_dict(fc), date, _end_times, _calc_fn,
+                                        fc_dict, date, _end_times, _calc_fn,
                                     )
+                                    _t_submit_elapsed = _time.time() - _t_ser
                                     futures[future] = code
                                     submitted_at[future] = _time.time()
                                     n_codes += 1
                                     del fc
+                                    if n_codes <= 5 or _t_filter_elapsed > 1.0 or _t_submit_elapsed > 1.0:
+                                        logger.info(
+                                            "[Perf] code=%s filter=%.3fs pickle=%.3fs submit=%.3fs",
+                                            code, _t_filter_elapsed,
+                                            _t_pickle - _t_ser, _t_submit_elapsed)
                                 except Exception as e:
                                     logger.warning("Filter failed code=%s: %s", code, e)
 
@@ -765,6 +778,8 @@ def _compute_code_all_endtimes(
 
     Returns dict: {end_time: result_or_None}
     """
+    import time as _wtime
+    _t0 = _wtime.time()
     fc = _FilteredCode(
         code=fc_data["code"],
         security_id=fc_data["security_id"],
@@ -776,16 +791,27 @@ def _compute_code_all_endtimes(
         l2_deal_hist=fc_data["l2_deal_hist"],
         l1_tick_hist=fc_data["l1_tick_hist"],
     )
+    _t_deser = _wtime.time()
     results = {}
+    _slow_count = 0
     for end_time in end_times:
         try:
             stock_data = _stock_data_from_filtered(fc, date, end_time, zero_copy=True)
+            _t1 = _wtime.time()
             res = calc_fn(stock_data, fc.code, date, end_time)
+            _t_calc = _wtime.time() - _t1
+            if _t_calc > 0.1:
+                _slow_count += 1
             results[end_time] = res
         except Exception as e:
             logger.warning("Worker: factor_calculation failed code=%s end_time=%s: %s",
                           fc.code, end_time, e)
             results[end_time] = None
+    _t_total = _wtime.time() - _t0
+    if _t_total > 2.0:
+        logger.info("[Worker] code=%s total=%.2fs deser=%.3fs calc=%d×%d slow_et=%d",
+                    fc.code, _t_total, _t_deser - _t0, len(end_times), len(results),
+                    _slow_count)
     return results
 
 
@@ -861,12 +887,14 @@ def _filter_code_from_bundle(
     security_id: Optional[int] = None,
     factor_info: Optional[Dict] = None,
     hist_bundles: Optional[List[_DayBundle]] = None,
+    _perf_log: bool = False,
 ) -> _FilteredCode:
     """从全市场数据包中过滤出单只股票的全天数据（只做一次）。
 
     包含 _restore_oss_precision + 历史 lookback，结果可在多个 end_time 间复用。
     security_id 由调用方通过 _resolve_security_id 预先查找，避免重复。
     """
+    import time as _ptime
 
     def _filter(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
@@ -888,10 +916,31 @@ def _filter_code_from_bundle(
             return df[df["ID_QI"].astype(str).str.zfill(6) == id_qi].reset_index(drop=True)
         return df
 
-    l2_order = _restore_oss_precision(_filter(bundle.l2_order), code)
-    l2_deal = _restore_oss_precision(_filter(bundle.l2_deal), code)
-    l1_tick = _restore_oss_precision(_filter(bundle.l1_tick), code)
+    _t0 = _ptime.time()
+    deal_filtered = _filter(bundle.l2_deal)
+    _t1 = _ptime.time()
+    deal_restored = _restore_oss_precision(deal_filtered, code)
+    _t2 = _ptime.time()
+    tick_filtered = _filter(bundle.l1_tick)
+    _t3 = _ptime.time()
+    tick_restored = _restore_oss_precision(tick_filtered, code)
+    _t4 = _ptime.time()
     market = _filter(bundle.market)
+    _t5 = _ptime.time()
+
+    if _perf_log and (_t5 - _t0) > 0.5:
+        logger.info(
+            "[Perf] filter+restore code=%s deal_f=%.3fs deal_r=%.3fs(%drows) "
+            "tick_f=%.3fs tick_r=%.3fs(%drows) market_f=%.3fs total=%.3fs",
+            code,
+            _t1 - _t0, _t2 - _t1, len(deal_restored),
+            _t3 - _t2, _t4 - _t3, len(tick_restored),
+            _t5 - _t4, _t5 - _t0,
+        )
+
+    l2_order = pd.DataFrame()  # need_l2_order=False for this strategy
+    l2_deal = deal_restored
+    l1_tick = tick_restored
 
     l2_order_hist: list = []
     l2_deal_hist: list = []
