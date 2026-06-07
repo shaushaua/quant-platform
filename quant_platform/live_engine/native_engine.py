@@ -860,7 +860,7 @@ class NativeEngine:
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        end_time = "daily" if is_daily else now_dt.strftime("%H%M%S")
+        end_time = schedule.end_time_label if is_daily and schedule is not None else now_dt.strftime("%H%M%S")
         self._round_count += 1
 
         files_by_code = self._scan_shm_files()

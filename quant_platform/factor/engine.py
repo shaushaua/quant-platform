@@ -34,6 +34,8 @@
 
 import logging
 import os
+import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -111,6 +113,8 @@ def calc_factors_by_date_range(
         trading_days = _fallback_trading_days(start_date, end_date)
 
     _end_times = end_times if end_times else [""]
+    zero_copy_stock_data = os.environ.get("FACTOR_ZERO_COPY", "1").lower() not in ("0", "false", "no")
+    multi_slice = len(_end_times) > 1  # 多时间切片策略（分钟/10分钟/20分钟等）
 
     # 判断是否为全市场模式
     is_explicit_list = securities and len(securities) > 0
@@ -165,70 +169,147 @@ def calc_factors_by_date_range(
         if use_streaming:
             # 分批加载模式：将全市场股票分批，每批下载一次文件并过滤
             # 避免每只股票单独下载（O(N×4GB)），也避免全量加载 OOM
-            # 默认每批 200 只，内存占用约 600MB~1GB/批（deal+tick 合计）
             #
-            # 循环顺序：batch → code → end_time
+            # 两种 batch size。默认按 4C8G 分布式 worker 设置，优先控制内存峰值。
+            # - DATA_BATCH_SIZE: DuckDB 查询每批的股票数（默认 200）
+            # - FACTOR_BATCH_SIZE: 内存中同时持有的过滤后数据量（默认 100）
+            #
+            # 循环顺序：data_batch → compute_sub_batch → code → end_time
             # 每只股票只 filter 一次，多个 end_time 复用已过滤数据
-            BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "200"))
-            batches = [_securities[i:i+BATCH_SIZE] for i in range(0, len(_securities), BATCH_SIZE)]
-            logger.info("分批加载模式：%d 只股票分 %d 批处理（每批 %d 只）",
-                        len(_securities), len(batches), BATCH_SIZE)
+            DATA_BATCH_SIZE = int(os.environ.get("DATA_BATCH_SIZE", "200"))
+            COMPUTE_BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "100"))
+            if multi_slice:
+                logger.info("多时间切片策略：%d 个 end_time，数据加载 batch=%d，计算 batch=%d",
+                            len(_end_times), DATA_BATCH_SIZE, COMPUTE_BATCH_SIZE)
+
+            data_batches = [_securities[i:i+DATA_BATCH_SIZE]
+                            for i in range(0, len(_securities), DATA_BATCH_SIZE)]
+            logger.info("分批加载模式：%d 只股票分 %d 个数据批次（每批 %d 只）",
+                        len(_securities), len(data_batches), DATA_BATCH_SIZE)
 
             # per-end_time result collectors
             end_time_results: dict = {et: [] for et in _end_times}
+            import time as _time
 
-            for batch_idx, batch_codes in enumerate(batches):
-                import time as _time
-                _t_load = _time.time()
-                market_override = (
-                    daily_basic if not is_explicit_list and _uses_current_day_market(factor_info)
-                    else None
+            # --- Reusable pool for entire day (avoid process spawn overhead) ---
+            pool = None
+            enable_process_pool = os.environ.get("FACTOR_ENABLE_PROCESS_POOL", "1").lower() in ("1", "true", "yes")
+            if processes > 1 and _calc_fn is not None and enable_process_pool:
+                try:
+                    pickle.dumps(_calc_fn)
+                    pool = ProcessPoolExecutor(max_workers=processes)
+                except Exception as e:
+                    logger.warning(
+                        "factor_data_handler 不支持进程池序列化，降级为串行计算: %s",
+                        e,
+                    )
+            elif processes > 1 and _calc_fn is not None:
+                logger.info(
+                    "FACTOR_ENABLE_PROCESS_POOL=0，进程池已关闭，使用串行计算"
                 )
-                bundle = _load_day_bundle(date, factor_info, api, batch_codes,
-                                          market_override=market_override)
-                _load_elapsed = _time.time() - _t_load
-                logger.info("[Perf] batch %d/%d _load_day_bundle=%.2fs", batch_idx+1, len(batches), _load_elapsed)
-                if is_explicit_list and daily_basic_for_inference is None and _uses_current_day_market(factor_info):
-                    daily_basic_for_inference = bundle.market
 
-                # 预解析 security_id（构建映射字典，O(N) 而非 O(N²)）
-                _id_map = _build_security_id_map(bundle.market)
-                security_id_map = {code: _id_map.get(_code_to_id_qi(code)) for code in batch_codes}
+            day_offsets = _parse_day_offsets(factor_info)
+            hist_offsets = _history_load_offsets(day_offsets)
+            try:
+                for data_batch_idx, data_batch_codes in enumerate(data_batches):
+                    _t_load = _time.time()
+                    market_override = (
+                        daily_basic if not is_explicit_list and _uses_current_day_market(factor_info)
+                        else None
+                    )
+                    bundle = _load_day_bundle(date, factor_info, api, data_batch_codes,
+                                              market_override=market_override)
+                    _load_elapsed = _time.time() - _t_load
+                    logger.info("[Perf] data_batch %d/%d _load_day_bundle=%.2fs (%d stocks)",
+                                data_batch_idx+1, len(data_batches), _load_elapsed, len(data_batch_codes))
+                    if is_explicit_list and daily_basic_for_inference is None and _uses_current_day_market(factor_info):
+                        daily_basic_for_inference = bundle.market
 
-                # 批量加载历史数据（同一批次共享下载）
-                day_offsets = _parse_day_offsets(factor_info)
-                hist_offsets = _history_load_offsets(day_offsets)
-                hist_by_code: Dict[str, list] = {}
-                if hist_offsets:
-                    hist_by_code = _load_history_bundles_batch(
-                        date, hist_offsets, factor_info, api, batch_codes, security_id_map)
+                    # 预解析 security_id
+                    _id_map = _build_security_id_map(bundle.market)
+                    security_id_map = {code: _id_map.get(_code_to_id_qi(code)) for code in data_batch_codes}
 
-                for code in batch_codes:
-                    try:
-                        security_id = security_id_map[code]
+                    # Split data batch into compute sub-batches to control memory
+                    compute_batches = [data_batch_codes[i:i+COMPUTE_BATCH_SIZE]
+                                       for i in range(0, len(data_batch_codes), COMPUTE_BATCH_SIZE)]
 
-                        # filter + restore 一次，多个 end_time 复用
-                        fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
-                        if day_offsets:
-                            hist_bundles = _combine_history_bundles(
-                                date, day_offsets, fc, hist_by_code.get(code, []))
-                            _attach_history_to_filtered(fc, hist_bundles)
+                    for comp_batch in compute_batches:
+                        # Batch-load history for this compute batch
+                        hist_by_code: Dict[str, list] = {}
+                        if hist_offsets:
+                            hist_by_code = _load_history_bundles_batch(
+                                date, hist_offsets, factor_info, api, comp_batch, security_id_map)
 
-                        for end_time in _end_times:
-                            stock_data = _stock_data_from_filtered(fc, date, end_time)
-                            if _calc_fn is not None:
-                                _t_calc = _time.time()
-                                res = _calc_fn(stock_data, code, date, end_time)
-                                _calc_elapsed = _time.time() - _t_calc
-                                if _calc_elapsed > 1.0:
-                                    logger.info("[Perf] %s factor_calculation=%.2fs", code, _calc_elapsed)
-                                if res is not None:
-                                    end_time_results[end_time].append(res)
-                    except Exception as e:
-                        logger.warning("因子计算异常 date=%s code=%s: %s", date, code, e)
+                        if pool is not None:
+                            # --- PARALLEL: reuse pool, submit+harvest pipeline ---
+                            _t_par = _time.time()
+                            n_codes = 0
+                            max_inflight = processes  # limit pending futures to control memory on 4C8G workers
+                            futures = {}
 
-                # 批次完成后释放大 DataFrame，避免内存积累
-                del bundle
+                            for code in comp_batch:
+                                # harvest completed futures to keep inflight bounded
+                                while len(futures) >= max_inflight:
+                                    done = next(as_completed(futures))
+                                    _harvest_future(done, futures, end_time_results)
+
+                                try:
+                                    security_id = security_id_map[code]
+                                    fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
+                                    if day_offsets:
+                                        hist_bundles = _combine_history_bundles(
+                                            date, day_offsets, fc, hist_by_code.get(code, []))
+                                        _attach_history_to_filtered(fc, hist_bundles)
+                                    future = pool.submit(
+                                        _compute_code_all_endtimes,
+                                        _filtered_code_to_dict(fc), date, _end_times, _calc_fn,
+                                    )
+                                    futures[future] = code
+                                    n_codes += 1
+                                    del fc
+                                except Exception as e:
+                                    logger.warning("Filter failed code=%s: %s", code, e)
+
+                            # harvest remaining
+                            for future in as_completed(list(futures)):
+                                _harvest_future(future, futures, end_time_results)
+
+                            _par_elapsed = _time.time() - _t_par
+                            logger.info("[Perf] comp_batch parallel %d codes in %.2fs (%d processes)",
+                                        n_codes, _par_elapsed, processes)
+                        else:
+                            # --- SERIAL (original path) ---
+                            for code in comp_batch:
+                                try:
+                                    security_id = security_id_map[code]
+
+                                    # filter + restore 一次，多个 end_time 复用
+                                    fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
+                                    if day_offsets:
+                                        hist_bundles = _combine_history_bundles(
+                                            date, day_offsets, fc, hist_by_code.get(code, []))
+                                        _attach_history_to_filtered(fc, hist_bundles)
+
+                                    for end_time in _end_times:
+                                        stock_data = _stock_data_from_filtered(
+                                            fc, date, end_time, zero_copy=zero_copy_stock_data
+                                        )
+                                        if _calc_fn is not None:
+                                            _t_calc = _time.time()
+                                            res = _calc_fn(stock_data, code, date, end_time)
+                                            _calc_elapsed = _time.time() - _t_calc
+                                            if _calc_elapsed > 1.0:
+                                                logger.info("[Perf] %s factor_calculation=%.2fs", code, _calc_elapsed)
+                                            if res is not None:
+                                                end_time_results[end_time].append(res)
+                                except Exception as e:
+                                    logger.warning("因子计算异常 date=%s code=%s: %s", date, code, e)
+
+                    # Data batch completed, release bundle
+                    del bundle
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True)
 
             # 按 end_time 汇总结果、运行推理、调用 outfun
             for end_time in _end_times:
@@ -307,7 +388,9 @@ def calc_factors_by_date_range(
                         _attach_history_to_filtered(fc, hist_bundles)
 
                     for end_time in _end_times:
-                        stock_data = _stock_data_from_filtered(fc, date, end_time)
+                        stock_data = _stock_data_from_filtered(
+                            fc, date, end_time, zero_copy=zero_copy_stock_data
+                        )
                         if _calc_fn is not None:
                             res = _calc_fn(stock_data, code, date, end_time)
                             if res is not None:
@@ -623,6 +706,69 @@ class _FilteredCode:
         self.l1_tick_hist = l1_tick_hist
 
 
+def _filtered_code_to_dict(fc: _FilteredCode) -> dict:
+    """Convert _FilteredCode to plain dict for inter-process serialization."""
+    return {
+        "code": fc.code,
+        "security_id": fc.security_id,
+        "l2_order": fc.l2_order,
+        "l2_deal": fc.l2_deal,
+        "l1_tick": fc.l1_tick,
+        "market": fc.market,
+        "l2_order_hist": fc.l2_order_hist,
+        "l2_deal_hist": fc.l2_deal_hist,
+        "l1_tick_hist": fc.l1_tick_hist,
+    }
+
+
+def _compute_code_all_endtimes(
+    fc_data: dict,
+    date: str,
+    end_times: list,
+    calc_fn: Callable,
+) -> dict:
+    """Worker entry: compute factor_calculation for one stock across all end_times.
+
+    Returns dict: {end_time: result_or_None}
+    """
+    fc = _FilteredCode(
+        code=fc_data["code"],
+        security_id=fc_data["security_id"],
+        l2_order=fc_data["l2_order"],
+        l2_deal=fc_data["l2_deal"],
+        l1_tick=fc_data["l1_tick"],
+        market=fc_data["market"],
+        l2_order_hist=fc_data["l2_order_hist"],
+        l2_deal_hist=fc_data["l2_deal_hist"],
+        l1_tick_hist=fc_data["l1_tick_hist"],
+    )
+    results = {}
+    for end_time in end_times:
+        try:
+            stock_data = _stock_data_from_filtered(fc, date, end_time, zero_copy=True)
+            res = calc_fn(stock_data, fc.code, date, end_time)
+            results[end_time] = res
+        except Exception as e:
+            logger.warning("Worker: factor_calculation failed code=%s end_time=%s: %s",
+                          fc.code, end_time, e)
+            results[end_time] = None
+    return results
+
+
+def _harvest_future(future, futures_map: dict, end_time_results: dict) -> None:
+    """Collect result from a completed future, remove from map."""
+    code = futures_map.pop(future, None)
+    if code is None:
+        return
+    try:
+        code_results = future.result()
+        for et, res in code_results.items():
+            if res is not None:
+                end_time_results[et].append(res)
+    except Exception as e:
+        logger.warning("Worker exception code=%s: %s", code, e)
+
+
 def _resolve_security_id(market_df: pd.DataFrame, code: str,
                         _id_map: Optional[Dict[str, int]] = None) -> Optional[int]:
     """从 daily_basic(market) 中查找 code 对应的 SECURITY_ID 整数。"""
@@ -697,8 +843,15 @@ def _filter_code_from_bundle(
                          l2_order_hist, l2_deal_hist, l1_tick_hist)
 
 
-def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str) -> StockData:
-    """从已过滤数据创建 StockData（轻量，每个 end_time 调用一次）。"""
+def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str,
+                             zero_copy: bool = False) -> StockData:
+    """从已过滤数据创建 StockData。
+
+    Args:
+        zero_copy: 如果 True，直接引用 DataFrame 不做 copy。
+                   适用于同一只股票对多个 end_time 调用的场景（分钟策略）。
+                   策略代码不得修改传入的 DataFrame。
+    """
     if any(len(d) > 0 for d in [fc.l2_order, fc.l2_deal, fc.l1_tick, fc.market]):
         price_sample = None
         if not fc.l2_deal.empty and "Price" in fc.l2_deal.columns:
@@ -711,6 +864,20 @@ def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str) -> St
             fc.code, date, end_time, len(fc.l2_order), len(fc.l2_deal),
             len(fc.l1_tick), len(fc.market),
             f"{price_sample:.2f}" if price_sample is not None else "N/A",
+        )
+    if zero_copy:
+        return StockData(
+            code=fc.code,
+            date=date,
+            end_time=end_time,
+            l2_order=fc.l2_order,
+            l2_deal=fc.l2_deal,
+            l1_tick=fc.l1_tick,
+            market=fc.market,
+            daily_basic=fc.market,
+            l2_order_hist=fc.l2_order_hist,
+            l2_deal_hist=fc.l2_deal_hist,
+            l1_tick_hist=fc.l1_tick_hist,
         )
     return StockData(
         code=fc.code,

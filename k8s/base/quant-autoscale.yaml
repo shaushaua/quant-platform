@@ -1,5 +1,6 @@
-# quant-autoscale: 交易日自动扩缩容
-# 依赖: trade-calendar ConfigMap (由 scripts/gen_trade_calendar.py 生成)
+# quant-autoscale: 交易日自动扩缩容 combined-engine，降低非交易时段成本。
+# 可选依赖: trade-calendar ConfigMap (由 scripts/gen_trade_calendar.py 生成)。
+# 如果未部署 trade-calendar，则按周一到周五执行。
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -34,14 +35,14 @@ roleRef:
   name: quant-autoscale
   apiGroup: rbac.authorization.k8s.io
 ---
-# 每个交易日 08:50 扩容
+# 每个交易日 09:00 扩容
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: quant-scale-up
   namespace: quant
 spec:
-  schedule: "50 8 * * 1-5"
+  schedule: "0 9 * * 1-5"
   timeZone: Asia/Shanghai
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
@@ -63,15 +64,22 @@ spec:
                   set -e
                   TODAY=$(date +%Y%m%d)
 
-                  # Check trading calendar
-                  CALENDAR=$(kubectl get configmap trade-calendar -n quant -o jsonpath='{.data.trading_days}')
-                  if echo ",${CALENDAR}," | grep -q ",${TODAY},"; then
-                    echo "[$(date)] $TODAY is a trading day, scaling up..."
-                    kubectl patch deployment combined-engine -n quant -p '{"spec":{"replicas":1}}'
-                    echo "[$(date)] Done. Deployment scaled to 1."
+                  # If trade-calendar exists, only scale up on configured trading days.
+                  # If it is absent, fall back to weekday execution from CronJob schedule.
+                  CALENDAR=$(kubectl get configmap trade-calendar -n quant -o jsonpath='{.data.trading_days}' 2>/dev/null || true)
+                  if [ -n "${CALENDAR}" ]; then
+                    if echo ",${CALENDAR}," | grep -q ",${TODAY},"; then
+                      echo "[$(date)] $TODAY is a trading day, scaling up..."
+                    else
+                      echo "[$(date)] $TODAY is NOT a trading day, skipping."
+                      exit 0
+                    fi
                   else
-                    echo "[$(date)] $TODAY is NOT a trading day, skipping."
+                    echo "[$(date)] trade-calendar not found, using weekday fallback."
                   fi
+
+                  kubectl patch deployment combined-engine -n quant -p '{"spec":{"replicas":1}}'
+                  echo "[$(date)] Done. Deployment scaled to 1."
 ---
 # 每个交易日 15:30 缩容（幂等，非交易日也安全）
 apiVersion: batch/v1

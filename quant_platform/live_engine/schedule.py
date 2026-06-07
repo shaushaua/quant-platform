@@ -69,7 +69,7 @@ class ComputationSchedule:
         """
         if self.name == "daily":
             return "daily"
-        return ""  # minute — filled at dispatch with actual time
+        return ""  # interval — filled at dispatch with actual time
 
 
 def build_schedules_from_env() -> List[ComputationSchedule]:

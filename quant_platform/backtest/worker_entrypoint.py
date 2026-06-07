@@ -149,19 +149,26 @@ def _get_bucket() -> oss2.Bucket:
     return _oss_bucket
 
 
-def _write_daily_result(date: str, records: list[dict]) -> None:
+def _write_result(date: str, end_time: str, records: list[dict]) -> None:
     """
-    按日期写入结果到 OSS，路径格式:
-    {TASK_ID}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
+    写入结果到 OSS。
+
+    路径格式:
+    - 有 end_time: {STRATEGY_NAME}/{YYYY}/{YYYYMM}/{date}/{date}_{end_time}_s{shard}.json
+    - 无 end_time: {STRATEGY_NAME}/{YYYY}/{YYYYMM}/{date}/{date}_s{shard}.json
     """
     year = date[:4]
     month = date[4:6]
-    suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
-    key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}/{date}{suffix}.json"
+    shard_suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
+    if end_time:
+        filename = f"{date}_{end_time}{shard_suffix}.json"
+    else:
+        filename = f"{date}{shard_suffix}.json"
+    key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}/{filename}"
     bucket = _get_bucket()
     payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
     bucket.put_object(key, payload)
-    _logger.info("日结果已写入 OSS", date=date, records=len(records),
+    _logger.info("结果已写入 OSS", date=date, end_time=end_time, records=len(records),
                  path=f"oss://{RESULT_BUCKET}/{key}")
 
 
@@ -187,10 +194,13 @@ def _load_strategy():
 
 def _make_daily_outfun(user_outfun=None):
     """
-    返回一个 outfun，每个 date 计算完成后立即将该日所有股票结果写入 OSS。
-    路径: {TASK_ID}/{YYYY}/{YYYYMM}/{YYYYMMDD}.json
+    返回一个 outfun，每个 date + end_time 计算完成后写入 OSS。
+
+    OSS key 规则：
+    - 有 end_time（分钟级策略）: {date}_{end_time}_s0.json
+    - 无 end_time（日频策略）:   {date}_s0.json
     """
-    stats = {"total_records": 0, "days_written": 0}
+    stats = {"total_records": 0, "writes": 0}
 
     def _outfun(date: str, end_time: str, test: pd.DataFrame) -> None:
         if user_outfun is not None:
@@ -207,11 +217,11 @@ def _make_daily_outfun(user_outfun=None):
         _logger.info("日期计算完成", date=date, end_time=end_time, records=len(records))
 
         try:
-            _write_daily_result(date, records)
+            _write_result(date, end_time, records)
             stats["total_records"] += len(records)
-            stats["days_written"] += 1
+            stats["writes"] += 1
         except Exception as e:
-            _logger.error("写入每日结果失败", date=date, error=str(e))
+            _logger.error("写入结果失败", date=date, end_time=end_time, error=str(e))
 
     return _outfun, stats
 
@@ -236,7 +246,7 @@ def main():
 
     factor_info = strategy.factor_info
     securities = getattr(strategy, "securities", None)  # 可选
-    end_times = getattr(strategy, "end_times", [""])     # 默认每日收盘后一次
+    end_times = getattr(strategy, "end_times", [""])     # 兼容老策略：默认日频/全天一次
     user_outfun = getattr(strategy, "outfun", None)
 
     _logger.info("strategy loaded",
@@ -295,7 +305,7 @@ def main():
     elapsed = round(time.time() - t0, 1)
     _logger.info("计算完成",
                  total_records=stats["total_records"],
-                 days_written=stats["days_written"],
+                 writes=stats["writes"],
                  elapsed_seconds=elapsed)
 
     _logger.info("worker done", elapsed_seconds=elapsed)

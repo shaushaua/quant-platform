@@ -79,6 +79,8 @@ class OSSDataLoader:
         self.cache_size = cache_size if cache_size is not None else int(os.getenv("CACHE_SIZE", "10"))
         self._cache: Dict[str, pd.DataFrame] = {}
         self._grouped_cache: Dict[str, Dict] = {}
+        # Cache: date_str -> {id_qi: security_id} for _resolve_security_ids
+        self._security_id_map_cache: Dict[str, Dict[str, int]] = {}
 
         self._ak = os.environ.get("OSS_ACCESS_KEY_ID", "")
         self._sk = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
@@ -168,24 +170,28 @@ class OSSDataLoader:
             return pd.DataFrame()
 
     def _resolve_security_ids(self, date_str: str, codes: List[str]) -> List[int]:
-        """将 000001.SZ 格式的 codes 转成 SECURITY_ID 整数列表。"""
-        key = self._object_key(date_str, "daily_basic")
-        logger.info(f"读取 daily_basic 进行 ID 映射 | key={key}")
-        df = self._read_small_file(key)
-        if df.empty:
-            logger.warning(f"daily_basic 文件为空或不存在: {key}")
-            return []
-        if "ID_QI" not in df.columns or "SECURITY_ID" not in df.columns:
-            logger.warning(f"daily_basic 缺少必要列 | columns={list(df.columns)}")
-            return []
+        """将 000001.SZ 格式的 codes 转成 SECURITY_ID 整数列表。
 
-        logger.info(f"daily_basic 加载成功 | 行数={len(df)} ID_QI样本={df['ID_QI'].head(3).tolist()}")
+        daily_basic 按日期缓存，同一日期多次调用不重复下载。
+        """
+        id_map = self._security_id_map_cache.get(date_str)
+        if id_map is None:
+            key = self._object_key(date_str, "daily_basic")
+            logger.info(f"读取 daily_basic 进行 ID 映射 | key={key}")
+            df = self._read_small_file(key)
+            if df.empty:
+                logger.warning(f"daily_basic 文件为空或不存在: {key}")
+                return []
+            if "ID_QI" not in df.columns or "SECURITY_ID" not in df.columns:
+                logger.warning(f"daily_basic 缺少必要列 | columns={list(df.columns)}")
+                return []
+            logger.info(f"daily_basic 加载成功 | 行数={len(df)} ID_QI样本={df['ID_QI'].head(3).tolist()}")
+            id_map = dict(zip(df["ID_QI"].astype(str), df["SECURITY_ID"].astype(int)))
+            self._security_id_map_cache[date_str] = id_map
 
-        # ID_QI 是6位纯数字字符串，codes 可能带交易所后缀如 000001.SZ
-        id_map = dict(zip(df["ID_QI"].astype(str), df["SECURITY_ID"].astype(int)))
         result = []
         for code in codes:
-            id_qi = code.split(".")[0].zfill(6)  # 000001.SZ -> 000001
+            id_qi = code.split(".")[0].zfill(6)
             if id_qi in id_map:
                 result.append(id_map[id_qi])
             else:
