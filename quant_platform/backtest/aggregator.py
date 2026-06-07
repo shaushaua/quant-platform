@@ -53,7 +53,10 @@ def merge_daily_shards(bucket: oss2.Bucket, task_id: str, daily_keys: list[str])
     date_groups: dict[str, list[str]] = defaultdict(list)
     for key in daily_keys:
         filename = key.rsplit("/", 1)[-1].replace(".json", "")
-        date_str = re.sub(r"_s\d+$", "", filename)
+        date_str = filename[:8]
+        if not re.fullmatch(r"\d{8}", date_str):
+            print(f"[aggregator] skip unknown result filename: {key}")
+            continue
         date_groups[date_str].append(key)
 
     total_records = 0

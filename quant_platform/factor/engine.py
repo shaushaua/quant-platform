@@ -35,7 +35,7 @@
 import logging
 import os
 import pickle
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -190,6 +190,11 @@ def calc_factors_by_date_range(
             # per-end_time result collectors
             end_time_results: dict = {et: [] for et in _end_times}
             import time as _time
+            flush_each_data_batch = (
+                os.environ.get("FACTOR_FLUSH_EACH_DATA_BATCH", "1").lower() in ("1", "true", "yes")
+                and _out_fn is not None
+                and _infer_fn is None
+            )
 
             # --- Reusable pool for entire day (avoid process spawn overhead) ---
             pool = None
@@ -246,12 +251,17 @@ def calc_factors_by_date_range(
                             n_codes = 0
                             max_inflight = processes  # limit pending futures to control memory on 4C8G workers
                             futures = {}
+                            submitted_at = {}
 
                             for code in comp_batch:
                                 # harvest completed futures to keep inflight bounded
                                 while len(futures) >= max_inflight:
-                                    done = next(as_completed(futures))
-                                    _harvest_future(done, futures, end_time_results)
+                                    done = _wait_one_future(
+                                        futures, submitted_at, end_time_results,
+                                        date, data_batch_idx, comp_batch,
+                                    )
+                                    if done is None:
+                                        continue
 
                                 try:
                                     security_id = security_id_map[code]
@@ -265,14 +275,20 @@ def calc_factors_by_date_range(
                                         _filtered_code_to_dict(fc), date, _end_times, _calc_fn,
                                     )
                                     futures[future] = code
+                                    submitted_at[future] = _time.time()
                                     n_codes += 1
                                     del fc
                                 except Exception as e:
                                     logger.warning("Filter failed code=%s: %s", code, e)
 
                             # harvest remaining
-                            for future in as_completed(list(futures)):
-                                _harvest_future(future, futures, end_time_results)
+                            while futures:
+                                done = _wait_one_future(
+                                    futures, submitted_at, end_time_results,
+                                    date, data_batch_idx, comp_batch,
+                                )
+                                if done is None:
+                                    continue
 
                             _par_elapsed = _time.time() - _t_par
                             logger.info("[Perf] comp_batch parallel %d codes in %.2fs (%d processes)",
@@ -307,51 +323,69 @@ def calc_factors_by_date_range(
 
                     # Data batch completed, release bundle
                     del bundle
+
+                    if flush_each_data_batch:
+                        for end_time in _end_times:
+                            test = _merge_results(end_time_results[end_time])
+                            if test is not None and not test.empty:
+                                test.attrs["part_index"] = data_batch_idx
+                                test.attrs["part_count"] = len(data_batches)
+                                test.attrs["partial"] = True
+                                try:
+                                    _out_fn(date, end_time, test)
+                                except Exception as e:
+                                    logger.error(
+                                        "outfun 异常 date=%s end_time=%s part=%s: %s",
+                                        date, end_time, data_batch_idx, e,
+                                    )
+                                last_result_for_date = test
+                            end_time_results[end_time] = []
             finally:
                 if pool is not None:
                     pool.shutdown(wait=True)
 
             # 按 end_time 汇总结果、运行推理、调用 outfun
-            for end_time in _end_times:
-                test = _merge_results(end_time_results[end_time])
-                if _infer_fn is not None and test is not None and not test.empty:
-                    try:
-                        _daily = _daily_basic_for_inference(
-                            api, date, is_explicit_list,
-                            daily_basic if not is_explicit_list else None,
-                            daily_basic_for_inference)
-                        if is_explicit_list and daily_basic_for_inference is None:
-                            daily_basic_for_inference = _daily
-                        universe_extra = {
-                            "date": date,
-                            "end_time": end_time,
-                            "codes": _securities,
-                            "factor_result": test,
-                        }
-                        trading_universe_df = compute_trading_universe(_daily, universe_extra)
-                        index_composition_df = compute_index_composition(_daily, universe_extra)
-                        positions = call_inference(
-                            _infer_fn,
-                            date,
-                            end_time,
-                            prev_day_for_inference,
-                            test,
-                            _daily,
-                            trading_universe_df,
-                            index_composition_df,
-                            None,
-                        )
-                        if positions is not None and not positions.empty:
-                            logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
-                    except Exception as e:
-                        logger.error("inference 异常 date=%s end_time=%s: %s", date, end_time, e)
-                if _out_fn is not None:
-                    try:
-                        _out_fn(date, end_time, test)
-                    except Exception as e:
-                        logger.error("outfun 异常 date=%s end_time=%s: %s", date, end_time, e)
-                if test is not None and not test.empty:
-                    last_result_for_date = test
+            if not flush_each_data_batch:
+                for end_time in _end_times:
+                    test = _merge_results(end_time_results[end_time])
+                    if _infer_fn is not None and test is not None and not test.empty:
+                        try:
+                            _daily = _daily_basic_for_inference(
+                                api, date, is_explicit_list,
+                                daily_basic if not is_explicit_list else None,
+                                daily_basic_for_inference)
+                            if is_explicit_list and daily_basic_for_inference is None:
+                                daily_basic_for_inference = _daily
+                            universe_extra = {
+                                "date": date,
+                                "end_time": end_time,
+                                "codes": _securities,
+                                "factor_result": test,
+                            }
+                            trading_universe_df = compute_trading_universe(_daily, universe_extra)
+                            index_composition_df = compute_index_composition(_daily, universe_extra)
+                            positions = call_inference(
+                                _infer_fn,
+                                date,
+                                end_time,
+                                prev_day_for_inference,
+                                test,
+                                _daily,
+                                trading_universe_df,
+                                index_composition_df,
+                                None,
+                            )
+                            if positions is not None and not positions.empty:
+                                logger.info("[inference] date=%s end_time=%s positions=%d", date, end_time, len(positions))
+                        except Exception as e:
+                            logger.error("inference 异常 date=%s end_time=%s: %s", date, end_time, e)
+                    if _out_fn is not None:
+                        try:
+                            _out_fn(date, end_time, test)
+                        except Exception as e:
+                            logger.error("outfun 异常 date=%s end_time=%s: %s", date, end_time, e)
+                    if test is not None and not test.empty:
+                        last_result_for_date = test
         else:
             # 传统模式：预加载全市场数据（适用于小规模股票列表）
             # 循环顺序：code → end_time，每只股票只 filter 一次
@@ -767,6 +801,36 @@ def _harvest_future(future, futures_map: dict, end_time_results: dict) -> None:
                 end_time_results[et].append(res)
     except Exception as e:
         logger.warning("Worker exception code=%s: %s", code, e)
+
+
+def _wait_one_future(
+    futures_map: dict,
+    submitted_at: dict,
+    end_time_results: dict,
+    date: str,
+    data_batch_idx: int,
+    comp_batch: list,
+):
+    """Wait for one process-pool task, logging progress instead of blocking silently."""
+    done, _ = wait(list(futures_map.keys()), timeout=30, return_when=FIRST_COMPLETED)
+    if not done:
+        now = datetime.now().timestamp()
+        slow = []
+        for future, code in list(futures_map.items()):
+            elapsed = now - submitted_at.get(future, now)
+            slow.append((elapsed, code))
+        slow.sort(reverse=True)
+        sample = ", ".join(f"{code}:{elapsed:.0f}s" for elapsed, code in slow[:5])
+        logger.info(
+            "[Perf] comp_batch waiting date=%s data_batch=%d pending=%d codes=%d slowest=[%s]",
+            date, data_batch_idx + 1, len(futures_map), len(comp_batch), sample,
+        )
+        return None
+
+    future = next(iter(done))
+    submitted_at.pop(future, None)
+    _harvest_future(future, futures_map, end_time_results)
+    return future
 
 
 def _resolve_security_id(market_df: pd.DataFrame, code: str,

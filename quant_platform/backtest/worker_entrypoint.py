@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import time
+import math
 from typing import Optional
 
 import oss2
@@ -59,7 +60,24 @@ STOCK_SHARDS = int(os.environ.get("STOCK_SHARDS", "1"))
 STOCK_SHARD_INDEX = int(os.environ.get("STOCK_SHARD_INDEX", "0"))
 DATA_PATH    = os.environ.get("DATA_PATH", "/data")
 RESULT_BUCKET = os.environ.get("RESULT_BUCKET", "stock-mdl-data-result")
-PROCESSES    = int(os.environ.get("WORKERS", "1"))
+
+
+def _effective_cpu_limit() -> Optional[int]:
+    """Return cgroup CPU quota as whole cores when available."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max", "r", encoding="utf-8") as fh:
+            quota, period = fh.read().strip().split()[:2]
+        if quota == "max":
+            return None
+        cores = int(quota) / int(period)
+        return max(1, int(math.floor(cores)))
+    except Exception:
+        return None
+
+
+_requested_processes = int(os.environ.get("WORKERS", "1"))
+_cpu_limit = _effective_cpu_limit()
+PROCESSES = min(_requested_processes, _cpu_limit) if _cpu_limit else _requested_processes
 
 STRATEGY_PATH = "/app/strategy/strategy.py"
 
@@ -149,7 +167,13 @@ def _get_bucket() -> oss2.Bucket:
     return _oss_bucket
 
 
-def _write_result(date: str, end_time: str, records: list[dict]) -> None:
+def _write_result(
+    date: str,
+    end_time: str,
+    records: list[dict],
+    part_index: Optional[int] = None,
+    part_count: Optional[int] = None,
+) -> None:
     """
     写入结果到 OSS。
 
@@ -160,15 +184,18 @@ def _write_result(date: str, end_time: str, records: list[dict]) -> None:
     year = date[:4]
     month = date[4:6]
     shard_suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
+    part_suffix = f"_p{part_index}" if part_index is not None else ""
     if end_time:
-        filename = f"{date}_{end_time}{shard_suffix}.json"
+        filename = f"{date}_{end_time}{shard_suffix}{part_suffix}.json"
     else:
-        filename = f"{date}{shard_suffix}.json"
+        filename = f"{date}{shard_suffix}{part_suffix}.json"
     key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}/{filename}"
     bucket = _get_bucket()
     payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
     bucket.put_object(key, payload)
     _logger.info("结果已写入 OSS", date=date, end_time=end_time, records=len(records),
+                 part_index=part_index if part_index is not None else "",
+                 part_count=part_count if part_count is not None else "",
                  path=f"oss://{RESULT_BUCKET}/{key}")
 
 
@@ -214,10 +241,12 @@ def _make_daily_outfun(user_outfun=None):
             return
 
         records = test.to_dict(orient="records")
+        part_index = test.attrs.get("part_index")
+        part_count = test.attrs.get("part_count")
         _logger.info("日期计算完成", date=date, end_time=end_time, records=len(records))
 
         try:
-            _write_result(date, end_time, records)
+            _write_result(date, end_time, records, part_index=part_index, part_count=part_count)
             stats["total_records"] += len(records)
             stats["writes"] += 1
         except Exception as e:
@@ -232,7 +261,10 @@ def _make_daily_outfun(user_outfun=None):
 
 def main():
     _logger.info("worker started",
-                 start_date=START_DATE, end_date=END_DATE)
+                 start_date=START_DATE, end_date=END_DATE,
+                 requested_workers=_requested_processes,
+                 effective_workers=PROCESSES,
+                 cpu_limit=_cpu_limit if _cpu_limit is not None else "")
 
     strategy = _load_strategy()
 
