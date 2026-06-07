@@ -154,12 +154,12 @@ def _build_feature_matrix(
             x = pd.DataFrame(x, index=df.index, columns=features)
         return x.reindex(columns=features).fillna(0.0)
 
-    x = pd.DataFrame(index=df.index)
-    for feature in features:
-        if feature in df.columns:
-            x[feature] = pd.to_numeric(df[feature], errors="coerce")
-        else:
-            x[feature] = float("nan")
+    values = {
+        feature: pd.to_numeric(df[feature], errors="coerce")
+        if feature in df.columns else pd.Series(float("nan"), index=df.index)
+        for feature in features
+    }
+    x = pd.DataFrame(values, index=df.index)
     if medians is not None:
         x = x.fillna(medians.reindex(features))
     return x.fillna(0.0)
