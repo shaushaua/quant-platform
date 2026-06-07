@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import logging
 import os
-from io import BytesIO
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional
 
 import pandas as pd
 
@@ -19,14 +22,15 @@ logger = logging.getLogger(__name__)
 def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
     """Return the latest QMT account snapshot from the configured export dir.
 
-    QMT data export writes CSV/TXT/DBF files such as position/asset/order/deal.
-    This adapter currently reads CSV/TXT files from a local path. In Kubernetes,
-    mount/sync the Windows export directory into the Pod or keep the SFTP mirror
-    path as ``QMT_EXPORT_LOCAL_DIR``.
+    Prefer ``QMT_GATEWAY_URL``. Local CSV/TXT reading is kept only for mounted
+    export directories in development.
     """
+    gateway_url = os.environ.get("QMT_GATEWAY_URL", "")
+    if gateway_url:
+        return _get_gateway_portfolio_context(gateway_url, date_str, end_time)
+
     local_dir_raw = os.environ.get("QMT_EXPORT_LOCAL_DIR", "")
     local_dir = Path(local_dir_raw) if local_dir_raw else None
-    remote_dir = os.environ.get("QMT_EXPORT_REMOTE_DIR", "")
     account_id = os.environ.get("QMT_ACCOUNT_ID", "")
     account_type = os.environ.get("QMT_ACCOUNT_TYPE", "2")
 
@@ -48,18 +52,15 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
         as_of = pd.to_datetime(latest_mtime, unit="s").strftime("%Y%m%d %H:%M:%S") if latest_mtime else ""
         source = str(local_dir)
     else:
-        remote_tables = _read_remote_tables(remote_dir)
-        positions_file, positions_raw = remote_tables["positions"]
-        account_file, account_raw = remote_tables["account"]
-        orders_file, orders_raw = remote_tables["orders"]
-        deals_file, deals_raw = remote_tables["deals"]
-
-        positions = _standardize_positions(positions_raw)
-        account = _standardize_account(account_raw, account_id)
-        orders = _standardize_orders(orders_raw)
-        deals = _standardize_deals(deals_raw)
+        positions_file = account_file = orders_file = deals_file = None
+        positions = pd.DataFrame()
+        account = pd.DataFrame()
+        orders = pd.DataFrame()
+        deals = pd.DataFrame()
         as_of = ""
-        source = f"sftp://{os.environ.get('QMT_SFTP_HOST', '')}/{remote_dir}"
+        source = ""
+        logger.warning("[qmt-context] QMT_GATEWAY_URL not configured and local export dir missing: %s",
+                       local_dir_raw)
 
     return PortfolioContext(
         account_id=account_id,
@@ -79,6 +80,69 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
             "orders_file": str(orders_file) if orders_file else "",
             "deals_file": str(deals_file) if deals_file else "",
         },
+    )
+
+
+def _get_gateway_portfolio_context(gateway_url: str, date_str: str, end_time: str) -> PortfolioContext:
+    account_id = os.environ.get("QMT_ACCOUNT_ID", "")
+    account_type = os.environ.get("QMT_ACCOUNT_TYPE", "2")
+    timeout = float(os.environ.get("QMT_GATEWAY_TIMEOUT", "10"))
+    token = os.environ.get("QMT_GATEWAY_TOKEN", "")
+    params = urllib.parse.urlencode({"account_id": account_id}) if account_id else ""
+    url = f"{gateway_url.rstrip('/')}/v1/positions"
+    if params:
+        url = f"{url}?{params}"
+
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    positions = pd.DataFrame()
+    as_of = ""
+    source = url
+    meta = {
+        "date": date_str,
+        "end_time": end_time,
+        "gateway_url": gateway_url.rstrip("/"),
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if not payload.get("ok", False):
+            logger.warning("[qmt-context] gateway returned not ok: %s", payload.get("error", ""))
+        else:
+            positions = _standardize_gateway_positions(pd.DataFrame(payload.get("positions") or []))
+            as_of = str(payload.get("source_mtime", "") or "")
+            source = str(payload.get("source_file", "") or url)
+            meta.update({
+                "source_file": payload.get("source_file", ""),
+                "source_mtime": payload.get("source_mtime", ""),
+                "stale_seconds": payload.get("stale_seconds", None),
+                "stale": payload.get("stale", None),
+                "raw_rows": payload.get("raw_rows", None),
+                "position_count": payload.get("position_count", len(positions)),
+            })
+            logger.debug("[qmt-context] gateway positions=%d stale=%s source=%s",
+                         len(positions), payload.get("stale", None), source)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.warning("[qmt-context] gateway HTTP %s: %s", exc.code, body[:300])
+    except Exception as exc:
+        logger.warning("[qmt-context] gateway read failed: %s", exc)
+
+    return PortfolioContext(
+        account_id=account_id,
+        broker="qmt",
+        account_type=account_type,
+        as_of=as_of,
+        source=source,
+        positions=positions,
+        account=pd.DataFrame(),
+        orders=pd.DataFrame(),
+        deals=pd.DataFrame(),
+        meta=meta,
     )
 
 
@@ -104,100 +168,6 @@ def _latest_file(base_dir: Path, prefixes: Iterable[str]) -> Optional[Path]:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _read_remote_tables(remote_dir: str) -> dict[str, Tuple[str, pd.DataFrame]]:
-    specs = {
-        "positions": ("position", "positions", "持仓"),
-        "account": ("asset", "account", "fund", "资金", "资产"),
-        "orders": ("order", "orders", "委托"),
-        "deals": ("deal", "deals", "成交"),
-    }
-    empty = {key: ("", pd.DataFrame()) for key in specs}
-    if not remote_dir or not os.environ.get("QMT_SFTP_HOST", ""):
-        return empty
-    sftp = None
-    try:
-        import paramiko
-        sftp = _open_sftp(paramiko)
-        result = {}
-        for key, prefixes in specs.items():
-            remote_path = _latest_remote_path(sftp, remote_dir, prefixes)
-            if not remote_path:
-                result[key] = ("", pd.DataFrame())
-                continue
-            with sftp.open(remote_path, "rb") as fp:
-                data = fp.read()
-            result[key] = (remote_path, _read_csv_bytes(data, remote_path))
-        return result
-    except ImportError:
-        logger.warning("[qmt-context] paramiko not installed; cannot read QMT exports via SFTP")
-    except Exception as exc:
-        logger.warning("[qmt-context] remote read failed: %s", exc)
-    finally:
-        if sftp is not None:
-            try:
-                sftp.close()
-            except Exception:
-                pass
-    return empty
-
-
-def _open_sftp(paramiko):
-    host = os.environ.get("QMT_SFTP_HOST", "")
-    port = int(os.environ.get("QMT_SFTP_PORT", "22"))
-    user = os.environ.get("QMT_SFTP_USER", "quant")
-    key_path = os.environ.get("QMT_SFTP_KEY", "")
-    password = os.environ.get("QMT_SFTP_PASS", "")
-    timeout = float(os.environ.get("QMT_SFTP_TIMEOUT", "10"))
-
-    connect_kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": user,
-        "timeout": timeout,
-        "banner_timeout": timeout,
-        "auth_timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
-    }
-    if key_path and Path(key_path).exists():
-        connect_kwargs["key_filename"] = key_path
-        if password:
-            connect_kwargs["password"] = password
-    elif password:
-        connect_kwargs["password"] = password
-    else:
-        raise RuntimeError("no QMT_SFTP_KEY or QMT_SFTP_PASS configured")
-
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(**connect_kwargs)
-    return ssh.open_sftp()
-
-
-def _latest_remote_path(sftp, remote_dir: str, prefixes: Iterable[str]) -> str:
-    lowered_prefixes = tuple(p.lower() for p in prefixes)
-    candidates = []
-    for attr in sftp.listdir_attr(remote_dir):
-        name = attr.filename
-        lower_name = name.lower()
-        suffix = Path(name).suffix.lower()
-        if suffix not in {".csv", ".txt"}:
-            continue
-        if lower_name.endswith("_result.dbf"):
-            continue
-        if any(lower_name.startswith(prefix) or prefix in lower_name for prefix in lowered_prefixes):
-            candidates.append((attr.st_mtime, _remote_join(remote_dir, name)))
-    if not candidates:
-        return ""
-    return max(candidates, key=lambda item: item[0])[1]
-
-
-def _remote_join(remote_dir: str, filename: str) -> str:
-    sep = "\\" if "\\" in remote_dir else "/"
-    clean_dir = remote_dir.rstrip("/\\")
-    return f"{clean_dir}{sep}{filename}"
-
-
 def _read_table(path: Optional[Path]) -> pd.DataFrame:
     if path is None:
         return pd.DataFrame()
@@ -210,19 +180,6 @@ def _read_table(path: Optional[Path]) -> pd.DataFrame:
             logger.warning("[qmt-context] failed to read %s: %s", path, exc)
             return pd.DataFrame()
     logger.warning("[qmt-context] failed to decode %s", path)
-    return pd.DataFrame()
-
-
-def _read_csv_bytes(data: bytes, source: str) -> pd.DataFrame:
-    for encoding in ("utf-8-sig", "gbk", "gb18030"):
-        try:
-            return pd.read_csv(BytesIO(data), encoding=encoding)
-        except UnicodeDecodeError:
-            continue
-        except Exception as exc:
-            logger.warning("[qmt-context] failed to parse %s: %s", source, exc)
-            return pd.DataFrame()
-    logger.warning("[qmt-context] failed to decode %s", source)
     return pd.DataFrame()
 
 
@@ -276,6 +233,35 @@ def _standardize_positions(df: pd.DataFrame) -> pd.DataFrame:
     ).fillna(0.0)
     out["last_price"] = pd.to_numeric(
         _series(out, ("last_price", "最新价", "当前价"), 0),
+        errors="coerce",
+    ).fillna(0.0)
+    return out
+
+
+def _standardize_gateway_positions(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "symbol" in out.columns:
+        out["code"] = out["symbol"].map(_normalize_code)
+    elif "code" in out.columns:
+        out["code"] = out["code"].map(_normalize_code)
+    volume = _series(out, ("volume", "current_volume"), 0)
+    out["current_volume"] = pd.to_numeric(volume, errors="coerce").fillna(0).astype("int64")
+    out["available_volume"] = pd.to_numeric(
+        _series(out, ("available_volume", "available"), 0),
+        errors="coerce",
+    ).fillna(0).astype("int64")
+    out["market_value"] = pd.to_numeric(
+        _series(out, ("market_value",), 0),
+        errors="coerce",
+    ).fillna(0.0)
+    out["cost_price"] = pd.to_numeric(
+        _series(out, ("cost_price",), 0),
+        errors="coerce",
+    ).fillna(0.0)
+    out["last_price"] = pd.to_numeric(
+        _series(out, ("last_price",), 0),
         errors="coerce",
     ).fillna(0.0)
     return out

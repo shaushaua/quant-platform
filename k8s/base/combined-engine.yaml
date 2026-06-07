@@ -83,27 +83,21 @@ spec:
               value: "minute,daily"
             - name: DAILY_FACTOR_TRIGGER_TIME
               value: "15:10"
-            # --- QMT SFTP push ---
-            - name: QMT_SFTP_HOST
-              value: ""
-            - name: QMT_SFTP_PORT
-              value: "22"
-            - name: QMT_SFTP_USER
-              value: "quant"
-            - name: QMT_SFTP_KEY
-              value: ""
-            - name: QMT_SFTP_DIR
-              value: "C:\\\\quant\\\\place"
-            - name: QMT_ORDER_REMOTE_DIR
-              value: "C:\\\\quant\\\\place"
-            - name: QMT_EXPORT_REMOTE_DIR
-              value: "C:\\\\quant\\\\position"
+            # --- QMT gateway ---
+            - name: QMT_GATEWAY_URL
+              value: "http://172.16.0.47:18080"
+            - name: QMT_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: quant-secrets
+                  key: QMT_GATEWAY_TOKEN
+                  optional: true
+            - name: QMT_GATEWAY_TIMEOUT
+              value: "10"
             - name: QMT_EXPORT_LOCAL_DIR
               value: "/data/qmt/position"
-            - name: QMT_SFTP_TIMEOUT
-              value: "10"
             - name: QMT_ACCOUNT_ID
-              value: ""
+              value: "00033770"
             - name: QMT_ACCOUNT_TYPE
               value: "2"
             - name: QMT_STRATEGY_NAME

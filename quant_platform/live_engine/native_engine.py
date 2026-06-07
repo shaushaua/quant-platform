@@ -18,10 +18,9 @@ Environment variables:
 from __future__ import annotations
 
 import copy
-import csv
 import gc
 import importlib
-import io
+import json
 import logging
 import multiprocessing
 import os
@@ -32,9 +31,11 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -64,10 +65,6 @@ from .pipeline_logger import get_streaming_logger
 from .schedule import ComputationSchedule, build_schedules_from_env
 
 logger = logging.getLogger(__name__)
-
-_qmt_ssh = None
-_qmt_sftp = None
-_qmt_sftp_config: Optional[Tuple] = None
 
 # Module-level globals: set before fork, inherited by child processes via COW
 _factor_fn: Optional[Callable] = None
@@ -284,14 +281,14 @@ class NativeEngine:
 
     def _init_qmt_worker(self) -> None:
         """Start a persistent QMT push worker when QMT is configured."""
-        if self._qmt_process is not None or not os.environ.get("QMT_SFTP_HOST", ""):
+        if self._qmt_process is not None or not _qmt_push_configured():
             return
         maxsize = int(os.environ.get("QMT_QUEUE_MAXSIZE", "32"))
         self._qmt_queue = multiprocessing.Queue(maxsize=maxsize)
         self._qmt_process = multiprocessing.Process(
             target=_qmt_worker_loop,
             args=(self._qmt_queue,),
-            name="qmt-sftp-worker",
+            name="qmt-gateway-worker",
         )
         self._qmt_process.start()
         logger.info("[qmt] started persistent worker pid=%d", self._qmt_process.pid)
@@ -1278,7 +1275,7 @@ class NativeEngine:
 
 
 def _qmt_worker_loop(qmt_queue) -> None:
-    """Persistent QMT SFTP worker.
+    """Persistent QMT gateway worker.
 
     It receives already-aggregated inference/order DataFrames. Factor workers
     never call this function, so one compute round can produce at most one QMT
@@ -1296,165 +1293,107 @@ def _qmt_worker_loop(qmt_queue) -> None:
             except Exception as exc:
                 logger.error("[qmt] worker task failed: %s", exc, exc_info=True)
     finally:
-        _close_qmt_sftp()
         logger.info("[qmt] worker loop stopped")
 
 
 def _push_to_qmt(orders_df: pd.DataFrame, date_str: str, end_time: str) -> None:
-    """Push QMT CSV-preorder signal file to QMT Windows machine via SFTP.
+    """Push QMT orders through qmt-gateway.
 
     Env vars:
-        QMT_SFTP_HOST:   Windows machine IP (required)
-        QMT_SFTP_PORT:   SSH port (default 22)
-        QMT_SFTP_USER:   SSH username
-        QMT_SFTP_KEY:    Path to SSH private key file
-        QMT_ORDER_REMOTE_DIR: QMT CSV-preorder monitor directory
-        QMT_SFTP_DIR:    Deprecated fallback for QMT_ORDER_REMOTE_DIR
-        QMT_SFTP_PASS:   SSH password (alternative to key)
-        QMT_SFTP_TIMEOUT: SSH/SFTP timeout seconds (default 10)
+        QMT_GATEWAY_URL: HTTP gateway base URL, e.g. http://172.16.0.47:18080
+        QMT_GATEWAY_TOKEN: HTTP bearer token
+        QMT_GATEWAY_TIMEOUT: HTTP timeout seconds
         QMT_ACCOUNT_ID:  QMT fund account used in signal file name
         QMT_ACCOUNT_TYPE: QMT account type, default 2 (stock)
         QMT_STRATEGY_NAME: default strategy name in signal rows
     """
-    host = os.environ.get("QMT_SFTP_HOST", "")
-    if not host:
-        return  # not configured
+    gateway_url = os.environ.get("QMT_GATEWAY_URL", "")
+    if not gateway_url:
+        logger.warning("[qmt] QMT_GATEWAY_URL not configured, skip order push")
+        return
+    _push_to_qmt_gateway(orders_df, date_str, end_time, gateway_url)
 
+
+def _qmt_push_configured() -> bool:
+    return bool(os.environ.get("QMT_GATEWAY_URL", ""))
+
+
+def _push_to_qmt_gateway(orders_df: pd.DataFrame, date_str: str, end_time: str, gateway_url: str) -> None:
     account_id = os.environ.get("QMT_ACCOUNT_ID", "")
     if not account_id:
-        logger.error("[qmt] QMT_ACCOUNT_ID not configured, skip signal push")
+        logger.error("[qmt] QMT_ACCOUNT_ID not configured, skip gateway push")
+        return
+    orders = _build_qmt_gateway_orders(orders_df, date_str, end_time)
+    if not orders:
+        logger.warning("[qmt] no valid QMT gateway order rows; required columns include code, side/order_type, volume")
         return
 
-    signal_text = _build_qmt_signal_text(orders_df, date_str, end_time)
-    if not signal_text:
-        return
-
-    try:
-        import paramiko
-    except ImportError:
-        logger.error("[qmt] paramiko not installed, skip SFTP push")
-        return
-
-    try:
-        remote_dir = os.environ.get("QMT_ORDER_REMOTE_DIR") or os.environ.get("QMT_SFTP_DIR", "C:\\\\quant\\\\place")
-        account_type = os.environ.get("QMT_ACCOUNT_TYPE", "2")
-        clean_dir = remote_dir.rstrip("\\/")
-        sep = "\\" if "\\" in remote_dir else "/"
-        signal_seq = f"{date_str}{end_time}{int(time.time() * 1000) % 1000000:06d}"
-        remote_file = f"{clean_dir}{sep}signal.{account_id}_{account_type}.{signal_seq}.txt"
-        remote_tmp = f"{remote_file}.tmp"
-        payload = signal_text.encode("utf-8")
-
-        sftp = _get_qmt_sftp(paramiko)
-        sftp.putfo(io.BytesIO(payload), remote_tmp)
-        sftp.rename(remote_tmp, remote_file)
-        logger.info("[qmt] pushed signal file to %s:%s (%d bytes, rows=%d)",
-                    host, remote_file, len(payload), signal_text.count("\n"))
-    except Exception as exc:
-        _close_qmt_sftp()
-        logger.error("[qmt] SFTP push failed: %s", exc)
-
-
-def _get_qmt_sftp(paramiko):
-    """Return a process-local reusable SFTP connection."""
-    global _qmt_ssh, _qmt_sftp, _qmt_sftp_config
-
-    host = os.environ.get("QMT_SFTP_HOST", "")
-    port = int(os.environ.get("QMT_SFTP_PORT", "22"))
-    user = os.environ.get("QMT_SFTP_USER", "quant")
-    key_path = os.environ.get("QMT_SFTP_KEY", "")
-    password = os.environ.get("QMT_SFTP_PASS", "")
-    timeout = float(os.environ.get("QMT_SFTP_TIMEOUT", "10"))
-    config = (host, port, user, key_path, bool(password), timeout)
-
-    if _qmt_sftp is not None and _qmt_sftp_config == config:
-        try:
-            _qmt_sftp.stat(".")
-            return _qmt_sftp
-        except Exception:
-            _close_qmt_sftp()
-
-    connect_kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": user,
-        "timeout": timeout,
-        "banner_timeout": timeout,
-        "auth_timeout": timeout,
-        "look_for_keys": False,
-        "allow_agent": False,
+    payload = {
+        "account_id": account_id,
+        "account_type": os.environ.get("QMT_ACCOUNT_TYPE", "2"),
+        "orders": orders,
     }
-    if key_path and Path(key_path).exists():
-        connect_kwargs["key_filename"] = key_path
-        if password:
-            connect_kwargs["password"] = password
-    elif key_path:
-        logger.warning("[qmt] QMT_SFTP_KEY does not exist: %s", key_path)
-        if password:
-            connect_kwargs["password"] = password
-        else:
-            raise RuntimeError("no usable QMT_SFTP_KEY or QMT_SFTP_PASS configured")
-    elif password:
-        connect_kwargs["password"] = password
-    else:
-        raise RuntimeError("no QMT_SFTP_KEY or QMT_SFTP_PASS configured")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("QMT_GATEWAY_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    timeout = float(os.environ.get("QMT_GATEWAY_TIMEOUT", "10"))
+    url = f"{gateway_url.rstrip('/')}/v1/orders"
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(**connect_kwargs)
-    _qmt_ssh = ssh
-    _qmt_sftp = ssh.open_sftp()
-    _qmt_sftp_config = config
-    return _qmt_sftp
-
-
-def _close_qmt_sftp() -> None:
-    global _qmt_ssh, _qmt_sftp, _qmt_sftp_config
-    if _qmt_sftp is not None:
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            response_text = resp.read().decode("utf-8", errors="replace")
         try:
-            _qmt_sftp.close()
+            response = json.loads(response_text)
         except Exception:
-            pass
-    if _qmt_ssh is not None:
-        try:
-            _qmt_ssh.close()
-        except Exception:
-            pass
-    _qmt_ssh = None
-    _qmt_sftp = None
-    _qmt_sftp_config = None
+            response = {}
+        if response and not response.get("ok", False):
+            logger.error("[qmt] gateway push rejected: %s", response)
+            return
+        logger.info("[qmt] gateway pushed %d rows to %s signal=%s",
+                    len(orders), url, response.get("signal_file", "") if response else "")
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        logger.error("[qmt] gateway HTTP %s: %s", exc.code, body_text[:500])
+    except Exception as exc:
+        logger.error("[qmt] gateway push failed: %s", exc)
 
 
-def _build_qmt_signal_text(orders_df: pd.DataFrame, date_str: str, end_time: str) -> str:
-    """Convert engine order output to QMT CSV-preorder signal rows."""
-    rows = []
-    for _, row in orders_df.iterrows():
+def _build_qmt_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
+    orders = []
+    for idx, row in orders_df.iterrows():
         code = _qmt_code(row.get("qmt_code", row.get("code", "")))
         volume = _qmt_volume(row)
         order_type = _qmt_order_type(row)
         if not code or volume <= 0 or not order_type:
             continue
-
         price_type = _qmt_price_type(row)
-        price = _qmt_price(row, price_type)
-        if price_type in {"3", "6"} and not price:
+        price_raw = _qmt_price(row, price_type)
+        if price_type in {"3", "6"} and not price_raw:
             logger.error("[qmt] skip %s %s: price_type=%s requires price",
                          code, order_type, price_type)
             continue
         strategy = str(row.get("strategy", "") or os.environ.get("QMT_STRATEGY_NAME", "quant_platform"))
         note = str(row.get("note", "") or row.get("remark", "") or
                    f"{strategy}_{date_str}{end_time}_{code}_{order_type}")
-        rows.append([note, order_type, price_type, price, code, str(volume), strategy])
-
-    if not rows:
-        logger.warning("[qmt] no valid QMT order rows; required columns include "
-                       "code, side/order_type, volume")
-        return ""
-
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\n")
-    writer.writerows(rows)
-    return buf.getvalue()
+        order_id = str(row.get("order_id", "") or note or f"{date_str}{end_time}_{idx}")
+        try:
+            price = float(price_raw) if price_raw not in {"", None} else 0.0
+        except Exception:
+            price = 0.0
+        orders.append({
+            "order_id": order_id,
+            "qmt_code": code,
+            "qmt_order_type": order_type,
+            "volume": int(volume),
+            "qmt_price_type": price_type,
+            "price": price,
+            "strategy": strategy,
+            "note": note,
+        })
+    return orders
 
 
 def _qmt_code(code: object) -> str:
