@@ -18,11 +18,15 @@ Environment variables:
 from __future__ import annotations
 
 import copy
+import csv
 import gc
 import importlib
+import io
 import logging
 import multiprocessing
 import os
+import pickle
+import queue
 import resource
 import signal
 import sys
@@ -43,9 +47,10 @@ from ..data.native_shm_reader import (
     NativeShmReader, scan_shm_dir, get_codes, open_all_readers,
     KIND_TICK, KIND_ORDER, KIND_DEAL, COLS_BY_KIND, SHM_HEADER_SIZE,
 )
-from ..data.mysql_loader import DailyBasicCache
+from ..data.mysql_loader import DailyBasicCache, IdxConsCache
 from ..factor.base import StockData, StockState
 from ..inference.interface import (
+    build_trading_universe_df,
     call_inference,
     compute_index_composition,
     compute_trading_universe,
@@ -59,6 +64,10 @@ from .pipeline_logger import get_streaming_logger
 from .schedule import ComputationSchedule, build_schedules_from_env
 
 logger = logging.getLogger(__name__)
+
+_qmt_ssh = None
+_qmt_sftp = None
+_qmt_sftp_config: Optional[Tuple] = None
 
 # Module-level globals: set before fork, inherited by child processes via COW
 _factor_fn: Optional[Callable] = None
@@ -222,17 +231,25 @@ class NativeEngine:
         self.shm_dir = os.environ.get("NATIVE_SHM_DIR", "/data/quant/shm")
         self.compute_interval = int(os.environ.get("COMPUTE_INTERVAL", "60"))
         self.factor_module = os.environ.get("FACTOR_MODULE", "")
+        self.daily_factor_module = os.environ.get("DAILY_FACTOR_MODULE", "")
+        self._daily_factor_fn: Optional[Callable] = None
         self.factor_output_path = os.environ.get("FACTOR_OUTPUT_PATH", "/data/factors")
         self.output_path = Path(self.factor_output_path) if self.factor_output_path else None
         self.n_workers = int(os.environ.get("FACTOR_WORKERS", "40"))
         self.trading_day: str = ""
         self._pool: Optional[multiprocessing.Pool] = None
         self._daily_cache: Optional[DailyBasicCache] = None
+        self._idx_cons_cache: Optional[IdxConsCache] = None
+        self._idx_cons_df: pd.DataFrame = pd.DataFrame()
+        self._trading_universe_df: Optional[pd.DataFrame] = None
+        self.trading_universe_fn: Optional[Callable] = None
         self._states: Dict[str, StockState] = {}
         self.factor_calculation: Optional[Callable] = None
         self.outfun: Optional[Callable] = None
         self.inference_fn: Optional[Callable] = None
         self.portfolio_context_fn: Optional[Callable] = None
+        self._qmt_queue: Optional[multiprocessing.Queue] = None
+        self._qmt_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._schedules: list = []  # List[ComputationSchedule]
         self._last_codes: List[str] = []
@@ -264,6 +281,36 @@ class NativeEngine:
             initializer=_worker_init,
             initargs=(self.factor_module, self._daily_basic_df, self._market_df),
         )
+
+    def _init_qmt_worker(self) -> None:
+        """Start a persistent QMT push worker when QMT is configured."""
+        if self._qmt_process is not None or not os.environ.get("QMT_SFTP_HOST", ""):
+            return
+        maxsize = int(os.environ.get("QMT_QUEUE_MAXSIZE", "32"))
+        self._qmt_queue = multiprocessing.Queue(maxsize=maxsize)
+        self._qmt_process = multiprocessing.Process(
+            target=_qmt_worker_loop,
+            args=(self._qmt_queue,),
+            name="qmt-sftp-worker",
+        )
+        self._qmt_process.start()
+        logger.info("[qmt] started persistent worker pid=%d", self._qmt_process.pid)
+
+    def _stop_qmt_worker(self) -> None:
+        """Stop the persistent QMT push worker."""
+        if self._qmt_queue is not None:
+            try:
+                self._qmt_queue.put_nowait(None)
+            except Exception:
+                pass
+        if self._qmt_process is not None:
+            self._qmt_process.join(timeout=10)
+            if self._qmt_process.is_alive():
+                logger.warning("[qmt] worker did not stop in time; terminating")
+                self._qmt_process.terminate()
+                self._qmt_process.join(timeout=5)
+        self._qmt_queue = None
+        self._qmt_process = None
 
     def _release_pool(self) -> None:
         """Release factor workers before memory-heavy post-close archive upload."""
@@ -357,6 +404,18 @@ class NativeEngine:
         except Exception as exc:
             logger.warning("[native] OSS prev day load failed: %s", exc)
         return None
+
+    def _load_idx_cons(self) -> None:
+        """Load index constituent data from MySQL at startup."""
+        index_ids_str = os.environ.get("IDX_CONS_IDS", "")
+        index_ids = [s.strip() for s in index_ids_str.split(",") if s.strip()]
+        if not index_ids:
+            logger.warning("[native] IDX_CONS_IDS not configured, skip idx_cons loading")
+            return
+        self._idx_cons_cache = IdxConsCache(index_ids=index_ids)
+        if self._idx_cons_cache.load():
+            self._idx_cons_df = self._idx_cons_cache.get_idx_cons()
+        logger.info("[native] idx_cons: %d rows loaded", len(self._idx_cons_df))
 
     def _scan_shm_files(self) -> Dict[str, Dict[int, str]]:
         """Scan SHM directory, return {code: {kind: path}}.
@@ -829,8 +888,9 @@ class NativeEngine:
 
         t0 = time.time()
 
+        factor_fn = self._daily_factor_fn if (is_daily and self._daily_factor_fn) else self.factor_calculation
         global _factor_fn, _market_df, _daily_basic_df, _base_ns
-        _factor_fn = self.factor_calculation
+        _factor_fn = factor_fn
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
         _base_ns = pd.Timestamp(date_str).value
@@ -842,7 +902,7 @@ class NativeEngine:
         tasks = [
             (code, date_str, end_time, wall_secs, states_snapshot.get(code),
              tick_paths.get(code, ""), deal_paths.get(code, ""), order_paths.get(code, ""),
-             date_str, self.factor_calculation)
+             date_str, factor_fn)
             for code in all_codes
         ]
 
@@ -914,6 +974,37 @@ class NativeEngine:
                      stocks=len(all_codes), results=len(results),
                      compute_ms=round(elapsed_ms, 1))
 
+    def _handle_output_child(self, pid: int, read_fd: int, date_str: str, end_time: str) -> None:
+        """Read inference output from the output child and enqueue QMT work in parent."""
+        positions_df = None
+        try:
+            with os.fdopen(read_fd, "rb") as pipe:
+                try:
+                    positions_df = pickle.load(pipe)
+                except EOFError:
+                    positions_df = None
+        except Exception as exc:
+            logger.error("[output-child] failed to read QMT payload from pid=%d: %s", pid, exc)
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
+        if positions_df is None or positions_df.empty:
+            return
+
+        if self._qmt_queue is not None:
+            try:
+                self._qmt_queue.put_nowait((positions_df, date_str, end_time))
+                logger.info("[qmt] enqueued %d rows date=%s end_time=%s",
+                            len(positions_df), date_str, end_time)
+            except queue.Full:
+                logger.error("[qmt] queue full, drop %d rows date=%s end_time=%s",
+                             len(positions_df), date_str, end_time)
+        else:
+            _push_to_qmt(positions_df, date_str, end_time)
+
     def _write_results(self, results: list, date_str: str, end_time: str,
                         schedule: Optional[ComputationSchedule] = None) -> None:
         """Write factor results to CSV and upload to OSS."""
@@ -927,14 +1018,15 @@ class NativeEngine:
         portfolio_context_fn = self.portfolio_context_fn
         daily_basic_df = self._daily_basic_df
         prev_day_factors = self._prev_day_factors
+        idx_cons_df = self._idx_cons_df
+        trading_universe_df = self._trading_universe_df
         try:
-            os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            pass
-        try:
+            read_fd, write_fd = os.pipe()
             pid = os.fork()
             if pid == 0:
+                os.close(read_fd)
                 try:
+                    qmt_payload = None
                     result_df = pd.DataFrame(results)
                     if output_path and not result_df.empty:
                         output_path.mkdir(parents=True, exist_ok=True)
@@ -956,10 +1048,15 @@ class NativeEngine:
                                 "end_time": end_time,
                                 "codes": _result_codes(result_df),
                                 "factor_result": result_df,
+                                "idx_cons_df": idx_cons_df,
                             }
-                            trading_universe_df = compute_trading_universe(
-                                daily_basic_df, universe_extra)
-                            index_composition_df = compute_index_composition(
+                            # Use pre-computed trading_universe from startup if available
+                            if trading_universe_df is not None and not trading_universe_df.empty:
+                                tu_df = trading_universe_df
+                            else:
+                                tu_df = compute_trading_universe(
+                                    daily_basic_df, universe_extra)
+                            idx_comp_df = compute_index_composition(
                                 daily_basic_df, universe_extra)
                             positions_df = call_inference(
                                 inference_fn,
@@ -968,8 +1065,8 @@ class NativeEngine:
                                 prev_day_factors,
                                 result_df,
                                 daily_basic_df,
-                                trading_universe_df,
-                                index_composition_df,
+                                tu_df,
+                                idx_comp_df,
                                 portfolio_context,
                             )
                             if positions_df is not None and not positions_df.empty:
@@ -978,8 +1075,7 @@ class NativeEngine:
                                     positions_df.to_csv(pos_file, index=False)
                                     logger.info("[inference] wrote %d positions to %s",
                                                 len(positions_df), pos_file)
-                                # Push to QMT via SFTP
-                                _push_to_qmt(positions_df, date_str, end_time)
+                                qmt_payload = positions_df
                         except Exception as exc:
                             logger.error("[inference] failed: %s", exc, exc_info=True)
                     if outfun is not None:
@@ -987,12 +1083,31 @@ class NativeEngine:
                             outfun(date_str, end_time, result_df)
                         except Exception as exc:
                             logger.error("[combined] outfun failed: %s", exc)
+                    with os.fdopen(write_fd, "wb") as pipe:
+                        pickle.dump(qmt_payload, pipe, protocol=pickle.HIGHEST_PROTOCOL)
                 except Exception as exc:
                     logger.error("[output-child] failed: %s", exc, exc_info=True)
+                    try:
+                        with os.fdopen(write_fd, "wb") as pipe:
+                            pickle.dump(None, pipe, protocol=pickle.HIGHEST_PROTOCOL)
+                    except OSError:
+                        pass
                 finally:
                     os._exit(0)
+            os.close(write_fd)
+            threading.Thread(
+                target=self._handle_output_child,
+                args=(pid, read_fd, date_str, end_time),
+                name=f"output-child-{pid}",
+                daemon=True,
+            ).start()
             logger.info("[combined] output forked to child pid=%d", pid)
         except OSError:
+            for fd in ("read_fd", "write_fd"):
+                try:
+                    os.close(locals()[fd])
+                except Exception:
+                    pass
             pass
 
     def run(self) -> None:
@@ -1005,6 +1120,9 @@ class NativeEngine:
 
         # Load daily basic
         self._load_daily_basic()
+
+        # Load index constituents
+        self._load_idx_cons()
 
         # Set globals for workers
         global _factor_fn, _market_df, _daily_basic_df
@@ -1021,6 +1139,16 @@ class NativeEngine:
         else:
             logger.error("[native] FACTOR_MODULE not set!")
             return
+
+        # Load daily factor module (optional, for different strategy at daily schedule)
+        if self.daily_factor_module:
+            try:
+                dmod = importlib.import_module(self.daily_factor_module)
+                self._daily_factor_fn = dmod.factor_calculation
+                logger.info("[native] loaded daily factor: %s", self.daily_factor_module)
+            except Exception as exc:
+                logger.error("[native] failed to load daily factor module %s: %s",
+                             self.daily_factor_module, exc)
 
         # Load inference module (optional)
         inference_module = os.environ.get("INFERENCE_MODULE", "")
@@ -1052,8 +1180,43 @@ class NativeEngine:
                 logger.error("[native] failed to load portfolio context module %s: %s",
                              portfolio_context_module, exc)
 
+        # Load trading universe module (optional, but must succeed if configured).
+        # Traders implement trading_universe(daily_basic_df, idx_cons_df) -> list[str]
+        # Called once at startup, result cached and passed to inference.
+        trading_universe_module = os.environ.get("TRADING_UNIVERSE_MODULE", "")
+        if trading_universe_module:
+            try:
+                tmod = importlib.import_module(trading_universe_module)
+                self.trading_universe_fn = getattr(tmod, "trading_universe", None)
+                if not self.trading_universe_fn:
+                    logger.error("[native] trading universe module %s has no "
+                                 "'trading_universe' function", trading_universe_module)
+                    return
+                logger.info("[native] loaded trading_universe: %s", trading_universe_module)
+            except Exception as exc:
+                logger.error("[native] failed to load trading universe module %s: %s",
+                             trading_universe_module, exc)
+                return
+
+            # Call trading_universe at startup
+            try:
+                universe_codes = self.trading_universe_fn(
+                    self._daily_basic_df, self._idx_cons_df,
+                )
+                if universe_codes is not None:
+                    self._trading_universe_df = build_trading_universe_df(
+                        universe_codes, self._daily_basic_df,
+                    )
+                    logger.info("[native] trading_universe returned %d codes", len(self._trading_universe_df))
+                else:
+                    logger.info("[native] trading_universe() returned None; using default universe")
+            except Exception as exc:
+                logger.error("[native] trading_universe() call failed: %s", exc)
+                return
+
         # Init pool
         self._init_pool()
+        self._init_qmt_worker()
 
         # Load previous day factors (for inference)
         if self.inference_fn is not None:
@@ -1111,89 +1274,252 @@ class NativeEngine:
         except Exception as exc:
             logger.warning("[native] final archive/upload failed: %s", exc)
         self._release_pool()
+        self._stop_qmt_worker()
 
 
-def _push_to_qmt(positions_df: pd.DataFrame, date_str: str, end_time: str) -> None:
-    """Push positions CSV to QMT Windows machine via SFTP.
+def _qmt_worker_loop(qmt_queue) -> None:
+    """Persistent QMT SFTP worker.
+
+    It receives already-aggregated inference/order DataFrames. Factor workers
+    never call this function, so one compute round can produce at most one QMT
+    upload task.
+    """
+    logger.info("[qmt] worker loop started")
+    try:
+        while True:
+            item = qmt_queue.get()
+            if item is None:
+                break
+            try:
+                orders_df, date_str, end_time = item
+                _push_to_qmt(orders_df, date_str, end_time)
+            except Exception as exc:
+                logger.error("[qmt] worker task failed: %s", exc, exc_info=True)
+    finally:
+        _close_qmt_sftp()
+        logger.info("[qmt] worker loop stopped")
+
+
+def _push_to_qmt(orders_df: pd.DataFrame, date_str: str, end_time: str) -> None:
+    """Push QMT CSV-preorder signal file to QMT Windows machine via SFTP.
 
     Env vars:
         QMT_SFTP_HOST:   Windows machine IP (required)
         QMT_SFTP_PORT:   SSH port (default 22)
         QMT_SFTP_USER:   SSH username
         QMT_SFTP_KEY:    Path to SSH private key file
-        QMT_SFTP_DIR:    Remote directory (default D:\\qmt_inbox)
+        QMT_ORDER_REMOTE_DIR: QMT CSV-preorder monitor directory
+        QMT_SFTP_DIR:    Deprecated fallback for QMT_ORDER_REMOTE_DIR
         QMT_SFTP_PASS:   SSH password (alternative to key)
         QMT_SFTP_TIMEOUT: SSH/SFTP timeout seconds (default 10)
+        QMT_ACCOUNT_ID:  QMT fund account used in signal file name
+        QMT_ACCOUNT_TYPE: QMT account type, default 2 (stock)
+        QMT_STRATEGY_NAME: default strategy name in signal rows
     """
     host = os.environ.get("QMT_SFTP_HOST", "")
     if not host:
         return  # not configured
 
-    import io
+    account_id = os.environ.get("QMT_ACCOUNT_ID", "")
+    if not account_id:
+        logger.error("[qmt] QMT_ACCOUNT_ID not configured, skip signal push")
+        return
+
+    signal_text = _build_qmt_signal_text(orders_df, date_str, end_time)
+    if not signal_text:
+        return
+
     try:
         import paramiko
     except ImportError:
         logger.error("[qmt] paramiko not installed, skip SFTP push")
         return
 
-    ssh = None
-    sftp = None
     try:
-        port = int(os.environ.get("QMT_SFTP_PORT", "22"))
-        user = os.environ.get("QMT_SFTP_USER", "quant")
-        key_path = os.environ.get("QMT_SFTP_KEY", "")
-        password = os.environ.get("QMT_SFTP_PASS", "")
-        remote_dir = os.environ.get("QMT_SFTP_DIR", "D:\\\\qmt_inbox")
-        timeout = float(os.environ.get("QMT_SFTP_TIMEOUT", "10"))
-
-        connect_kwargs = {
-            "hostname": host,
-            "port": port,
-            "username": user,
-            "timeout": timeout,
-            "banner_timeout": timeout,
-            "auth_timeout": timeout,
-            "look_for_keys": False,
-            "allow_agent": False,
-        }
-        if key_path and Path(key_path).exists():
-            connect_kwargs["key_filename"] = key_path
-            if password:
-                connect_kwargs["password"] = password
-        elif key_path:
-            logger.warning("[qmt] QMT_SFTP_KEY does not exist: %s", key_path)
-            if password:
-                connect_kwargs["password"] = password
-            else:
-                logger.error("[qmt] no usable QMT_SFTP_KEY or QMT_SFTP_PASS configured")
-                return
-        elif password:
-            connect_kwargs["password"] = password
-        else:
-            logger.error("[qmt] no QMT_SFTP_KEY or QMT_SFTP_PASS configured")
-            return
-
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(**connect_kwargs)
-        sftp = ssh.open_sftp()
+        remote_dir = os.environ.get("QMT_ORDER_REMOTE_DIR") or os.environ.get("QMT_SFTP_DIR", "C:\\\\quant\\\\place")
+        account_type = os.environ.get("QMT_ACCOUNT_TYPE", "2")
         clean_dir = remote_dir.rstrip("\\/")
         sep = "\\" if "\\" in remote_dir else "/"
-        remote_file = f"{clean_dir}{sep}{date_str}_{end_time}_positions.csv"
-        csv_bytes = positions_df.to_csv(index=False).encode("utf-8")
-        sftp.putfo(io.BytesIO(csv_bytes), remote_file)
-        logger.info("[qmt] pushed %d positions to %s:%s (%d bytes)",
-                    len(positions_df), host, remote_file, len(csv_bytes))
+        signal_seq = f"{date_str}{end_time}{int(time.time() * 1000) % 1000000:06d}"
+        remote_file = f"{clean_dir}{sep}signal.{account_id}_{account_type}.{signal_seq}.txt"
+        remote_tmp = f"{remote_file}.tmp"
+        payload = signal_text.encode("utf-8")
+
+        sftp = _get_qmt_sftp(paramiko)
+        sftp.putfo(io.BytesIO(payload), remote_tmp)
+        sftp.rename(remote_tmp, remote_file)
+        logger.info("[qmt] pushed signal file to %s:%s (%d bytes, rows=%d)",
+                    host, remote_file, len(payload), signal_text.count("\n"))
     except Exception as exc:
+        _close_qmt_sftp()
         logger.error("[qmt] SFTP push failed: %s", exc)
-    finally:
-        if sftp is not None:
+
+
+def _get_qmt_sftp(paramiko):
+    """Return a process-local reusable SFTP connection."""
+    global _qmt_ssh, _qmt_sftp, _qmt_sftp_config
+
+    host = os.environ.get("QMT_SFTP_HOST", "")
+    port = int(os.environ.get("QMT_SFTP_PORT", "22"))
+    user = os.environ.get("QMT_SFTP_USER", "quant")
+    key_path = os.environ.get("QMT_SFTP_KEY", "")
+    password = os.environ.get("QMT_SFTP_PASS", "")
+    timeout = float(os.environ.get("QMT_SFTP_TIMEOUT", "10"))
+    config = (host, port, user, key_path, bool(password), timeout)
+
+    if _qmt_sftp is not None and _qmt_sftp_config == config:
+        try:
+            _qmt_sftp.stat(".")
+            return _qmt_sftp
+        except Exception:
+            _close_qmt_sftp()
+
+    connect_kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": user,
+        "timeout": timeout,
+        "banner_timeout": timeout,
+        "auth_timeout": timeout,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if key_path and Path(key_path).exists():
+        connect_kwargs["key_filename"] = key_path
+        if password:
+            connect_kwargs["password"] = password
+    elif key_path:
+        logger.warning("[qmt] QMT_SFTP_KEY does not exist: %s", key_path)
+        if password:
+            connect_kwargs["password"] = password
+        else:
+            raise RuntimeError("no usable QMT_SFTP_KEY or QMT_SFTP_PASS configured")
+    elif password:
+        connect_kwargs["password"] = password
+    else:
+        raise RuntimeError("no QMT_SFTP_KEY or QMT_SFTP_PASS configured")
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(**connect_kwargs)
+    _qmt_ssh = ssh
+    _qmt_sftp = ssh.open_sftp()
+    _qmt_sftp_config = config
+    return _qmt_sftp
+
+
+def _close_qmt_sftp() -> None:
+    global _qmt_ssh, _qmt_sftp, _qmt_sftp_config
+    if _qmt_sftp is not None:
+        try:
+            _qmt_sftp.close()
+        except Exception:
+            pass
+    if _qmt_ssh is not None:
+        try:
+            _qmt_ssh.close()
+        except Exception:
+            pass
+    _qmt_ssh = None
+    _qmt_sftp = None
+    _qmt_sftp_config = None
+
+
+def _build_qmt_signal_text(orders_df: pd.DataFrame, date_str: str, end_time: str) -> str:
+    """Convert engine order output to QMT CSV-preorder signal rows."""
+    rows = []
+    for _, row in orders_df.iterrows():
+        code = _qmt_code(row.get("qmt_code", row.get("code", "")))
+        volume = _qmt_volume(row)
+        order_type = _qmt_order_type(row)
+        if not code or volume <= 0 or not order_type:
+            continue
+
+        price_type = _qmt_price_type(row)
+        price = _qmt_price(row, price_type)
+        if price_type in {"3", "6"} and not price:
+            logger.error("[qmt] skip %s %s: price_type=%s requires price",
+                         code, order_type, price_type)
+            continue
+        strategy = str(row.get("strategy", "") or os.environ.get("QMT_STRATEGY_NAME", "quant_platform"))
+        note = str(row.get("note", "") or row.get("remark", "") or
+                   f"{strategy}_{date_str}{end_time}_{code}_{order_type}")
+        rows.append([note, order_type, price_type, price, code, str(volume), strategy])
+
+    if not rows:
+        logger.warning("[qmt] no valid QMT order rows; required columns include "
+                       "code, side/order_type, volume")
+        return ""
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def _qmt_code(code: object) -> str:
+    raw = str(code or "").strip().upper()
+    if not raw:
+        return ""
+    if len(raw) == 8 and (raw.startswith("SH") or raw.startswith("SZ")):
+        return raw
+    if raw.endswith(".SH"):
+        return "SH" + raw[:6]
+    if raw.endswith(".SZ"):
+        return "SZ" + raw[:6]
+    if len(raw) == 6 and raw[0] == "6":
+        return "SH" + raw
+    if len(raw) == 6 and raw[0] in {"0", "3"}:
+        return "SZ" + raw
+    return raw
+
+
+def _qmt_volume(row: pd.Series) -> int:
+    for col in ("qmt_volume", "order_volume", "volume", "qty", "quantity"):
+        if col in row and pd.notna(row[col]):
             try:
-                sftp.close()
+                return int(float(row[col]))
             except Exception:
-                pass
-        if ssh is not None:
-            ssh.close()
+                return 0
+    return 0
+
+
+def _qmt_order_type(row: pd.Series) -> str:
+    for col in ("qmt_order_type", "order_type", "报单类型"):
+        if col in row and pd.notna(row[col]):
+            try:
+                return str(int(float(row[col])))
+            except Exception:
+                return str(row[col]).strip()
+    side = str(row.get("side", row.get("action", "")) or "").strip().lower()
+    if side in {"buy", "b", "long", "23", "买", "买入"}:
+        return "23"
+    if side in {"sell", "s", "short", "24", "卖", "卖出"}:
+        return "24"
+    return ""
+
+
+def _qmt_price_type(row: pd.Series) -> str:
+    raw = row.get("qmt_price_type", row.get("price_type", row.get("quote_type", "")))
+    value = str(raw or os.environ.get("QMT_DEFAULT_PRICE_TYPE", "1")).strip()
+    mapping = {
+        "latest": "1",
+        "market": "1",
+        "last": "1",
+        "limit": "3",
+        "fixed": "3",
+    }
+    return mapping.get(value.lower(), value)
+
+
+def _qmt_price(row: pd.Series, price_type: str) -> str:
+    raw = row.get("qmt_price", row.get("order_price", row.get("limit_price", row.get("price", ""))))
+    if raw == "" or pd.isna(raw):
+        return "0" if price_type == "1" else ""
+    try:
+        return f"{float(raw):.4f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(raw).strip()
 
 
 def _result_codes(result_df: pd.DataFrame) -> List[str]:

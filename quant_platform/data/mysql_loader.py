@@ -245,8 +245,9 @@ class MySQLLoader:
         从 MySQL 加载日线基础数据（daily_basic），与 Go data-converter 的
         GenerateDailyBasicData 保持一致。
 
-        查询 mkt_equd + mkt_equd_adj_af 表，输出列:
-            _date, ID_QI, SECURITY_ID, open, high, low, close,
+        查询 mkt_equd + mkt_equd_adj_af + md_security 表，输出列:
+            _date, ID_QI, SECURITY_ID, SEC_SHORT_NAME, SEC_FULL_NAME,
+            open, high, low, close,
             adj_open, adj_close, adj_high, adj_low, adj_pre_close,
             deal_amount, volume, amount, mkt_cap, float_mkt_cap,
             turnover_rate, pe_ttm, pb
@@ -268,6 +269,8 @@ class MySQLLoader:
                 t1.TRADE_DATE        AS _date,
                 t1.TICKER_SYMBOL     AS ID_QI,
                 t1.SECURITY_ID,
+                s.SEC_SHORT_NAME      AS SEC_SHORT_NAME,
+                s.SEC_FULL_NAME       AS SEC_FULL_NAME,
                 t2.OPEN_PRICE_2      AS open,
                 t2.HIGHEST_PRICE     AS high,
                 t2.LOWEST_PRICE      AS low,
@@ -289,6 +292,8 @@ class MySQLLoader:
             JOIN mkt_equd_adj_af t2
                 ON  t1.SECURITY_ID = t2.SECURITY_ID
                 AND t1.TRADE_DATE  = t2.TRADE_DATE
+            LEFT JOIN md_security s
+                ON t1.SECURITY_ID = s.SECURITY_ID
             WHERE t1.TRADE_DATE = %s
               AND t1.EXCHANGE_CD IN ('XSHG', 'XSHE')
             ORDER BY t1.TICKER_SYMBOL
@@ -370,6 +375,81 @@ class MySQLLoader:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+    # ==================== 指数成分股 (idx_cons) ====================
+
+    def get_idx_cons(self, index_ids: List[str]) -> pd.DataFrame:
+        """
+        从 MySQL 加载指数成分股数据 (idx_cons)。
+
+        idx_cons 表结构:
+            SECURITY_ID = 指数内部ID, CONS_ID = 成分股内部ID,
+            INTO_DATE, OUT_DATE, IS_NEW
+
+        通过 JOIN mkt_idxd_csi 获取指数交易代码，
+        通过 JOIN md_security 获取成分股代码和名称。
+
+        Args:
+            index_ids: 指数 SECURITY_ID 列表，如 ["1782","2103","33736","3800","1200245"]
+
+        Returns:
+            pd.DataFrame with columns:
+                INDEX_ID, INDEX_CODE, STOCK_ID, ID_QI, SEC_SHORT_NAME,
+                INTO_DATE, OUT_DATE, IS_NEW
+        """
+        self._ensure_connection()
+
+        try:
+            with self._conn.cursor() as cursor:
+                placeholders = ",".join(["%s"] * len(index_ids))
+                sql = f"""
+                    SELECT
+                        ic.SECURITY_ID  AS INDEX_ID,
+                        idx.TICKER_SYMBOL AS INDEX_CODE,
+                        ic.CONS_ID      AS STOCK_ID,
+                        stock.TICKER_SYMBOL AS ID_QI,
+                        stock.SEC_SHORT_NAME AS SEC_SHORT_NAME,
+                        ic.INTO_DATE,
+                        ic.OUT_DATE,
+                        ic.IS_NEW
+                    FROM idx_cons ic
+                    INNER JOIN (
+                        SELECT DISTINCT INDEX_ID, TICKER_SYMBOL
+                        FROM mkt_idxd_csi
+                        WHERE INDEX_ID IN ({placeholders})
+                    ) idx ON ic.SECURITY_ID = idx.INDEX_ID
+                    INNER JOIN md_security stock
+                        ON ic.CONS_ID = stock.SECURITY_ID
+                    WHERE ic.IS_NEW = 1
+                      AND stock.ASSET_CLASS = 'E'
+                      AND stock.LIST_STATUS_CD = 'L'
+                    ORDER BY idx.TICKER_SYMBOL, stock.TICKER_SYMBOL
+                """
+                cursor.execute(sql, tuple(index_ids))
+                columns = [desc[0] for desc in cursor.description]
+                rows = cursor.fetchall()
+
+                if not rows:
+                    logger.warning(f"idx_cons: no rows for index_ids={index_ids}")
+                    return pd.DataFrame()
+
+                result = pd.DataFrame(rows, columns=columns)
+
+                # Normalize date columns to YYYYMMDD strings
+                for col in ("INTO_DATE", "OUT_DATE"):
+                    if col in result.columns:
+                        result[col] = pd.to_datetime(result[col], errors="coerce").dt.strftime("%Y%m%d")
+
+                # Pad ID_QI to 6 digits
+                if "ID_QI" in result.columns:
+                    result["ID_QI"] = result["ID_QI"].astype(str).str.zfill(6)
+
+                logger.info(f"获取 idx_cons: index_ids={index_ids}, {len(result)} 条")
+                return result
+
+        except Exception as e:
+            logger.error(f"查询 idx_cons 失败: {e}")
+            return pd.DataFrame()
 
 
 class PriceCache:
@@ -515,6 +595,58 @@ class DailyBasicCache:
 def create_loader() -> MySQLLoader:
     """创建MySQL加载器"""
     return MySQLLoader()
+
+
+class IdxConsCache:
+    """
+    指数成分股缓存
+
+    使用方式:
+        cache = IdxConsCache()
+        cache.load()
+
+        df = cache.get_idx_cons()
+    """
+
+    def __init__(self, loader: MySQLLoader = None, index_ids: List[str] = None):
+        self.loader = loader or MySQLLoader()
+        self.index_ids = index_ids or []
+        self._df: Optional[pd.DataFrame] = None
+        self._lock = threading.RLock()
+
+    def load(self) -> bool:
+        """加载指数成分股数据."""
+        try:
+            if not self.loader._conn:
+                self.loader.connect()
+
+            df = self.loader.get_idx_cons(self.index_ids)
+
+            with self._lock:
+                self._df = df
+
+            logger.info(f"idx_cons 缓存加载完成: index_ids={self.index_ids}, {len(df)} 条")
+            return True
+        except Exception as e:
+            logger.error(f"加载 idx_cons 缓存失败: {e}")
+            return False
+
+    def get_idx_cons(self) -> pd.DataFrame:
+        """获取 idx_cons DataFrame."""
+        with self._lock:
+            return self._df if self._df is not None else pd.DataFrame()
+
+    def get_index_members(self, index_id: str) -> List[str]:
+        """获取指定指数的成分股 ID_QI 列表."""
+        with self._lock:
+            if self._df is None or self._df.empty:
+                return []
+            mask = self._df["INDEX_ID"].astype(str) == str(index_id)
+            return self._df.loc[mask, "ID_QI"].dropna().astype(str).tolist()
+
+    def is_loaded(self) -> bool:
+        """是否已加载数据."""
+        return self._df is not None and not self._df.empty
 
 
 def create_price_cache(trade_date: str = None) -> PriceCache:

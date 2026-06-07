@@ -12,9 +12,7 @@ cd "$ROOT_DIR"
 echo "[build] image: ${REGISTRY}/${IMAGE}:${TAG}"
 echo "[build] dockerfile: ${DOCKERFILE}"
 
-test -f vendor/mdl-sdk/libs/linux/libmdl_api.so
-test -f vendor/mdl-sdk/libs/linux/libjson.a
-test -f vendor/mdl-client/mdl_forward_2.13.232_linux.tar.gz
+scripts/ensure_mdl_vendor.sh
 
 if [ "$TAG" = "latest" ]; then
   docker build \

@@ -3,8 +3,10 @@ FROM 172.24.99.176:5000/quant-platform/backtest-base:latest AS cpp-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends cmake g++ make && rm -rf /var/lib/apt/lists/*
 
-# Copy MDL C++ SDK (headers + shared lib)
+# Copy MDL C++ SDK headers + static libs (small, tracked in git)
 COPY vendor/mdl-sdk/ /opt/mdl-sdk/
+
+RUN chmod +x /opt/mdl-sdk/libs/linux/libmdl_api.so
 
 # Copy native collector source
 COPY native_mdl_collector/ /app/native_mdl_collector/
@@ -26,7 +28,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install MDL Linux client (feeder_client sidecar)
+# Install MDL Linux client (feeder_client sidecar) from local vendor cache.
 COPY vendor/mdl-client/mdl_forward_2.13.232_linux.tar.gz /tmp/
 RUN mkdir -p /opt/mdl-client \
     && tar xzf /tmp/mdl_forward_2.13.232_linux.tar.gz -C /opt/mdl-client \

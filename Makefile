@@ -14,6 +14,7 @@ all: build push
 # ============================================================
 build:
 	@echo "==> Building Docker image..."
+	scripts/ensure_mdl_vendor.sh
 	docker build -f docker/combined-engine.Dockerfile \
 	    -t $(REGISTRY)/$(IMAGE):latest \
 	    -t $(REGISTRY)/$(IMAGE):$(TAG) \

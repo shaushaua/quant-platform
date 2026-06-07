@@ -19,7 +19,9 @@ test_*.py
 *.parquet
 .env
 
-# Local vendor binaries
+# Local vendor binaries (downloaded before Docker build, not tracked)
+/vendor/mdl-sdk/libs/linux/libmdl_api.so
+/vendor/mdl-client/*.tar.gz
 /vendor/pymdl/*.tar.gz
 /vendor/mdl_parser/*.whl
 

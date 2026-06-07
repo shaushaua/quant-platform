@@ -148,9 +148,33 @@ def compute_index_composition(
 ) -> pd.DataFrame:
     """Compute per-stock index composition data passed to inference.
 
-    Placeholder for now; fill this with index constituent/weight logic later.
+    If ``extra_fields["idx_cons_df"]`` is provided (from IdxConsCache), builds
+    a per-stock frame with index membership flags.  Otherwise returns empty.
+
+    Expected idx_cons_df columns: INDEX_ID, INDEX_CODE, STOCK_ID, ID_QI, ...
     """
-    return pd.DataFrame()
+    extra_fields = extra_fields or {}
+    idx_cons_df = extra_fields.get("idx_cons_df")
+    if idx_cons_df is None or idx_cons_df.empty:
+        return pd.DataFrame()
+
+    # Build a wide DataFrame: one row per stock (ID_QI), one boolean column per index
+    result = idx_cons_df[["ID_QI", "INDEX_ID"]].copy()
+    result["in_index"] = True
+    wide = result.pivot_table(
+        index="ID_QI", columns="INDEX_ID", values="in_index", fill_value=False,
+    ).astype(bool)
+    wide.columns = [f"in_idx_{c}" for c in wide.columns]
+    wide = wide.reset_index()
+
+    # Merge SECURITY_ID from daily_basic if available
+    if daily_basic_df is not None and not daily_basic_df.empty:
+        if "ID_QI" in daily_basic_df.columns and "SECURITY_ID" in daily_basic_df.columns:
+            id_map = daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates("ID_QI")
+            id_map["ID_QI"] = id_map["ID_QI"].astype(str).str.zfill(6)
+            wide = wide.merge(id_map, on="ID_QI", how="left")
+
+    return wide
 
 
 def call_inference(

@@ -10,6 +10,20 @@
 QMT 启动监控后，会扫描该目录下符合格式的 `TXT` 下单文件，并同步导出委托、成交、
 持仓、资金等回报文件。
 
+当前实盘配置建议拆成两个目录：
+
+```text
+C:\quant\place      # CSV 预埋单监控目录，系统上传 signal.*.txt
+C:\quant\position   # QMT 数据导出目录，系统读取持仓/资金/委托/成交
+```
+
+对应 K8s 环境变量：
+
+```text
+QMT_ORDER_REMOTE_DIR=C:\\quant\\place
+QMT_EXPORT_REMOTE_DIR=C:\\quant\\position
+```
+
 ### 1.2 输入文件名
 
 报单/撤单文件名：
@@ -170,6 +184,40 @@ CSV 预埋单使用以下报价方式。不要与便捷交易的报价代码混�
 3 指定价
 ```
 
+### 1.7.1 引擎输出到 QMT adapter 的字段
+
+实盘引擎不会把 `position` 权重直接推给 QMT。只有推理模块返回明确订单字段时，
+才会生成 QMT `signal.*.txt` 文件。
+
+最小字段：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `code` | 是 | 内部代码，如 `600000.SH` 或 `000001.SZ` |
+| `side` | 是 | `buy`/`sell`，也支持 `买入`/`卖出` |
+| `volume` | 是 | 下单股数 |
+
+可选字段：
+
+| 字段 | 说明 |
+|------|------|
+| `price_type` | `latest`/`market` 映射为 `1`；`limit` 映射为 `3`；也可直接填 `1`/`3`/`M1` 等 |
+| `limit_price` | 指定价，`price_type=3` 时使用 |
+| `strategy` | 策略名称，缺省使用 `QMT_STRATEGY_NAME` |
+| `note` / `remark` | 投资备注 |
+| `qmt_order_type` | 直接指定 QMT 报单类型，例如 `23`/`24` |
+| `qmt_price_type` | 直接指定 QMT 报价方式 |
+| `qmt_price` | 直接指定 QMT 报单价格 |
+| `qmt_volume` | 直接指定 QMT 下单总量 |
+
+示例：
+
+```csv
+code,side,volume,price_type,limit_price,strategy,note
+600000.SH,buy,1000,latest,0,model_a,model_a_20260607093500
+000001.SZ,sell,500,limit,9.87,model_a,model_a_20260607093500
+```
+
 ### 1.8 撤单文件内容
 
 撤单文件名仍然使用：
@@ -214,5 +262,3 @@ signal_backup\
 ```
 
 这些是 QMT 输出文件，用于读取委托、成交、持仓和资金状态。不要把它们当作下单输入。
-
-

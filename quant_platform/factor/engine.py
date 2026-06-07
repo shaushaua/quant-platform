@@ -705,7 +705,7 @@ def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str) -> St
             price_sample = fc.l2_deal["Price"].iloc[0]
         elif not fc.l2_order.empty and "Price" in fc.l2_order.columns:
             price_sample = fc.l2_order["Price"].iloc[0]
-        logger.info(
+        logger.debug(
             "[StockData] %s date=%s end_time=%s order=%d行 deal=%d行 tick=%d行 "
             "market=%d行 Price样本=%s",
             fc.code, date, end_time, len(fc.l2_order), len(fc.l2_deal),

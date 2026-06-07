@@ -70,13 +70,17 @@ spec:
               value: /data/quant/mdl_logs/mdl
             # --- 因子计算 ---
             - name: FACTOR_MODULE
+              value: "quant_platform.factor.examples.protected_eillen_intraday_strategy"
+            - name: DAILY_FACTOR_MODULE
               value: "quant_platform.factor.examples.protected_eillen_strategy"
             - name: INFERENCE_MODULE
               value: ""
+            - name: PORTFOLIO_CONTEXT_MODULE
+              value: "quant_platform.broker.qmt_context"
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: COMPUTE_SCHEDULES
-              value: "minute"
+              value: "minute,daily"
             - name: DAILY_FACTOR_TRIGGER_TIME
               value: "15:10"
             # --- QMT SFTP push ---
@@ -89,9 +93,23 @@ spec:
             - name: QMT_SFTP_KEY
               value: ""
             - name: QMT_SFTP_DIR
-              value: "D:\\\\qmt_inbox"
+              value: "C:\\\\quant\\\\place"
+            - name: QMT_ORDER_REMOTE_DIR
+              value: "C:\\\\quant\\\\place"
+            - name: QMT_EXPORT_REMOTE_DIR
+              value: "C:\\\\quant\\\\position"
+            - name: QMT_EXPORT_LOCAL_DIR
+              value: "/data/qmt/position"
             - name: QMT_SFTP_TIMEOUT
               value: "10"
+            - name: QMT_ACCOUNT_ID
+              value: ""
+            - name: QMT_ACCOUNT_TYPE
+              value: "2"
+            - name: QMT_STRATEGY_NAME
+              value: "quant_platform"
+            - name: QMT_DEFAULT_PRICE_TYPE
+              value: "1"
             - name: DATA_FLUSH_INTERVAL
               value: "0.01"
             - name: SHM_STORE_BACKEND
@@ -102,6 +120,13 @@ spec:
               value: /data/factors
             - name: DAILY_BASIC_MARKET_COUNT
               value: "5"
+            # --- 指数成分股（MySQL idx_cons 表，填指数 SECURITY_ID）---
+            # 1782=沪深300, 2103=中证500, 33736=中证1000, 3800=中证全指, 1200245=中证2000
+            - name: IDX_CONS_IDS
+              value: "1782,2103,33736,3800,1200245"
+            # --- 交易员 trading_universe 接口（可选，配了则必须成功）---
+            - name: TRADING_UNIVERSE_MODULE
+              value: ""
             - name: FACTOR_WORKERS
               value: "40"
             # --- 原始行情归档：内存计算同时落盘，盘后上传 OSS ---

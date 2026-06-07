@@ -110,18 +110,35 @@ def inference(date_str: str, end_time: str,
 
 ### 5. index_composition_df — 指数成分分股数据
 
-`index_composition_df` 用于传入指数成分、权重、成分调整等分股数据。当前接口已预留，
-默认生成函数先返回空 DataFrame；后续可以在
-`quant_platform.inference.interface.compute_index_composition()` 中补充具体生成逻辑。
+`index_composition_df` 用于传入指数成分、权重、成分调整等分股数据。引擎启动时
+从 MySQL `idx_cons` 表加载，通过 `IDX_CONS_IDS` 环境变量配置指数 SECURITY_ID（逗号分隔）。
 
-建议列：
+`IDX_CONS_IDS` 默认值：`1782,2103,33736,3800,1200245`
+（沪深300/中证500/中证1000/中证全指/中证2000）。
+
+原始查询列（从 IdxConsCache 获取）：
 
 | 列 | 说明 |
 |----|------|
-| `index_code` | 指数代码 |
-| `code` | 成分股代码 |
-| `weight` | 成分权重 |
-| `as_of` | 数据日期/快照时间 |
+| `INDEX_ID` | 指数内部 ID |
+| `INDEX_CODE` | 指数交易代码，如 `000300` |
+| `STOCK_ID` | 成分股内部 SECURITY_ID |
+| `ID_QI` | 6 位股票代码，如 `000001` |
+| `SEC_SHORT_NAME` | 股票简称 |
+| `INTO_DATE` | 入选日期 |
+| `OUT_DATE` | 剔除日期 |
+
+生成后的 `index_composition_df` 为宽表格式：
+
+| 列 | 说明 |
+|----|------|
+| `ID_QI` | 6 位股票代码 |
+| `SECURITY_ID` | 股票整数 ID（从 daily_basic 补充） |
+| `in_idx_1782` | 是否为沪深300成分股 |
+| `in_idx_2103` | 是否为中证500成分股 |
+| `in_idx_33736` | 是否为中证1000成分股 |
+| `in_idx_3800` | 是否为中证全指成分股 |
+| `in_idx_1200245` | 是否为中证2000成分股 |
 
 ### 6. portfolio_context — 当前账户上下文
 
@@ -177,6 +194,27 @@ QMT 数据导出文件 / SFTP / 后续 broker adapter 获取账户快照，交�
 | `position` | float | 是 | 仓位权重 |
 
 可以额外返回任意列，引擎不会丢弃。
+
+如果需要触发 QMT CSV 预埋单，下游 QMT adapter 需要明确订单字段。单纯返回
+`position` 权重只会写本地 `{date}_{end_time}_positions.csv`，不会生成 QMT
+下单文件。
+
+QMT 下单最小字段：
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `code` | str | 股票代码，如 `600000.SH` |
+| `side` | str | `buy` / `sell` |
+| `volume` | int | 下单股数 |
+
+可选字段：
+
+| 列名 | 说明 |
+|------|------|
+| `price_type` | `latest`/`market` 或 QMT 原生报价方式 |
+| `limit_price` | 指定价 |
+| `strategy` | 策略名称 |
+| `note` | 投资备注 |
 
 ### position 权重约定
 
@@ -319,3 +357,56 @@ calc_factors_by_date_range(
 4. **性能** — 推理在 fork 子进程中执行（实盘），尽量 < 5 秒
 5. **模型文件** — bake 进 Docker 镜像，避免运行时下载
 6. **不要在推理模块直接下单** — 返回目标，由引擎/QMT adapter 统一转换
+
+## trading_universe 接口（可选，配了则必须成功）
+
+交易员可以实现 `trading_universe` 接口来定义交易股票池。引擎在 Pod 启动时调用一次，
+结果缓存并传递给每轮的 `inference()` 调用。
+
+- 未配置 `TRADING_UNIVERSE_MODULE`：引擎正常运行，推理时使用默认逻辑构建 universe
+- 配置了但加载/调用失败：引擎不进入主循环
+
+### 接口定义
+
+```python
+def trading_universe(daily_basic_df: pd.DataFrame,
+                     idx_cons_df: pd.DataFrame) -> list[str]:
+    """
+    引擎启动时调用一次。
+
+    参数:
+        daily_basic_df: 引擎已加载的 daily_basic DataFrame
+        idx_cons_df:    指数成分股 DataFrame (from MySQL idx_cons)
+                         columns: INDEX_ID, INDEX_CODE, STOCK_ID, ID_QI,
+                                  SEC_SHORT_NAME, INTO_DATE, OUT_DATE, IS_NEW
+
+    返回:
+        股票代码列表, 如 ["000001.SZ", "000002.SZ", ...]
+        或 None（表示使用默认 universe）
+    """
+```
+
+### K8s 配置
+
+```yaml
+- name: TRADING_UNIVERSE_MODULE
+  value: "quant_platform.inference.examples.my_trading_universe"
+```
+
+### 使用示例
+
+```python
+def trading_universe(daily_basic_df, idx_cons_df):
+    """只交易中证500成分股"""
+    if idx_cons_df.empty:
+        return None  # fallback to default
+
+    csi500 = idx_cons_df[idx_cons_df["INDEX_ID"].astype(str) == "2103"]
+    return [
+        f"{code.zfill(6)}.SZ" if code[0] in "03" else f"{code.zfill(6)}.SH"
+        for code in csi500["ID_QI"].dropna().astype(str)
+    ]
+```
+
+如果不配置 `TRADING_UNIVERSE_MODULE`，引擎使用 `compute_trading_universe()` 默认逻辑
+（从 daily_basic 或因子结果中提取股票列表）。
