@@ -1,6 +1,5 @@
 REGISTRY ?= 172.24.99.176:5000/quant-platform
 IMAGE ?= combined-engine
-TAG ?= $(shell date +%Y%m%d%H%M%S)
 
 .PHONY: build push deploy all
 
@@ -17,17 +16,15 @@ build:
 	scripts/ensure_mdl_vendor.sh
 	docker build -f docker/combined-engine.Dockerfile \
 	    -t $(REGISTRY)/$(IMAGE):latest \
-	    -t $(REGISTRY)/$(IMAGE):$(TAG) \
 	    .
 
 # ============================================================
 # Push Docker image to registry
 # ============================================================
 push:
-	@echo "==> Pushing $(REGISTRY)/$(IMAGE):$(TAG) ..."
-	docker push $(REGISTRY)/$(IMAGE):$(TAG)
+	@echo "==> Pushing $(REGISTRY)/$(IMAGE):latest ..."
 	docker push $(REGISTRY)/$(IMAGE):latest
-	@echo "==> Done: $(REGISTRY)/$(IMAGE):$(TAG)"
+	@echo "==> Done: $(REGISTRY)/$(IMAGE):latest"
 
 # ============================================================
 # Deploy: rollout restart on K8s
