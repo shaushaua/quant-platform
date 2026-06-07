@@ -194,7 +194,8 @@ def _latest_remote_path(sftp, remote_dir: str, prefixes: Iterable[str]) -> str:
 
 def _remote_join(remote_dir: str, filename: str) -> str:
     sep = "\\" if "\\" in remote_dir else "/"
-    return f"{remote_dir.rstrip('/\\\\')}{sep}{filename}"
+    clean_dir = remote_dir.rstrip("/\\")
+    return f"{clean_dir}{sep}{filename}"
 
 
 def _read_table(path: Optional[Path]) -> pd.DataFrame:
