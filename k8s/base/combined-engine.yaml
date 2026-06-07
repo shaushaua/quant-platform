@@ -74,7 +74,21 @@ spec:
             - name: DAILY_FACTOR_MODULE
               value: "quant_platform.factor.examples.protected_eillen_strategy"
             - name: INFERENCE_MODULE
-              value: ""
+              value: "quant_platform.inference.robot_model_inference"
+            - name: ROBOT_TARGET_CAPITAL
+              value: "100000"
+            - name: ROBOT_MAX_ORDERS
+              value: "10"
+            - name: ROBOT_POSITION_TAIL_FRAC
+              value: "0.10"
+            - name: ROBOT_LOT_SIZE
+              value: "100"
+            - name: ROBOT_DEFAULT_PRICE
+              value: "10"
+            - name: ROBOT_ENABLE_SELL
+              value: "true"
+            - name: ROBOT_STRATEGY_NAME
+              value: "robot_model"
             - name: PORTFOLIO_CONTEXT_MODULE
               value: "quant_platform.broker.qmt_context"
             - name: COMPUTE_INTERVAL
