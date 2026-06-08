@@ -31,6 +31,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from quant_platform.factor.engine import calc_factors_by_date_range
+from quant_platform.factor.time_slices import generate_intraday_end_times
 from quant_platform.data.api import DataAPI
 
 
@@ -120,11 +121,14 @@ def main():
 
         factor_info = getattr(strategy, 'factor_info', {})
         securities = getattr(strategy, 'securities', [])
-        end_times = getattr(strategy, 'end_times', [""])
+        end_times = getattr(strategy, 'end_times', None)
+        if not end_times:
+            interval = int(factor_info.get("compute_interval", 0))
+            end_times = generate_intraday_end_times(interval) if interval > 0 else [""]
 
         print(f"   ✓ factor_info: {factor_info}")
         print(f"   ✓ securities: {len(securities)} 只股票")
-        print(f"   ✓ end_times: {end_times}")
+        print(f"   ✓ end_times: count={len(end_times)}, first={end_times[:3]}, last={end_times[-3:]}")
 
     except Exception as e:
         print(f"❌ 加载策略失败: {e}")
