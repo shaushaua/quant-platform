@@ -106,6 +106,41 @@ _kind_names = {
 }
 
 
+def _code_to_id_qi(code: str) -> str:
+    return str(code).split(".")[0].zfill(6)
+
+
+def _add_code_key(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "_ID_QI_PAD" in df.columns:
+        return df
+    if "ID_QI" in df.columns:
+        df = df.copy()
+        df["_ID_QI_PAD"] = df["ID_QI"].astype(str).str.split(".").str[0].str.zfill(6)
+    elif "TICKER_SYMBOL" in df.columns:
+        df = df.copy()
+        df["_ID_QI_PAD"] = df["TICKER_SYMBOL"].astype(str).str.split(".").str[0].str.zfill(6)
+    return df
+
+
+def _filter_daily_for_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    key = _code_to_id_qi(code)
+    if "_ID_QI_PAD" in df.columns:
+        result = df[df["_ID_QI_PAD"] == key].reset_index(drop=True)
+        return result.drop(columns=["_ID_QI_PAD"], errors="ignore")
+    for col in ("ID_QI", "TICKER_SYMBOL", "code", "Code", "stock_code"):
+        if col in df.columns:
+            norm = df[col].astype(str).str.split(".").str[0].str.zfill(6)
+            return df[norm == key].reset_index(drop=True)
+    return df
+
+
+def _minute_end_time(now_dt: datetime) -> str:
+    """Return minute-boundary end_time to match historical minute slices."""
+    return now_dt.replace(second=0, microsecond=0).strftime("%H%M%S")
+
+
 def _build_df_from_native(reader: NativeShmReader, columns: list,
                           buf_cols: list, time_idx: int, updtime_idx: int,
                           trading_day: str, code: str) -> pd.DataFrame:
@@ -188,10 +223,12 @@ def _compute_stock_shm(args):
         order_df = _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code) if order_path else pd.DataFrame()
         df_ms = (time.perf_counter() - t0) * 1000
 
+        market_df = _filter_daily_for_code(_market_df, code)
         stock_data = StockData(
             code=code, date=date_str, end_time=end_time,
             l1_tick=tick_df, l2_deal=deal_df, l2_order=order_df,
-            market=_market_df, daily_basic=_daily_basic_df,
+            market=market_df,
+            daily_basic=market_df,
             state=state_snap,
         )
 
@@ -322,13 +359,40 @@ class NativeEngine:
 
     def _load_daily_basic(self) -> None:
         """Load daily basic data from MySQL."""
-        market_count = int(os.environ.get("DAILY_BASIC_MARKET_COUNT", "1"))
+        if "DAILY_BASIC_MARKET_COUNT" in os.environ:
+            market_count = int(os.environ["DAILY_BASIC_MARKET_COUNT"])
+        else:
+            market_count = 1
+            if self.factor_module:
+                try:
+                    mod = importlib.import_module(self.factor_module)
+                    factor_info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {}))
+                    market_count = int(factor_info.get("market_count", 1))
+                except Exception as exc:
+                    logger.warning("[native] failed to resolve factor market_count, fallback to 1: %s", exc)
+
         self._daily_cache = DailyBasicCache(market_count=market_count)
         self._daily_cache.load(self.trading_day)
-        self._daily_basic_df = self._daily_cache.get_daily_basic()
-        self._market_df = pd.DataFrame()
-        logger.info("[native] daily_basic: %d stocks, market: %d entries",
-                     len(self._daily_basic_df), len(self._market_df))
+        market_df = self._daily_cache.get_daily_basic()
+        market_df = _add_code_key(market_df)
+        self._market_df = market_df
+
+        if not market_df.empty and "_date" in market_df.columns:
+            today_mask = market_df["_date"].astype(str).str.replace("-", "", regex=False) == self.trading_day
+            self._daily_basic_df = market_df[today_mask].reset_index(drop=True)
+            if self._daily_basic_df.empty:
+                logger.warning(
+                    "[native] daily_basic has no rows for trading_day=%s, using full market df as fallback",
+                    self.trading_day,
+                )
+                self._daily_basic_df = market_df
+        else:
+            self._daily_basic_df = market_df
+
+        logger.info(
+            "[native] daily_basic: %d stocks, market: %d entries, market_count=%d",
+            len(self._daily_basic_df), len(self._market_df), market_count,
+        )
 
     def _load_prev_day_factors(self) -> None:
         """Load previous trading day's factor output for inference.
@@ -860,7 +924,7 @@ class NativeEngine:
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        end_time = schedule.end_time_label if is_daily and schedule is not None else now_dt.strftime("%H%M%S")
+        end_time = schedule.end_time_label if is_daily and schedule is not None else _minute_end_time(now_dt)
         self._round_count += 1
 
         files_by_code = self._scan_shm_files()

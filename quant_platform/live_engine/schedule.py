@@ -24,6 +24,7 @@ class ComputationSchedule:
     # interval mode
     interval_seconds: int = 60
     active_hours: Tuple[Tuple[int, int], Tuple[int, int]] = ((9, 15), (15, 5))
+    active_sessions: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
 
     # time_trigger mode
     trigger_times: Optional[List[Tuple[int, int]]] = None  # [(15, 10)]
@@ -44,6 +45,11 @@ class ComputationSchedule:
                 return False
             h, m = now_dt.hour, now_dt.minute
             now_min = h * 60 + m
+            if self.active_sessions:
+                return any(
+                    (sh * 60 + sm) <= now_min <= (eh * 60 + em)
+                    for (sh, sm), (eh, em) in self.active_sessions
+                )
             (sh, sm), (eh, em) = self.active_hours
             return (sh * 60 + sm) <= now_min <= (eh * 60 + em)
 
@@ -92,6 +98,7 @@ def build_schedules_from_env() -> List[ComputationSchedule]:
             schedule_type="interval",
             interval_seconds=interval,
             active_hours=((9, 15), (15, 5)),
+            active_sessions=[((9, 15), (11, 30)), ((13, 0), (15, 5))],
             run_inference=True,
             is_daily_result=False,
         ))

@@ -76,7 +76,7 @@ spec:
             - name: INFERENCE_MODULE
               value: "quant_platform.inference.robot_model_inference"
             - name: ROBOT_TARGET_CAPITAL
-              value: "100000"
+              value: "50000000"
             - name: ROBOT_MAX_ORDERS
               value: "10"
             - name: ROBOT_POSITION_TAIL_FRAC
