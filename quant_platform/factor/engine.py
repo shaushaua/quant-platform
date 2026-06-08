@@ -773,8 +773,12 @@ def _compute_code_all_endtimes(
     date: str,
     end_times: list,
     calc_fn: Callable,
+    calc_batch_fn: Optional[Callable] = None,
 ) -> dict:
     """Worker entry: compute factor_calculation for one stock across all end_times.
+
+    If calc_batch_fn is provided, calls it once with all end_times and expects
+    dict {end_time: result} back. Otherwise falls back to per-end_time calls.
 
     Returns dict: {end_time: result_or_None}
     """
@@ -792,6 +796,22 @@ def _compute_code_all_endtimes(
         l1_tick_hist=fc_data["l1_tick_hist"],
     )
     _t_deser = _wtime.time()
+
+    # --- Batch path: one call for all end_times ---
+    if calc_batch_fn is not None:
+        try:
+            stock_data = _stock_data_from_filtered(fc, date, "", zero_copy=True)
+            batch_results = calc_batch_fn(stock_data, fc.code, date, end_times)
+            _t_total = _wtime.time() - _t0
+            if _t_total > 1.0:
+                logger.info("[Worker] code=%s batch total=%.2fs deser=%.3fs results=%d",
+                            fc.code, _t_total, _t_deser - _t0,
+                            len(batch_results) if batch_results else 0)
+            return batch_results if batch_results else {}
+        except Exception as e:
+            logger.warning("[Worker] batch failed code=%s, fallback to per-et: %s", fc.code, e)
+
+    # --- Per-end_time path (original) ---
     results = {}
     _slow_count = 0
     for end_time in end_times:
