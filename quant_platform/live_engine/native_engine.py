@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 
 # Module-level globals: set before fork, inherited by child processes via COW
 _factor_fn: Optional[Callable] = None
+_factor_info: Dict[str, Any] = {}
 _market_df: pd.DataFrame = pd.DataFrame()
 _daily_basic_df: pd.DataFrame = pd.DataFrame()
 _reader_cache: Dict[str, NativeShmReader] = {}
@@ -214,13 +215,29 @@ def _compute_stock_shm(args):
     main-process StockState snapshot into the factor, matching the old
     _compute_stock_shm contract as closely as possible.
     """
-    global _factor_fn, _market_df, _daily_basic_df, _df_build_ms, _factor_ms, _profile_count
+    global _factor_fn, _factor_info, _market_df, _daily_basic_df, _base_ns, _df_build_ms, _factor_ms, _profile_count
     code, date_str, end_time, wall_secs, state_snap, tick_path, deal_path, order_path, trading_day, factor_fn = args
     try:
+        # Persistent pool workers are forked once at startup.  Main-process
+        # updates to _base_ns are not visible in those workers, so refresh it
+        # from the task's trading_day before reconstructing datetime columns.
+        _base_ns = pd.Timestamp(trading_day).value
         t0 = time.perf_counter()
-        tick_df = _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code) if tick_path else pd.DataFrame()
-        deal_df = _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code) if deal_path else pd.DataFrame()
-        order_df = _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code) if order_path else pd.DataFrame()
+        tick_df = (
+            _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code)
+            if tick_path and _factor_info.get("need_l1_tick")
+            else pd.DataFrame()
+        )
+        deal_df = (
+            _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code)
+            if deal_path and _factor_info.get("need_l2_deal")
+            else pd.DataFrame()
+        )
+        order_df = (
+            _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code)
+            if order_path and _factor_info.get("need_l2_order")
+            else pd.DataFrame()
+        )
         df_ms = (time.perf_counter() - t0) * 1000
 
         market_df = _filter_daily_for_code(_market_df, code)
@@ -279,6 +296,8 @@ class NativeEngine:
         self.trading_universe_fn: Optional[Callable] = None
         self._states: Dict[str, StockState] = {}
         self.factor_calculation: Optional[Callable] = None
+        self.factor_info: Dict[str, Any] = {}
+        self._daily_factor_info: Dict[str, Any] = {}
         self.outfun: Optional[Callable] = None
         self.inference_fn: Optional[Callable] = None
         self.portfolio_context_fn: Optional[Callable] = None
@@ -313,7 +332,7 @@ class NativeEngine:
             processes=self.n_workers,
             maxtasksperchild=None,
             initializer=_worker_init,
-            initargs=(self.factor_module, self._daily_basic_df, self._market_df),
+            initargs=(self.factor_module, self._daily_basic_df, self._market_df, self.factor_info),
         )
 
     def _init_qmt_worker(self) -> None:
@@ -952,19 +971,23 @@ class NativeEngine:
         t0 = time.time()
 
         factor_fn = self._daily_factor_fn if (is_daily and self._daily_factor_fn) else self.factor_calculation
-        global _factor_fn, _market_df, _daily_basic_df, _base_ns
+        global _factor_fn, _factor_info, _market_df, _daily_basic_df, _base_ns
         _factor_fn = factor_fn
+        _factor_info = self._daily_factor_info if (is_daily and self._daily_factor_info) else self.factor_info
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
         _base_ns = pd.Timestamp(date_str).value
 
+        active_factor_info = _factor_info
         tick_paths = {code: files_by_code[code].get(KIND_TICK, "") for code in all_codes}
         deal_paths = {code: files_by_code[code].get(KIND_DEAL, "") for code in all_codes}
         order_paths = {code: files_by_code[code].get(KIND_ORDER, "") for code in all_codes}
 
         tasks = [
             (code, date_str, end_time, wall_secs, states_snapshot.get(code),
-             tick_paths.get(code, ""), deal_paths.get(code, ""), order_paths.get(code, ""),
+             tick_paths.get(code, "") if active_factor_info.get("need_l1_tick") else "",
+             deal_paths.get(code, "") if active_factor_info.get("need_l2_deal") else "",
+             order_paths.get(code, "") if active_factor_info.get("need_l2_order") else "",
              date_str, factor_fn)
             for code in all_codes
         ]
@@ -1188,7 +1211,7 @@ class NativeEngine:
         self._load_idx_cons()
 
         # Set globals for workers
-        global _factor_fn, _market_df, _daily_basic_df
+        global _factor_fn, _factor_info, _market_df, _daily_basic_df
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
 
@@ -1196,9 +1219,11 @@ class NativeEngine:
         if self.factor_module:
             mod = importlib.import_module(self.factor_module)
             _factor_fn = mod.factor_calculation
+            self.factor_info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {})) or {}
+            _factor_info = self.factor_info
             self.factor_calculation = mod.factor_calculation
             self.outfun = getattr(mod, "outfun", None)
-            logger.info("[native] loaded factor: %s", self.factor_module)
+            logger.info("[native] loaded factor: %s factor_info=%s", self.factor_module, self.factor_info)
         else:
             logger.error("[native] FACTOR_MODULE not set!")
             return
@@ -1208,7 +1233,9 @@ class NativeEngine:
             try:
                 dmod = importlib.import_module(self.daily_factor_module)
                 self._daily_factor_fn = dmod.factor_calculation
-                logger.info("[native] loaded daily factor: %s", self.daily_factor_module)
+                self._daily_factor_info = getattr(dmod, "FACTOR_INFO", getattr(dmod, "factor_info", {})) or {}
+                logger.info("[native] loaded daily factor: %s factor_info=%s",
+                            self.daily_factor_module, self._daily_factor_info)
             except Exception as exc:
                 logger.error("[native] failed to load daily factor module %s: %s",
                              self.daily_factor_module, exc)
@@ -1536,11 +1563,12 @@ def _result_codes(result_df: pd.DataFrame) -> List[str]:
 
 
 def _worker_init(factor_module: str, daily_basic_df: pd.DataFrame,
-                 market_df: pd.DataFrame) -> None:
+                 market_df: pd.DataFrame, factor_info: Dict[str, Any]) -> None:
     """Initialize worker process."""
-    global _factor_fn, _market_df, _daily_basic_df
+    global _factor_fn, _factor_info, _market_df, _daily_basic_df
     _market_df = market_df
     _daily_basic_df = daily_basic_df
+    _factor_info = factor_info or {}
     if factor_module:
         mod = importlib.import_module(factor_module)
         _factor_fn = mod.factor_calculation
