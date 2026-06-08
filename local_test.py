@@ -62,6 +62,7 @@ def main():
     parser.add_argument('--all', action='store_true', help='测试全市场模式（仅前10只股票）')
     parser.add_argument('--output', default='./local_test_result', help='输出结果文件路径（不含扩展名）')
     parser.add_argument('--format', choices=['csv', 'parquet', 'json'], default='csv', help='输出格式（默认 csv）')
+    parser.add_argument('--processes', type=int, default=1, help='并行进程数；设为 4 可复现线上 worker pool 调用路径')
     parser.add_argument('--verbose', '-v', action='store_true', help='显示详细日志')
 
     args = parser.parse_args()
@@ -193,7 +194,7 @@ def main():
             end_date=end_date,
             end_times=end_times,
             securities=test_codes,
-            processes=1,
+            processes=args.processes,
             factor_data_handler=strategy.factor_calculation,
             outfun=collect_result,
             oss_base_path=None,

@@ -291,9 +291,18 @@ def main():
     end_times = getattr(strategy, "end_times", None)    # 策略自定义 end_times
     user_outfun = getattr(strategy, "outfun", None)
 
-    # 策略未定义 end_times 时，从 factor_info.compute_interval 自动生成
+    env_end_times = os.environ.get("END_TIMES", "").strip()
+    if env_end_times:
+        end_times = [x.strip() for x in env_end_times.split(",") if x.strip()]
+        _logger.info("end_times from env", count=len(end_times), sample=end_times[:3])
+
+    # 策略未定义 end_times 时，从 factor_info.compute_interval 或环境变量自动生成
     if not end_times:
-        interval = int(factor_info.get("compute_interval", 0))
+        interval = int(
+            factor_info.get("compute_interval", 0)
+            or os.environ.get("COMPUTE_INTERVAL", "0")
+            or os.environ.get("FACTOR_COMPUTE_INTERVAL", "0")
+        )
         if interval > 0:
             end_times = _generate_end_times(interval)
             _logger.info("end_times from compute_interval", interval=interval, count=len(end_times))

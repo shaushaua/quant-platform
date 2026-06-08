@@ -178,9 +178,13 @@ def calc_factors_by_date_range(
             # 每只股票只 filter 一次，多个 end_time 复用已过滤数据
             DATA_BATCH_SIZE = int(os.environ.get("DATA_BATCH_SIZE", "200"))
             COMPUTE_BATCH_SIZE = int(os.environ.get("FACTOR_BATCH_SIZE", "100"))
+            TASK_CODE_BATCH_SIZE = int(os.environ.get("FACTOR_TASK_CODE_BATCH_SIZE", str(COMPUTE_BATCH_SIZE)))
+            TASK_CODE_BATCH_SIZE = max(1, min(TASK_CODE_BATCH_SIZE, COMPUTE_BATCH_SIZE))
             if multi_slice:
-                logger.info("多时间切片策略：%d 个 end_time，数据加载 batch=%d，计算 batch=%d",
-                            len(_end_times), DATA_BATCH_SIZE, COMPUTE_BATCH_SIZE)
+                logger.info(
+                    "多时间切片策略：%d 个 end_time，数据加载 batch=%d，计算 batch=%d，task_codes=%d",
+                    len(_end_times), DATA_BATCH_SIZE, COMPUTE_BATCH_SIZE, TASK_CODE_BATCH_SIZE,
+                )
 
             data_batches = [_securities[i:i+DATA_BATCH_SIZE]
                             for i in range(0, len(_securities), DATA_BATCH_SIZE)]
@@ -252,8 +256,10 @@ def calc_factors_by_date_range(
                             max_inflight = processes * 2  # allow pipelining: main filters ahead while workers compute
                             futures = {}
                             submitted_at = {}
+                            task_codes = [comp_batch[i:i+TASK_CODE_BATCH_SIZE]
+                                          for i in range(0, len(comp_batch), TASK_CODE_BATCH_SIZE)]
 
-                            for code in comp_batch:
+                            for task_code_batch in task_codes:
                                 # harvest completed futures to keep inflight bounded
                                 while len(futures) >= max_inflight:
                                     done = _wait_one_future(
@@ -264,36 +270,39 @@ def calc_factors_by_date_range(
                                         continue
 
                                 try:
-                                    security_id = security_id_map[code]
                                     _t_filter = _time.time()
-                                    fc = _filter_code_from_bundle(
-                                        bundle, code, security_id, factor_info,
-                                        _perf_log=(n_codes < 10))
-                                    _t_filter_elapsed = _time.time() - _t_filter
-                                    if day_offsets:
-                                        hist_bundles = _combine_history_bundles(
-                                            date, day_offsets, fc, hist_by_code.get(code, []))
-                                        _attach_history_to_filtered(fc, hist_bundles)
+                                    filtered_codes = _filter_codes_from_bundle(
+                                        bundle,
+                                        task_code_batch,
+                                        security_id_map,
+                                        factor_info,
+                                    )
+                                    filter_elapsed = _time.time() - _t_filter
+                                    fc_dicts = []
+                                    for fc in filtered_codes:
+                                        if day_offsets:
+                                            hist_bundles = _combine_history_bundles(
+                                                date, day_offsets, fc, hist_by_code.get(fc.code, []))
+                                            _attach_history_to_filtered(fc, hist_bundles)
+                                        fc_dicts.append(_filtered_code_to_dict(fc))
                                     _t_ser = _time.time()
-                                    fc_dict = _filtered_code_to_dict(fc)
                                     _t_pickle = _time.time()
                                     future = pool.submit(
-                                        _compute_code_all_endtimes,
-                                        fc_dict, date, _end_times, _calc_fn,
+                                        _compute_codes_all_endtimes,
+                                        fc_dicts, date, _end_times, _calc_fn,
                                         factor_info,
                                     )
                                     _t_submit_elapsed = _time.time() - _t_ser
-                                    futures[future] = code
+                                    futures[future] = list(task_code_batch)
                                     submitted_at[future] = _time.time()
-                                    n_codes += 1
-                                    del fc
-                                    if n_codes <= 5 or _t_filter_elapsed > 1.0 or _t_submit_elapsed > 1.0:
+                                    n_codes += len(task_code_batch)
+                                    if n_codes <= 20 or filter_elapsed > 1.0 or _t_submit_elapsed > 1.0:
                                         logger.info(
-                                            "[Perf] code=%s filter=%.3fs pickle=%.3fs submit=%.3fs",
-                                            code, _t_filter_elapsed,
+                                            "[Perf] codes=%d sample=%s filter=%.3fs pickle=%.3fs submit=%.3fs",
+                                            len(task_code_batch), task_code_batch[:3], filter_elapsed,
                                             _t_pickle - _t_ser, _t_submit_elapsed)
                                 except Exception as e:
-                                    logger.warning("Filter failed code=%s: %s", code, e)
+                                    logger.warning("Filter failed codes=%s: %s", task_code_batch[:5], e)
 
                             # harvest remaining
                             while futures:
@@ -836,6 +845,105 @@ def _compute_code_all_endtimes(
     return results
 
 
+def _compute_codes_all_endtimes(
+    fc_data_list: list,
+    date: str,
+    end_times: list,
+    calc_fn: Callable,
+    factor_info: Optional[Dict] = None,
+) -> dict:
+    """Worker entry: compute a batch of codes in one strategy call.
+
+    Strategy receives the unified batch signature:
+      data={code: StockData}, code=[...], end_time=end_times.
+
+    Returns {code: {end_time: result_or_None}}.
+    """
+    import time as _wtime
+    _t0 = _wtime.time()
+    data_map = {}
+    codes = []
+
+    for fc_data in fc_data_list:
+        fc = _FilteredCode(
+            code=fc_data["code"],
+            security_id=fc_data["security_id"],
+            l2_order=fc_data["l2_order"],
+            l2_deal=fc_data["l2_deal"],
+            l1_tick=fc_data["l1_tick"],
+            market=fc_data["market"],
+            l2_order_hist=fc_data["l2_order_hist"],
+            l2_deal_hist=fc_data["l2_deal_hist"],
+            l1_tick_hist=fc_data["l1_tick_hist"],
+        )
+        stock_data = _stock_data_from_filtered(
+            fc,
+            date,
+            end_times[0] if len(end_times) == 1 else end_times,
+            factor_info=factor_info,
+            zero_copy=True,
+        )
+        data_map[fc.code] = stock_data
+        codes.append(fc.code)
+
+    _t_build = _wtime.time()
+    try:
+        raw = calc_fn(data_map, codes, date, end_times) if data_map else {}
+        normalized = _normalize_multi_code_batch_results(codes, end_times, raw)
+        if normalized is not None:
+            _t_total = _wtime.time() - _t0
+            if _t_total > 1.0:
+                logger.info(
+                    "[Worker] codes=%d batch total=%.2fs build=%.3fs results=%d",
+                    len(codes), _t_total, _t_build - _t0, sum(len(v) for v in normalized.values()),
+                )
+            return normalized
+        logger.debug("[Worker] codes=%d batch returned %s, fallback to per-code",
+                     len(codes), type(raw).__name__)
+    except Exception as e:
+        logger.warning("[Worker] codes=%d batch failed, fallback to per-code: %s", len(codes), e)
+
+    results = {}
+    for fc_data in fc_data_list:
+        code = fc_data["code"]
+        try:
+            results[code] = _compute_code_all_endtimes(fc_data, date, end_times, calc_fn, factor_info)
+        except Exception as e:
+            logger.warning("Worker fallback failed code=%s: %s", code, e)
+            results[code] = {et: None for et in end_times}
+    return results
+
+
+def _normalize_multi_code_batch_results(codes: list, end_times: list, value) -> Optional[dict]:
+    """Normalize batch output to {code: {end_time: result_or_None}}."""
+    if not isinstance(value, dict):
+        rows = _flatten_factor_result(value)
+        return _group_flat_rows_by_code(codes, end_times, rows)
+
+    normalized = {}
+    code_keyed = True
+    for code in codes:
+        code_value = value.get(code)
+        if code_value is None:
+            code_keyed = False
+            break
+        if not isinstance(code_value, dict):
+            code_keyed = False
+            break
+        if len(end_times) > 1:
+            if not all(et in code_value for et in end_times):
+                code_keyed = False
+                break
+            normalized[code] = {et: code_value.get(et) for et in end_times}
+        else:
+            normalized[code] = {end_times[0]: code_value}
+    if code_keyed:
+        return normalized
+
+    rows = _flatten_factor_result(value)
+    return _group_flat_rows_by_code(codes, end_times, rows)
+
+
 def _normalize_batch_results(code: str, end_times: list, value) -> Optional[dict]:
     """Normalize strategy batch output to {end_time: result_or_None}.
 
@@ -847,12 +955,14 @@ def _normalize_batch_results(code: str, end_times: list, value) -> Optional[dict
     Anything else returns None, triggering per-et fallback.
     """
     if not isinstance(value, dict):
-        return None
+        rows = _flatten_factor_result(value)
+        return {end_times[0]: rows} if len(end_times) == 1 and rows else None
 
     # Must be keyed by code
     code_value = value.get(code)
     if code_value is None:
-        return None
+        rows = _flatten_factor_result(value)
+        return {end_times[0]: rows} if len(end_times) == 1 and rows else None
 
     if not isinstance(code_value, dict):
         return None
@@ -867,18 +977,53 @@ def _normalize_batch_results(code: str, end_times: list, value) -> Optional[dict
     return {end_times[0]: code_value}
 
 
+def _group_flat_rows_by_code(codes: list, end_times: list, rows: list) -> Optional[dict]:
+    """Group flat row output from a batched strategy into worker result shape."""
+    if len(end_times) != 1 or not rows:
+        return None
+
+    wanted = {_code_to_id_qi(code): code for code in codes}
+    grouped = {code: [] for code in codes}
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        row_code = _row_code_key(row)
+        code = wanted.get(row_code)
+        if code is None:
+            return None
+        grouped[code].append(row)
+
+    if any(not items for items in grouped.values()):
+        return None
+    return {code: {end_times[0]: items} for code, items in grouped.items()}
+
+
+def _row_code_key(row: dict) -> str:
+    for key in ("code", "Code", "ID_QI", "stock_code", "ts_code"):
+        if key in row and row[key] is not None:
+            return _code_to_id_qi(row[key])
+    return ""
+
+
 def _harvest_future(future, futures_map: dict, end_time_results: dict) -> None:
     """Collect result from a completed future, remove from map."""
-    code = futures_map.pop(future, None)
-    if code is None:
+    codes = futures_map.pop(future, None)
+    if codes is None:
         return
     try:
-        code_results = future.result()
-        for et, res in code_results.items():
-            if res is not None:
-                end_time_results[et].append(res)
+        results = future.result()
+        if isinstance(codes, list):
+            for code in codes:
+                code_results = results.get(code, {}) if isinstance(results, dict) else {}
+                for et, res in code_results.items():
+                    if res is not None:
+                        end_time_results[et].append(res)
+        else:
+            for et, res in results.items():
+                if res is not None:
+                    end_time_results[et].append(res)
     except Exception as e:
-        logger.warning("Worker exception code=%s: %s", code, e)
+        logger.warning("Worker exception codes=%s: %s", codes, e)
 
 
 def _wait_one_future(
@@ -1008,6 +1153,91 @@ def _filter_code_from_bundle(
                          l2_order_hist, l2_deal_hist, l1_tick_hist)
 
 
+def _filter_codes_from_bundle(
+    bundle: _DayBundle,
+    codes: List[str],
+    security_id_map: Dict[str, Optional[int]],
+    factor_info: Optional[Dict] = None,
+) -> List[_FilteredCode]:
+    """Filter a bundle into per-code frames in one pass per table.
+
+    This avoids scanning the same large tick/deal DataFrame once per code.
+    It still materializes per-code DataFrames because StockData is per-code,
+    but the split is done with one groupby over the requested task batch.
+    """
+    code_by_security_id = {
+        int(sec_id): code
+        for code in codes
+        for sec_id in [security_id_map.get(code)]
+        if sec_id is not None
+    }
+    id_qi_by_code = {_code_to_id_qi(code): code for code in codes}
+    code_set = set(codes)
+
+    def _empty_by_code() -> Dict[str, pd.DataFrame]:
+        return {code: pd.DataFrame() for code in codes}
+
+    def _split(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        if df.empty:
+            return _empty_by_code()
+
+        col = next((c for c in ("Code", "stock_code", "code") if c in df.columns), None)
+        if col is None and "SECURITY_ID" in df.columns:
+            col = "SECURITY_ID"
+        if col is None and "ID_QI" in df.columns:
+            col = "ID_QI"
+        if col is None:
+            return {code: df.reset_index(drop=True) for code in codes}
+
+        if pd.api.types.is_integer_dtype(df[col]) and code_by_security_id:
+            wanted_ids = set(code_by_security_id.keys())
+            subset = df[df[col].isin(wanted_ids)]
+            groups = {
+                code_by_security_id[int(key)]: part.reset_index(drop=True)
+                for key, part in subset.groupby(col, sort=False)
+                if int(key) in code_by_security_id
+            }
+            return {code: groups.get(code, pd.DataFrame()) for code in codes}
+
+        if col == "ID_QI":
+            normalized = df[col].astype(str).str.zfill(6)
+        else:
+            normalized = df[col].astype(str).str.split(".").str[0].str.zfill(6)
+
+        subset = df[normalized.isin(id_qi_by_code.keys())].copy()
+        if subset.empty:
+            return _empty_by_code()
+        subset["_qp_split_code"] = normalized[subset.index].map(id_qi_by_code)
+        groups = {
+            key: part.drop(columns=["_qp_split_code"]).reset_index(drop=True)
+            for key, part in subset.groupby("_qp_split_code", sort=False)
+            if key in code_set
+        }
+        return {code: groups.get(code, pd.DataFrame()) for code in codes}
+
+    deal_by_code = _split(bundle.l2_deal)
+    tick_by_code = _split(bundle.l1_tick)
+    market_by_code = _split(bundle.market)
+
+    filtered: List[_FilteredCode] = []
+    for code in codes:
+        deal = _restore_oss_precision(deal_by_code.get(code, pd.DataFrame()), code)
+        tick = _restore_oss_precision(tick_by_code.get(code, pd.DataFrame()), code)
+        market = market_by_code.get(code, pd.DataFrame())
+        filtered.append(_FilteredCode(
+            code,
+            security_id_map.get(code),
+            pd.DataFrame(),
+            deal,
+            tick,
+            market,
+            [],
+            [],
+            [],
+        ))
+    return filtered
+
+
 def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str,
                              factor_info: Optional[Dict] = None,
                              zero_copy: bool = False) -> StockData:
@@ -1099,7 +1329,48 @@ def _merge_results(all_res: list) -> pd.DataFrame:
     """
     if not all_res:
         return pd.DataFrame()
-    return pd.DataFrame(all_res)
+
+    rows = []
+    for res in all_res:
+        rows.extend(_flatten_factor_result(res))
+    return pd.DataFrame(rows)
+
+
+def _flatten_factor_result(res) -> list:
+    """Normalize strategy output to a list of row dicts.
+
+    Some intraday strategies keep the public day-level call signature and
+    return 245 minute rows as {0: row, 1: row, ...}. Pandas would otherwise
+    treat that as one record with integer columns, corrupting the output.
+    """
+    if res is None:
+        return []
+
+    if isinstance(res, pd.DataFrame):
+        return res.to_dict("records")
+
+    if isinstance(res, list):
+        rows = []
+        for item in res:
+            rows.extend(_flatten_factor_result(item))
+        return rows
+
+    if not isinstance(res, dict):
+        return []
+
+    if _is_row_dict(res):
+        return [res]
+
+    values = list(res.values())
+    if values and all(isinstance(item, dict) for item in values):
+        return values
+
+    return [res]
+
+
+def _is_row_dict(res: dict) -> bool:
+    """Return True when a dict already represents one factor row."""
+    return any(key in res for key in ("code", "Code", "ID_QI", "datetime", "date", "end_time"))
 
 
 def _daily_basic_for_inference(
