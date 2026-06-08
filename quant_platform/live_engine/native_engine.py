@@ -378,14 +378,16 @@ class NativeEngine:
         self._market_df = market_df
 
         if not market_df.empty and "_date" in market_df.columns:
-            today_mask = market_df["_date"].astype(str).str.replace("-", "", regex=False) == self.trading_day
+            date_values = market_df["_date"].astype(str).str.replace("-", "", regex=False)
+            today_mask = date_values == self.trading_day
             self._daily_basic_df = market_df[today_mask].reset_index(drop=True)
             if self._daily_basic_df.empty:
+                latest_date = date_values.max()
                 logger.warning(
-                    "[native] daily_basic has no rows for trading_day=%s, using full market df as fallback",
-                    self.trading_day,
+                    "[native] daily_basic has no rows for trading_day=%s, using latest date=%s as fallback",
+                    self.trading_day, latest_date,
                 )
-                self._daily_basic_df = market_df
+                self._daily_basic_df = market_df[date_values == latest_date].reset_index(drop=True)
         else:
             self._daily_basic_df = market_df
 
