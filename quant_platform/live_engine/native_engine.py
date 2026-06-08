@@ -236,7 +236,7 @@ _profile_count = 0
 def _compute_code_batch_shm(args):
     """Worker path: build a per-process code batch and call strategy once."""
     global _base_ns, _df_build_ms, _factor_ms, _profile_count
-    codes, date_str, end_time, wall_secs, states_snapshot, tick_paths, deal_paths, order_paths, trading_day, factor_module, factor_info = args
+    codes, date_str, end_time, wall_secs, states_snapshot, tick_paths, deal_paths, order_paths, trading_day, factor_module, factor_info, is_daily = args
     results = []
     errors = 0
     build_t0 = time.perf_counter()
@@ -285,31 +285,71 @@ def _compute_code_batch_shm(args):
 
         build_ms = (time.perf_counter() - build_t0) * 1000
         factor_t0 = time.perf_counter()
-        raw = factor_fn(data_map, list(data_map.keys()), date_str, [end_time]) if data_map else {}
-        factor_ms = (time.perf_counter() - factor_t0) * 1000
-        if not isinstance(raw, dict):
-            return results, len(codes), build_ms, factor_ms, f"batch result must be dict, got {type(raw).__name__}"
+        requested_codes = list(data_map.keys())
 
-        for code, res in raw.items():
-            if code not in data_map:
-                logger.warning("[%s] batch result code not in request", code)
+        from ..factor.engine import (
+            _flatten_factor_result,
+            _normalize_multi_code_batch_results,
+        )
+
+        if is_daily:
+            returned_codes = set()
+            for code, stock_data in data_map.items():
+                try:
+                    raw_one = factor_fn(stock_data, code, date_str, end_time)
+                except Exception as exc:
+                    logger.warning("[%s] daily factor_calculation failed: %s", code, exc)
+                    errors += 1
+                    continue
+                rows = _flatten_factor_result(raw_one)
+                if not rows:
+                    continue
+                returned_codes.add(code)
+                results.extend(rows)
+
+            factor_ms = (time.perf_counter() - factor_t0) * 1000
+            missing = set(data_map.keys()) - returned_codes
+            if missing:
+                logger.info("[daily] missing results for %d/%d codes", len(missing), len(data_map))
+            _df_build_ms += build_ms
+            _factor_ms += factor_ms
+            _profile_count += 1
+            return results, errors, build_ms, factor_ms, None
+
+        raw = factor_fn(data_map, requested_codes, date_str, [end_time]) if data_map else {}
+        factor_ms = (time.perf_counter() - factor_t0) * 1000
+        try:
+            normalized = _normalize_multi_code_batch_results(
+                requested_codes, [end_time], raw)
+        except Exception as exc:
+            normalized = None
+            logger.warning("[batch] normalize result failed: %s", exc)
+
+        if normalized is None:
+            return results, len(codes), build_ms, factor_ms, (
+                f"batch result protocol mismatch: got {type(raw).__name__}"
+            )
+
+        returned_codes = set()
+        for code, et_map in normalized.items():
+            rows = _flatten_factor_result(et_map.get(end_time))
+            if not rows:
                 continue
-            if res is None:
-                continue
-            if not isinstance(res, dict):
-                logger.warning("[%s] batch result must be dict, got %s", code, type(res).__name__)
-                errors += 1
-                continue
+            returned_codes.add(code)
             state = states_snapshot.get(code)
+            data_latency_ms = None
             if state and state.last_market_time:
                 market_secs = _time_to_seconds(state.last_market_time)
                 if market_secs > 0:
-                    data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
-                    if abs(data_latency_ms) < 600_000:
-                        res["data_latency_ms"] = data_latency_ms
-            results.append(res)
+                    candidate = round((wall_secs - market_secs) * 1000, 1)
+                    if abs(candidate) < 600_000:
+                        data_latency_ms = candidate
+            for res in rows:
+                if data_latency_ms is not None:
+                    res["data_latency_ms"] = data_latency_ms
+                results.append(res)
 
-        missing = set(data_map.keys()) - set(raw.keys())
+        missing = set(data_map.keys()) - returned_codes
         if missing:
             logger.info("[batch] missing results for %d/%d codes", len(missing), len(data_map))
 
@@ -1051,7 +1091,7 @@ class NativeEngine:
              {code: tick_paths.get(code, "") for code in batch},
              {code: deal_paths.get(code, "") for code in batch},
              {code: order_paths.get(code, "") for code in batch},
-             date_str, factor_module_path, active_factor_info)
+             date_str, factor_module_path, active_factor_info, is_daily)
             for batch in code_batches
         ]
 

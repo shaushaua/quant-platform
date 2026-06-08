@@ -887,31 +887,20 @@ def _compute_codes_all_endtimes(
         codes.append(fc.code)
 
     _t_build = _wtime.time()
-    try:
-        raw = calc_fn(data_map, codes, date, end_times) if data_map else {}
-        normalized = _normalize_multi_code_batch_results(codes, end_times, raw)
-        if normalized is not None:
-            _t_total = _wtime.time() - _t0
-            if _t_total > 1.0:
-                logger.info(
-                    "[Worker] codes=%d batch total=%.2fs build=%.3fs results=%d",
-                    len(codes), _t_total, _t_build - _t0, sum(len(v) for v in normalized.values()),
-                )
-            return normalized
-        logger.debug("[Worker] codes=%d batch returned %s, fallback to per-code",
-                     len(codes), type(raw).__name__)
-    except Exception as e:
-        logger.warning("[Worker] codes=%d batch failed, fallback to per-code: %s", len(codes), e)
-
-    results = {}
-    for fc_data in fc_data_list:
-        code = fc_data["code"]
-        try:
-            results[code] = _compute_code_all_endtimes(fc_data, date, end_times, calc_fn, factor_info)
-        except Exception as e:
-            logger.warning("Worker fallback failed code=%s: %s", code, e)
-            results[code] = {et: None for et in end_times}
-    return results
+    raw = calc_fn(data_map, codes, date, end_times) if data_map else {}
+    normalized = _normalize_multi_code_batch_results(codes, end_times, raw)
+    if normalized is None:
+        raise ValueError(
+            f"batch result protocol mismatch: got {type(raw).__name__}, "
+            "expected {code: result}, {code: {end_time: result}}, or rows with code/ID_QI"
+        )
+    _t_total = _wtime.time() - _t0
+    if _t_total > 1.0:
+        logger.info(
+            "[Worker] codes=%d batch total=%.2fs build=%.3fs results=%d",
+            len(codes), _t_total, _t_build - _t0, sum(len(v) for v in normalized.values()),
+        )
+    return normalized
 
 
 def _normalize_multi_code_batch_results(codes: list, end_times: list, value) -> Optional[dict]:

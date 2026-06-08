@@ -54,6 +54,35 @@ def parse_date_range(date_arg: str):
         return date_arg, date_arg
 
 
+class BatchSignatureAdapter:
+    """Force local tests to use the production batch strategy signature.
+
+    The factor engine's serial path invokes a scalar handler. This adapter keeps
+    local `--processes=1` useful by converting that scalar engine call into the
+    batch-style call expected in live/backtest worker paths:
+      factor_calculation({code: StockData}, [code], date, [end_time])
+    """
+
+    def __init__(self, factor_calculation):
+        self.factor_calculation = factor_calculation
+
+    def __call__(self, stock_data, code, date, end_time):
+        raw = self.factor_calculation({code: stock_data}, [code], date, [end_time])
+        return self._unwrap(code, end_time, raw)
+
+    @staticmethod
+    def _unwrap(code, end_time, raw):
+        if not isinstance(raw, dict):
+            return raw
+
+        code_value = raw.get(code)
+        if code_value is None:
+            return raw
+        if isinstance(code_value, dict) and end_time in code_value:
+            return code_value.get(end_time)
+        return code_value
+
+
 def main():
     parser = argparse.ArgumentParser(description='本地测试因子策略')
     parser.add_argument('strategy', help='策略文件路径 (如 strategy.py)')
@@ -130,6 +159,7 @@ def main():
         print(f"   ✓ factor_info: {factor_info}")
         print(f"   ✓ securities: {len(securities)} 只股票")
         print(f"   ✓ end_times: count={len(end_times)}, first={end_times[:3]}, last={end_times[-3:]}")
+        print("   ✓ call_signature: batch ({code: StockData}, [code], date, [end_time])")
 
     except Exception as e:
         print(f"❌ 加载策略失败: {e}")
@@ -195,7 +225,7 @@ def main():
             end_times=end_times,
             securities=test_codes,
             processes=args.processes,
-            factor_data_handler=strategy.factor_calculation,
+            factor_data_handler=BatchSignatureAdapter(strategy.factor_calculation),
             outfun=collect_result,
             oss_base_path=None,
         )
