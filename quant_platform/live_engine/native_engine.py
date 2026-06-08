@@ -72,6 +72,7 @@ _factor_info: Dict[str, Any] = {}
 _market_df: pd.DataFrame = pd.DataFrame()
 _daily_basic_df: pd.DataFrame = pd.DataFrame()
 _reader_cache: Dict[str, NativeShmReader] = {}
+_strategy_cache: Dict[str, tuple[Callable, Dict[str, Any]]] = {}
 _base_ns: int = 0  # pd.Timestamp(trading_day).value, set once per day
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -79,6 +80,43 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("[native] invalid %s=%r, fallback to %d", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning("[native] invalid %s=%r < %d, fallback to %d", name, raw, minimum, default)
+        return default
+    return value
+
+
+def _get_worker_strategy(module_path: str, fallback_info: Optional[Dict[str, Any]] = None) -> tuple[Callable, Dict[str, Any]]:
+    """Import/cache a strategy inside the worker process.
+
+    Avoid sending function objects through multiprocessing queues and let
+    persistent workers switch between minute/daily strategy modules by task.
+    """
+    if not module_path:
+        if _factor_fn is None:
+            raise RuntimeError("factor module is empty and worker has no default factor")
+        return _factor_fn, (fallback_info or _factor_info or {})
+
+    cached = _strategy_cache.get(module_path)
+    if cached is not None:
+        return cached
+
+    mod = importlib.import_module(module_path)
+    fn = mod.factor_calculation
+    info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", None)) or fallback_info or {}
+    _strategy_cache[module_path] = (fn, info)
+    return fn, info
 
 
 # ── DataFrame construction from native mmap ────────────────────────
@@ -108,6 +146,7 @@ _kind_names = {
 
 
 def _code_to_id_qi(code: str) -> str:
+    """保留：_add_code_key 使用。"""
     return str(code).split(".")[0].zfill(6)
 
 
@@ -120,20 +159,6 @@ def _add_code_key(df: pd.DataFrame) -> pd.DataFrame:
     elif "TICKER_SYMBOL" in df.columns:
         df = df.copy()
         df["_ID_QI_PAD"] = df["TICKER_SYMBOL"].astype(str).str.split(".").str[0].str.zfill(6)
-    return df
-
-
-def _filter_daily_for_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
-    if df.empty:
-        return df
-    key = _code_to_id_qi(code)
-    if "_ID_QI_PAD" in df.columns:
-        result = df[df["_ID_QI_PAD"] == key].reset_index(drop=True)
-        return result.drop(columns=["_ID_QI_PAD"], errors="ignore")
-    for col in ("ID_QI", "TICKER_SYMBOL", "code", "Code", "stock_code"):
-        if col in df.columns:
-            norm = df[col].astype(str).str.split(".").str[0].str.zfill(6)
-            return df[norm == key].reset_index(drop=True)
     return df
 
 
@@ -208,69 +233,99 @@ _factor_ms = 0.0
 _profile_count = 0
 
 
-def _compute_stock_shm(args):
-    """Old combined-engine compute path over native mmap files.
-
-    Each call builds full current-day DataFrames from mmap views and passes the
-    main-process StockState snapshot into the factor, matching the old
-    _compute_stock_shm contract as closely as possible.
-    """
-    global _factor_fn, _factor_info, _market_df, _daily_basic_df, _base_ns, _df_build_ms, _factor_ms, _profile_count
-    code, date_str, end_time, wall_secs, state_snap, tick_path, deal_path, order_path, trading_day, factor_fn = args
+def _compute_code_batch_shm(args):
+    """Worker path: build a per-process code batch and call strategy once."""
+    global _base_ns, _df_build_ms, _factor_ms, _profile_count
+    codes, date_str, end_time, wall_secs, states_snapshot, tick_paths, deal_paths, order_paths, trading_day, factor_module, factor_info = args
+    results = []
+    errors = 0
+    build_t0 = time.perf_counter()
+    data_map = {}
     try:
-        # Persistent pool workers are forked once at startup.  Main-process
-        # updates to _base_ns are not visible in those workers, so refresh it
-        # from the task's trading_day before reconstructing datetime columns.
         _base_ns = pd.Timestamp(trading_day).value
-        t0 = time.perf_counter()
-        tick_df = (
-            _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code)
-            if tick_path and _factor_info.get("need_l1_tick")
-            else pd.DataFrame()
-        )
-        deal_df = (
-            _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code)
-            if deal_path and _factor_info.get("need_l2_deal")
-            else pd.DataFrame()
-        )
-        order_df = (
-            _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code)
-            if order_path and _factor_info.get("need_l2_order")
-            else pd.DataFrame()
-        )
-        df_ms = (time.perf_counter() - t0) * 1000
+        factor_fn, active_factor_info = _get_worker_strategy(factor_module, factor_info)
+        from ..factor.stock_data_builder import build_stock_data
 
-        market_df = _filter_daily_for_code(_market_df, code)
-        stock_data = StockData(
-            code=code, date=date_str, end_time=end_time,
-            l1_tick=tick_df, l2_deal=deal_df, l2_order=order_df,
-            market=market_df,
-            daily_basic=market_df,
-            state=state_snap,
-        )
+        need_tick = active_factor_info.get("need_l1_tick", True)
+        need_deal = active_factor_info.get("need_l2_deal", True)
+        need_order = active_factor_info.get("need_l2_order", False)
 
-        t1 = time.perf_counter()
-        result = factor_fn(stock_data, code, date_str, end_time)
-        fn_ms = (time.perf_counter() - t1) * 1000
+        for code in codes:
+            try:
+                tick_path = tick_paths.get(code, "")
+                deal_path = deal_paths.get(code, "")
+                order_path = order_paths.get(code, "")
+                tick_df = (
+                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code)
+                    if tick_path and need_tick
+                    else pd.DataFrame()
+                )
+                deal_df = (
+                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code)
+                    if deal_path and need_deal
+                    else pd.DataFrame()
+                )
+                order_df = (
+                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code)
+                    if order_path and need_order
+                    else pd.DataFrame()
+                )
+                data_map[code] = build_stock_data(
+                    code=code, date=date_str, end_time=end_time,
+                    tick_df=tick_df, deal_df=deal_df, order_df=order_df,
+                    market_df=_market_df,
+                    daily_basic_df=_market_df,
+                    factor_info=active_factor_info,
+                    state=states_snapshot.get(code),
+                    validate=True,
+                )
+            except Exception as exc:
+                logger.warning("[%s] build StockData failed: %s", code, exc)
+                errors += 1
 
-        _df_build_ms += df_ms
-        _factor_ms += fn_ms
-        _profile_count += 1
-        if _profile_count % 200 == 0:
-            logger.info("[profile] worker=%s stocks=%d df=%.1fms factor=%.1fms total=%.1fms",
+        build_ms = (time.perf_counter() - build_t0) * 1000
+        factor_t0 = time.perf_counter()
+        raw = factor_fn(data_map, list(data_map.keys()), date_str, [end_time]) if data_map else {}
+        factor_ms = (time.perf_counter() - factor_t0) * 1000
+        if not isinstance(raw, dict):
+            return results, len(codes), build_ms, factor_ms, f"batch result must be dict, got {type(raw).__name__}"
+
+        for code, res in raw.items():
+            if code not in data_map:
+                logger.warning("[%s] batch result code not in request", code)
+                continue
+            if res is None:
+                continue
+            if not isinstance(res, dict):
+                logger.warning("[%s] batch result must be dict, got %s", code, type(res).__name__)
+                errors += 1
+                continue
+            state = states_snapshot.get(code)
+            if state and state.last_market_time:
+                market_secs = _time_to_seconds(state.last_market_time)
+                if market_secs > 0:
+                    data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
+                    if abs(data_latency_ms) < 600_000:
+                        res["data_latency_ms"] = data_latency_ms
+            results.append(res)
+
+        missing = set(data_map.keys()) - set(raw.keys())
+        if missing:
+            logger.info("[batch] missing results for %d/%d codes", len(missing), len(data_map))
+
+        _df_build_ms += build_ms
+        _factor_ms += factor_ms
+        _profile_count += len(codes)
+        if _profile_count and _profile_count % 1000 < len(codes):
+            logger.info("[profile] worker=%s stocks=%d build=%.1fms factor=%.1fms total=%.1fms",
                         multiprocessing.current_process().name, _profile_count,
-                        _df_build_ms / _profile_count, _factor_ms / _profile_count,
-                        (_df_build_ms + _factor_ms) / _profile_count)
+                        _df_build_ms / max(_profile_count, 1),
+                        _factor_ms / max(_profile_count, 1),
+                        (_df_build_ms + _factor_ms) / max(_profile_count, 1))
 
-        if result is not None and state_snap and state_snap.last_market_time:
-            market_secs = _time_to_seconds(state_snap.last_market_time)
-            if market_secs > 0:
-                data_latency_ms = round((wall_secs - market_secs) * 1000, 1)
-                if abs(data_latency_ms) < 600_000:
-                    result["data_latency_ms"] = data_latency_ms
-        return code, result, None
+        return results, errors, build_ms, factor_ms, None
     except Exception as exc:
-        return code, None, str(exc)
+        return results, len(codes), (time.perf_counter() - build_t0) * 1000, 0.0, str(exc)
 
 
 # ── Native Engine ──────────────────────────────────────────────────
@@ -304,6 +359,7 @@ class NativeEngine:
         self._qmt_queue: Optional[multiprocessing.Queue] = None
         self._qmt_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
+        self._prev_valid_rate: Optional[float] = None
         self._schedules: list = []  # List[ComputationSchedule]
         self._last_codes: List[str] = []
         self._last_compute: float = 0.0
@@ -945,7 +1001,9 @@ class NativeEngine:
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        end_time = schedule.end_time_label if is_daily and schedule is not None else _minute_end_time(now_dt)
+        # Keep daily schedule compatible with historical daily factor runs:
+        # old strategies receive end_time="" for full-day calculation.
+        end_time = "" if is_daily else _minute_end_time(now_dt)
         self._round_count += 1
 
         files_by_code = self._scan_shm_files()
@@ -970,64 +1028,74 @@ class NativeEngine:
 
         t0 = time.time()
 
-        factor_fn = self._daily_factor_fn if (is_daily and self._daily_factor_fn) else self.factor_calculation
-        global _factor_fn, _factor_info, _market_df, _daily_basic_df, _base_ns
-        _factor_fn = factor_fn
-        _factor_info = self._daily_factor_info if (is_daily and self._daily_factor_info) else self.factor_info
+        factor_module_path = self.daily_factor_module if (is_daily and self.daily_factor_module) else self.factor_module
+        active_factor_info = self._daily_factor_info if (is_daily and self._daily_factor_info) else self.factor_info
+        global _market_df, _daily_basic_df, _base_ns
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
         _base_ns = pd.Timestamp(date_str).value
 
-        active_factor_info = _factor_info
         tick_paths = {code: files_by_code[code].get(KIND_TICK, "") for code in all_codes}
         deal_paths = {code: files_by_code[code].get(KIND_DEAL, "") for code in all_codes}
         order_paths = {code: files_by_code[code].get(KIND_ORDER, "") for code in all_codes}
-
-        tasks = [
-            (code, date_str, end_time, wall_secs, states_snapshot.get(code),
-             tick_paths.get(code, "") if active_factor_info.get("need_l1_tick") else "",
-             deal_paths.get(code, "") if active_factor_info.get("need_l2_deal") else "",
-             order_paths.get(code, "") if active_factor_info.get("need_l2_order") else "",
-             date_str, factor_fn)
-            for code in all_codes
-        ]
 
         results = []
         errors = 0
         pool_t0 = time.perf_counter()
 
+        batch_size = _env_int("LIVE_FACTOR_BATCH_SIZE", 128, minimum=1)
+        code_batches = [all_codes[i:i + batch_size] for i in range(0, len(all_codes), batch_size)]
+        tasks = [
+            (batch, date_str, end_time, wall_secs,
+             {code: states_snapshot.get(code) for code in batch},
+             {code: tick_paths.get(code, "") for code in batch},
+             {code: deal_paths.get(code, "") for code in batch},
+             {code: order_paths.get(code, "") for code in batch},
+             date_str, factor_module_path, active_factor_info)
+            for batch in code_batches
+        ]
+
+        build_ms_total = 0.0
+        factor_ms_total = 0.0
         if self._pool is not None:
             try:
-                for code, result, err in self._pool.imap_unordered(_compute_stock_shm, tasks, chunksize=32):
+                for batch_results, batch_errors, build_ms, factor_ms, err in self._pool.imap_unordered(
+                    _compute_code_batch_shm, tasks, chunksize=1,
+                ):
+                    build_ms_total += build_ms
+                    factor_ms_total += factor_ms
                     if err:
-                        logger.warning("[%s] compute failed: %s", code, err)
-                        errors += 1
-                    elif result is not None:
-                        results.append(result)
+                        logger.warning("[combined] batch compute failed: %s", err)
+                    errors += batch_errors
+                    results.extend(batch_results)
             except Exception as exc:
-                logger.error("[combined] persistent pool failed: %s", exc, exc_info=True)
+                logger.error("[combined] persistent batch pool failed: %s", exc, exc_info=True)
                 self._pool = None
-        else:
+
+        if self._pool is None:
             for task in tasks:
-                code, result, err = _compute_stock_shm(task)
+                batch_results, batch_errors, build_ms, factor_ms, err = _compute_code_batch_shm(task)
+                build_ms_total += build_ms
+                factor_ms_total += factor_ms
                 if err:
-                    logger.warning("[%s] compute failed: %s", code, err)
-                    errors += 1
-                elif result is not None:
-                    results.append(result)
+                    logger.warning("[combined] inline batch compute failed: %s", err)
+                errors += batch_errors
+                results.extend(batch_results)
 
         pool_ms = (time.perf_counter() - pool_t0) * 1000
         elapsed_ms = (time.time() - t0) * 1000
         pool_type = "persistent+shm" if self._pool is not None else "inline"
         n_stocks = len(all_codes)
-        per_stock = pool_ms / max(n_stocks, 1) * self.n_workers
+        wall_ms_per_stock = pool_ms / max(n_stocks, 1)
+        worker_sum_ms_per_stock = (build_ms_total + factor_ms_total) / max(n_stocks, 1)
         logger.info(
             "[combined] done (%s): %d results (errors=%d) | "
-            "snap=%.0fms pool=%.0fms total=%.0fms | "
-            "%d stocks × %dw → ~%.1fms/stock",
+            "snap=%.0fms pool=%.0fms build(sum)=%.0fms factor(sum)=%.0fms total=%.0fms | "
+            "%d stocks/%d batches × %dw | wall=%.1fms/stock worker_sum=%.1fms/stock",
             pool_type, len(results), errors,
-            snap_ms, pool_ms, elapsed_ms,
-            n_stocks, self.n_workers, per_stock,
+            snap_ms, pool_ms, build_ms_total, factor_ms_total, elapsed_ms,
+            n_stocks, len(code_batches), self.n_workers,
+            wall_ms_per_stock, worker_sum_ms_per_stock,
         )
 
         if states_snapshot:
@@ -1060,6 +1128,9 @@ class NativeEngine:
                      stocks=len(all_codes), results=len(results),
                      compute_ms=round(elapsed_ms, 1))
 
+        # 因子有效率自检
+        self._check_factor_valid_rate(results)
+
     def _handle_output_child(self, pid: int, read_fd: int, date_str: str, end_time: str) -> None:
         """Read inference output from the output child and enqueue QMT work in parent."""
         positions_df = None
@@ -1090,6 +1161,35 @@ class NativeEngine:
                              len(positions_df), date_str, end_time)
         else:
             _push_to_qmt(positions_df, date_str, end_time)
+
+    def _check_factor_valid_rate(self, results: list) -> None:
+        """因子有效率自检：有效率骤降时告警。"""
+        if not results:
+            return
+        import math
+        total_cells = 0
+        nan_cells = 0
+        for r in results:
+            if not r or not isinstance(r, dict):
+                continue
+            for k, v in r.items():
+                if not str(k).startswith("F_"):
+                    continue
+                total_cells += 1
+                if isinstance(v, float) and math.isnan(v):
+                    nan_cells += 1
+        if total_cells == 0:
+            return
+        valid_rate = 1.0 - (nan_cells / total_cells)
+        logger.info("[combined] factor valid rate: %.1f%% (%d/%d cells)",
+                    valid_rate * 100, total_cells - nan_cells, total_cells)
+        if (valid_rate < 0.5
+                and self._prev_valid_rate is not None
+                and self._prev_valid_rate > 0.8):
+            logger.error(
+                "[ALERT] factor valid rate dropped from %.1f%% to %.1f%%!",
+                self._prev_valid_rate * 100, valid_rate * 100)
+        self._prev_valid_rate = valid_rate
 
     def _write_results(self, results: list, date_str: str, end_time: str,
                         schedule: Optional[ComputationSchedule] = None) -> None:
@@ -1123,7 +1223,8 @@ class NativeEngine:
                         result_df.to_csv(out_file, index=False)
                         logger.info("[combined] wrote %s", out_file)
                     if not result_df.empty:
-                        _upload_to_oss(result_df, date_str, end_time)
+                        upload_end_time = "daily" if is_daily else end_time
+                        _upload_to_oss(result_df, date_str, upload_end_time)
                     if run_inference and inference_fn is not None and not result_df.empty:
                         try:
                             portfolio_context = None
@@ -1313,7 +1414,7 @@ class NativeEngine:
             self._load_prev_day_factors()
 
         # Build computation schedules from config
-        self._schedules = build_schedules_from_env()
+        self._schedules = build_schedules_from_env(self.factor_info)
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
         if self._raw_archive_enabled:
@@ -1565,13 +1666,13 @@ def _result_codes(result_df: pd.DataFrame) -> List[str]:
 def _worker_init(factor_module: str, daily_basic_df: pd.DataFrame,
                  market_df: pd.DataFrame, factor_info: Dict[str, Any]) -> None:
     """Initialize worker process."""
-    global _factor_fn, _factor_info, _market_df, _daily_basic_df
+    global _factor_fn, _factor_info, _market_df, _daily_basic_df, _strategy_cache
     _market_df = market_df
     _daily_basic_df = daily_basic_df
     _factor_info = factor_info or {}
     if factor_module:
-        mod = importlib.import_module(factor_module)
-        _factor_fn = mod.factor_calculation
+        _factor_fn, cached_info = _get_worker_strategy(factor_module, _factor_info)
+        _factor_info = cached_info or _factor_info
 
 
 def main() -> None:

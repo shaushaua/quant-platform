@@ -78,18 +78,23 @@ class ComputationSchedule:
         return ""  # interval — filled at dispatch with actual time
 
 
-def build_schedules_from_env() -> List[ComputationSchedule]:
+def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[ComputationSchedule]:
     """Build the active schedule list from environment variables.
 
     Env vars:
         COMPUTE_SCHEDULES:          comma-separated names, default "minute"
         COMPUTE_INTERVAL:           minute interval seconds, default 60
         DAILY_FACTOR_TRIGGER_TIME:  HH:MM, default "15:10"
+
+    factor_info override:
+        compute_interval:           strategy-defined interval (takes precedence over env)
     """
     import os
 
     enabled = [s.strip() for s in os.environ.get("COMPUTE_SCHEDULES", "minute").split(",")]
-    interval = int(os.environ.get("COMPUTE_INTERVAL", "60"))
+    # factor_info.compute_interval 优先，env var 次之
+    fi = factor_info or {}
+    interval = int(fi.get("compute_interval", 0)) or int(os.environ.get("COMPUTE_INTERVAL", "60"))
     schedules: List[ComputationSchedule] = []
 
     if "minute" in enabled:

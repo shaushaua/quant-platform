@@ -39,6 +39,34 @@ logging.basicConfig(
 from quant_platform.factor.engine import calc_factors_by_date_range
 
 
+def _generate_end_times(interval_seconds: int) -> list:
+    """根据 compute_interval 生成全天分钟级 end_times 列表。
+
+    A 股交易时段: 09:30-11:30, 13:00-15:00
+    返回: ["093000", "093030", "093100", ..., "145930", "150000"]
+    """
+    times = []
+    # 上午 09:30:00 - 11:30:00
+    t = 9 * 3600 + 30 * 60
+    morning_end = 11 * 3600 + 30 * 60
+    while t <= morning_end:
+        h, rem = divmod(t, 3600)
+        m, s = divmod(rem, 60)
+        times.append(f"{h:02d}{m:02d}{s:02d}")
+        t += interval_seconds
+
+    # 下午 13:00:00 - 15:00:00
+    t = 13 * 3600
+    afternoon_end = 15 * 3600
+    while t <= afternoon_end:
+        h, rem = divmod(t, 3600)
+        m, s = divmod(rem, 60)
+        times.append(f"{h:02d}{m:02d}{s:02d}")
+        t += interval_seconds
+
+    return times
+
+
 # ---------------------------------------------------------------------------
 # 环境变量读取
 # ---------------------------------------------------------------------------
@@ -278,8 +306,17 @@ def main():
 
     factor_info = strategy.factor_info
     securities = getattr(strategy, "securities", None)  # 可选
-    end_times = getattr(strategy, "end_times", [""])     # 兼容老策略：默认日频/全天一次
+    end_times = getattr(strategy, "end_times", None)    # 策略自定义 end_times
     user_outfun = getattr(strategy, "outfun", None)
+
+    # 策略未定义 end_times 时，从 factor_info.compute_interval 自动生成
+    if not end_times:
+        interval = int(factor_info.get("compute_interval", 0))
+        if interval > 0:
+            end_times = _generate_end_times(interval)
+            _logger.info("end_times from compute_interval", interval=interval, count=len(end_times))
+        else:
+            end_times = [""]  # 日频/全天一次
 
     _logger.info("strategy loaded",
                  securities_count=len(securities) if securities else "all",

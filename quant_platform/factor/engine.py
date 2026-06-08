@@ -280,6 +280,7 @@ def calc_factors_by_date_range(
                                     future = pool.submit(
                                         _compute_code_all_endtimes,
                                         fc_dict, date, _end_times, _calc_fn,
+                                        factor_info,
                                     )
                                     _t_submit_elapsed = _time.time() - _t_ser
                                     futures[future] = code
@@ -321,7 +322,7 @@ def calc_factors_by_date_range(
 
                                     for end_time in _end_times:
                                         stock_data = _stock_data_from_filtered(
-                                            fc, date, end_time, zero_copy=zero_copy_stock_data
+                                            fc, date, end_time, factor_info=factor_info, zero_copy=zero_copy_stock_data
                                         )
                                         if _calc_fn is not None:
                                             _t_calc = _time.time()
@@ -436,7 +437,7 @@ def calc_factors_by_date_range(
 
                     for end_time in _end_times:
                         stock_data = _stock_data_from_filtered(
-                            fc, date, end_time, zero_copy=zero_copy_stock_data
+                            fc, date, end_time, factor_info=factor_info, zero_copy=zero_copy_stock_data
                         )
                         if _calc_fn is not None:
                             res = _calc_fn(stock_data, code, date, end_time)
@@ -773,14 +774,13 @@ def _compute_code_all_endtimes(
     date: str,
     end_times: list,
     calc_fn: Callable,
-    calc_batch_fn: Optional[Callable] = None,
+    factor_info: Optional[Dict] = None,
 ) -> dict:
-    """Worker entry: compute factor_calculation for one stock across all end_times.
+    """Worker entry: compute factor_calculation for one code batch.
 
-    If calc_batch_fn is provided, calls it once with all end_times and expects
-    dict {end_time: result} back. Otherwise falls back to per-end_time calls.
-
-    Returns dict: {end_time: result_or_None}
+    The public strategy signature stays unchanged, but batch calls always pass:
+      data={code: StockData}, code=[code], end_time=end_times.
+    Returns the engine's internal {end_time: result_or_None} shape.
     """
     import time as _wtime
     _t0 = _wtime.time()
@@ -797,42 +797,74 @@ def _compute_code_all_endtimes(
     )
     _t_deser = _wtime.time()
 
-    # --- Batch path: one call for all end_times ---
-    if calc_batch_fn is not None:
-        try:
-            stock_data = _stock_data_from_filtered(fc, date, "", zero_copy=True)
-            batch_results = calc_batch_fn(stock_data, fc.code, date, end_times)
-            _t_total = _wtime.time() - _t0
+    stock_data = _stock_data_from_filtered(fc, date, "", factor_info=factor_info, zero_copy=True)
+    try:
+        batch_results = calc_fn({fc.code: stock_data}, [fc.code], date, end_times)
+        _t_total = _wtime.time() - _t0
+        normalized = _normalize_batch_results(fc.code, end_times, batch_results)
+        if normalized is not None:
             if _t_total > 1.0:
                 logger.info("[Worker] code=%s batch total=%.2fs deser=%.3fs results=%d",
-                            fc.code, _t_total, _t_deser - _t0,
-                            len(batch_results) if batch_results else 0)
-            return batch_results if batch_results else {}
-        except Exception as e:
-            logger.warning("[Worker] batch failed code=%s, fallback to per-et: %s", fc.code, e)
+                            fc.code, _t_total, _t_deser - _t0, len(normalized))
+            return normalized
+        logger.debug("[Worker] code=%s batch returned %s, fallback to per-et",
+                     fc.code, type(batch_results).__name__)
+    except Exception as e:
+        logger.warning("[Worker] code=%s batch failed, fallback to per-et: %s", fc.code, e)
 
-    # --- Per-end_time path (original) ---
+    # --- Fallback: per-end_time calls with correct end_time ---
     results = {}
     _slow_count = 0
-    for end_time in end_times:
+    for et in end_times:
         try:
-            stock_data = _stock_data_from_filtered(fc, date, end_time, zero_copy=True)
             _t1 = _wtime.time()
-            res = calc_fn(stock_data, fc.code, date, end_time)
+            et_stock_data = _stock_data_from_filtered(fc, date, et, factor_info=factor_info, zero_copy=True)
+            res = calc_fn(et_stock_data, fc.code, date, et)
             _t_calc = _wtime.time() - _t1
             if _t_calc > 0.1:
                 _slow_count += 1
-            results[end_time] = res
+            results[et] = res
         except Exception as e:
             logger.warning("Worker: factor_calculation failed code=%s end_time=%s: %s",
-                          fc.code, end_time, e)
-            results[end_time] = None
+                          fc.code, et, e)
+            results[et] = None
     _t_total = _wtime.time() - _t0
     if _t_total > 2.0:
-        logger.info("[Worker] code=%s total=%.2fs deser=%.3fs calc=%d×%d slow_et=%d",
+        logger.info("[Worker] code=%s fallback total=%.2fs deser=%.3fs calc=%d×%d slow_et=%d",
                     fc.code, _t_total, _t_deser - _t0, len(end_times), len(results),
                     _slow_count)
     return results
+
+
+def _normalize_batch_results(code: str, end_times: list, value) -> Optional[dict]:
+    """Normalize strategy batch output to {end_time: result_or_None}.
+
+    Strict protocol:
+      1. Single end_time  → strategy returns {code: result_dict}
+         → we return {end_time: result_dict}
+      2. Multiple end_times → strategy returns {code: {et: result_dict}}
+         → we return {et: result_dict}
+    Anything else returns None, triggering per-et fallback.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    # Must be keyed by code
+    code_value = value.get(code)
+    if code_value is None:
+        return None
+
+    if not isinstance(code_value, dict):
+        return None
+
+    # Multi end_time: code_value must be {et: result_dict}
+    if len(end_times) > 1:
+        if all(et in code_value for et in end_times):
+            return {et: code_value.get(et) for et in end_times}
+        return None
+
+    # Single end_time: code_value is the result dict directly
+    return {end_times[0]: code_value}
 
 
 def _harvest_future(future, futures_map: dict, end_time_results: dict) -> None:
@@ -977,14 +1009,11 @@ def _filter_code_from_bundle(
 
 
 def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str,
+                             factor_info: Optional[Dict] = None,
                              zero_copy: bool = False) -> StockData:
-    """从已过滤数据创建 StockData。
+    """从已过滤数据创建 StockData（统一走 build_stock_data）。"""
+    from .stock_data_builder import build_stock_data
 
-    Args:
-        zero_copy: 如果 True，直接引用 DataFrame 不做 copy。
-                   适用于同一只股票对多个 end_time 调用的场景（分钟策略）。
-                   策略代码不得修改传入的 DataFrame。
-    """
     if any(len(d) > 0 for d in [fc.l2_order, fc.l2_deal, fc.l1_tick, fc.market]):
         price_sample = None
         if not fc.l2_deal.empty and "Price" in fc.l2_deal.columns:
@@ -998,32 +1027,18 @@ def _stock_data_from_filtered(fc: _FilteredCode, date: str, end_time: str,
             len(fc.l1_tick), len(fc.market),
             f"{price_sample:.2f}" if price_sample is not None else "N/A",
         )
-    if zero_copy:
-        return StockData(
-            code=fc.code,
-            date=date,
-            end_time=end_time,
-            l2_order=fc.l2_order,
-            l2_deal=fc.l2_deal,
-            l1_tick=fc.l1_tick,
-            market=fc.market,
-            daily_basic=fc.market,
-            l2_order_hist=fc.l2_order_hist,
-            l2_deal_hist=fc.l2_deal_hist,
-            l1_tick_hist=fc.l1_tick_hist,
-        )
-    return StockData(
-        code=fc.code,
-        date=date,
-        end_time=end_time,
-        l2_order=fc.l2_order.copy(),
-        l2_deal=fc.l2_deal.copy(),
-        l1_tick=fc.l1_tick.copy(),
-        market=fc.market.copy(),
-        daily_basic=fc.market.copy(),
-        l2_order_hist=[df.copy() for df in fc.l2_order_hist],
-        l2_deal_hist=[df.copy() for df in fc.l2_deal_hist],
-        l1_tick_hist=[df.copy() for df in fc.l1_tick_hist],
+    return build_stock_data(
+        code=fc.code, date=date, end_time=end_time,
+        tick_df=fc.l1_tick if zero_copy else fc.l1_tick.copy(),
+        deal_df=fc.l2_deal if zero_copy else fc.l2_deal.copy(),
+        order_df=fc.l2_order if zero_copy else fc.l2_order.copy(),
+        market_df=fc.market if zero_copy else fc.market.copy(),
+        daily_basic_df=fc.market if zero_copy else fc.market.copy(),
+        factor_info=factor_info,
+        tick_hist=fc.l1_tick_hist if zero_copy else [d.copy() for d in fc.l1_tick_hist],
+        deal_hist=fc.l2_deal_hist if zero_copy else [d.copy() for d in fc.l2_deal_hist],
+        order_hist=fc.l2_order_hist if zero_copy else [d.copy() for d in fc.l2_order_hist],
+        validate=True,
     )
 
 
