@@ -16,7 +16,7 @@ using namespace schema;
 // ── SZ Tick (MID=28, Snapshot300111_v2) ──────────────────────────────
 //
 // Maps mdl_szl2_msg::Snapshot300111_v2 → 79-col float64 row.
-// Reference: mdl_parser/src/lib.rs parse_sz_tick_raw (lines 249-311)
+// Native parser for SZ Snapshot300111_v2 tick messages.
 //
 // Key differences from SH tick:
 //   - Price fields use MDLDoubleT<6> (÷1e6), not MDLFloatT<3> (÷1e3)
@@ -96,7 +96,7 @@ ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len, std::int64_
 // ── SZ Order (MID=33, Order300192_v2) ───────────────────────────────
 //
 // Maps mdl_szl2_msg::Order300192_v2 → 9-col float64 row.
-// Reference: mdl_parser/src/lib.rs parse_sz_order_raw (lines 373-393)
+// Native parser for SZ order messages.
 //
 // Side: 49('1')→0(buy), 50('2')→1(sell), else→10
 // OrdType: 49→1(limit), 50→2(market), 85→3(best), else→0
@@ -156,7 +156,7 @@ ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len) {
 // ── SZ Deal (MID=36, Transaction300191_v2) ──────────────────────────
 //
 // Maps mdl_szl2_msg::Transaction300191_v2 → 10-col float64 row.
-// Reference: mdl_parser/src/lib.rs parse_sz_deal_raw (lines 395-419)
+// Native parser for SZ deal messages.
 //
 // Side: buy_id > sell_id → 0(buy), else → 1(sell); ExecType==52 → 4
 // Money = LastPx × LastQty

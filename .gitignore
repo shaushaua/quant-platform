@@ -1,6 +1,7 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.DS_Store
 build/
 dist/
 wheels/
@@ -17,6 +18,7 @@ CLAUDE.md
 oss_data/
 test_*.py
 *.parquet
+local_test_result.*
 .env
 
 # Local vendor binaries (downloaded before Docker build, not tracked)

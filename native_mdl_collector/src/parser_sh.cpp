@@ -16,7 +16,7 @@ using namespace schema;
 // ── SH Tick (MID=4, SHL2MarketData) ─────────────────────────────────
 //
 // Maps mdl_shl2_msg::SHL2MarketData → 79-col float64 row.
-// Reference: mdl_parser/src/lib.rs parse_sh_tick_raw (lines 188-247)
+// Native parser for SHL2MarketData tick messages.
 //
 // SHL2MarketData field → schema column mapping:
 //   UpdateTime      → tick::Time (seconds), tick::UpdateTime
@@ -110,7 +110,7 @@ ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len, std::int64_
 // ── SH NGTS (MID=24, NGTSTick) ──────────────────────────────────────
 //
 // Maps mdl_shl2_msg::NGTSTick → order row and/or deal row.
-// Reference: mdl_parser/src/lib.rs parse_sh_ngts_raw (lines 314-371)
+// Native parser for SHL2Transaction/ngts order-deal messages.
 //
 // Type field:
 //   "A" or "D" → order (add/delete)

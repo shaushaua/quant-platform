@@ -5,23 +5,18 @@
 在实盘数据流水线的每一步记录耗时和延迟，写入磁盘 JSON Lines 文件。
 
 埋点环节：
-  csv_detect    → CSV 文件变化检测
-  csv_parse     → CSV 行解析
-  data_convert  → 通联格式转换
-  shm_write     → 写入 ShmStore
   sdk_connected → SDK 已连接通联客户端
   sdk_system_message → SDK 系统消息/订阅回包
-  sdk_shm_write → SDK 接收后写入 ShmStore
-  sdk_minute_write → SDK 写入 ShmStore 的行情分钟计数
-  chunk_read    → StreamingEngine 读取 chunk
-  stream_minute_consume → StreamingEngine 消费进 StockState 的行情分钟计数
+  native_shm_write → native collector 写入 mmap
+  native_minute_write → native collector 写入 mmap 的行情分钟计数
+  chunk_read    → NativeEngine 读取 mmap
   factor_compute → 因子计算
   output        → CSV 写入 + OSS 上传
 
 关键延迟字段：
   market_to_receive_*_ms → 通联行情交易时间到 SDK 回调接收时间
-  receive_to_write_*_ms  → SDK 回调接收时间到 ShmStore 写入时间
-  chunk_age_ms           → ShmStore 写入到 live-engine 读取时间
+  receive_to_write_*_ms  → SDK 回调接收时间到 mmap 写入时间
+  chunk_age_ms           → mmap 写入到 live-engine 读取时间
   data_latency_*_ms      → 行情交易时间到因子计算时间
   compute_ms             → 本轮因子计算总耗时
 
@@ -54,7 +49,7 @@ class PipelineLogger:
     def __init__(self, source: str = ""):
         """
         Args:
-            source: 标识来源进程（"collector" / "streaming"）
+            source: 标识来源进程（"native-collector" / "native-engine"）
         """
         self._source = source
         self._lock = threading.Lock()
@@ -105,7 +100,7 @@ class PipelineLogger:
         写一条流水线日志。
 
         Args:
-            stage: 阶段名称（csv_detect / csv_parse / data_convert / shm_write /
+            stage: 阶段名称（sdk_connected / native_shm_write /
                    chunk_read / factor_compute / output）
             **kwargs: 附加字段（rows, elapsed_ms, latency_ms 等）
         """

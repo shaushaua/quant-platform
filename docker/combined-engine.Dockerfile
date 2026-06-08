@@ -23,7 +23,7 @@ LABEL description="Native combined engine: feeder_client + C++ MDL collector + P
 
 WORKDIR /app
 
-# jemalloc is intentionally installed here instead of depending on sdk-collector.
+# jemalloc is installed in this runtime image for the native collector and Python engine.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*

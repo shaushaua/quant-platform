@@ -8,12 +8,6 @@
 
     data = DataAPI()
 
-    # 实时数据（从 native SHM）
-    df_1min = data.get_all_stocks_1min()
-    df_5min = data.get_all_stocks_5min()
-    df_tick = data.get_tick("000001.XSHE")
-
-    # 历史数据（从磁盘）
     df_history = data.get_history("2024-01-01", "2024-12-31", "tick")
 """
 
@@ -24,7 +18,6 @@ from datetime import datetime
 
 import pandas as pd
 
-from .shm_store import ShmStore
 from .oss_loader import OSSDataLoader
 from ..core.config import get_config
 
@@ -55,31 +48,23 @@ class DataAPI:
     统一数据API
     交易员直接使用，无网络调用，毫秒级访问
 
-    实时数据 -> ShmStore/native mmap
     历史数据 -> OSSLoader (本地磁盘/OSS挂载)
     """
 
     def __init__(
         self,
-        mode: str = "realtime",
+        mode: str = "backtest",
         oss_base_path: Optional[str] = None
     ):
         """
         初始化数据API
 
         Args:
-            mode: 运行模式
-                - "realtime": 实盘模式，连接内存实时数据
-                - "backtest": 回测模式，仅使用历史数据
+            mode: 运行模式；当前仅保留历史/OSS 查询能力。
             oss_base_path: OSS数据路径，默认从配置读取
         """
         self.mode = mode
         self.config = get_config()
-
-        # 实盘实时存储：统一走 C++ collector 写出的 native mmap。
-        self._shm: Optional[ShmStore] = None
-        if mode == "realtime":
-            self._shm = ShmStore()
 
         # OSS数据加载器
         # 回测模式下 cache_size=1：pregroup_day() 分组后会立即删除原始缓存，
@@ -94,14 +79,10 @@ class DataAPI:
 
         logger.info(f"DataAPI 初始化完成, mode={mode}")
 
-    # ==================== 实时数据（内存读取）====================
+    # ==================== 当日 OSS 数据便捷读取 ====================
 
     def _today_str(self) -> str:
         return datetime.now().strftime("%Y%m%d")
-
-    def _get_realtime_store(self):
-        """返回当前生效的实时存储。"""
-        return self._shm
 
     def get_all_stocks_1min(self) -> pd.DataFrame:
         """
@@ -110,56 +91,23 @@ class DataAPI:
         Returns:
             DataFrame with columns: Code, Time, Open, High, Low, Close, Volume, Amount
         """
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            logger.warning("非实盘模式，无法获取实时1分钟数据")
-            return pd.DataFrame()
-        df = store.get_kline("1min")
-        if df.empty:
-            return self._oss.load(self._today_str(), "kline_1min")
-        return df
+        return self._oss.load(self._today_str(), "kline_1min")
 
     def get_all_stocks_5min(self) -> pd.DataFrame:
         """获取所有股票5分钟K线"""
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            logger.warning("非实盘模式，无法获取实时5分钟数据")
-            return pd.DataFrame()
-        df = store.get_kline("5min")
-        if df.empty:
-            return self._oss.load(self._today_str(), "kline_5min")
-        return df
+        return self._oss.load(self._today_str(), "kline_5min")
 
     def get_all_stocks_10min(self) -> pd.DataFrame:
         """获取所有股票10分钟K线"""
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            logger.warning("非实盘模式，无法获取实时10分钟数据")
-            return pd.DataFrame()
-        df = store.get_kline("10min")
-        if df.empty:
-            return self._oss.load(self._today_str(), "kline_10min")
-        return df
+        return self._oss.load(self._today_str(), "kline_10min")
 
     def get_all_stocks_30min(self) -> pd.DataFrame:
         """获取所有股票30分钟K线"""
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            return pd.DataFrame()
-        df = store.get_kline("30min")
-        if df.empty:
-            return self._oss.load(self._today_str(), "kline_30min")
-        return df
+        return self._oss.load(self._today_str(), "kline_30min")
 
     def get_all_stocks_60min(self) -> pd.DataFrame:
         """获取所有股票60分钟K线"""
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            return pd.DataFrame()
-        df = store.get_kline("60min")
-        if df.empty:
-            return self._oss.load(self._today_str(), "kline_60min")
-        return df
+        return self._oss.load(self._today_str(), "kline_60min")
 
     def get_tick(self, code: Optional[str] = None) -> pd.DataFrame:
         """
@@ -171,15 +119,8 @@ class DataAPI:
         Returns:
             tick数据DataFrame
         """
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            logger.warning("非实盘模式，无法获取实时tick数据")
-            return pd.DataFrame()
-        df = store.get_tick(code)
-        if df.empty:
-            codes = [code] if code else None
-            return self._oss.load(self._today_str(), "tick", codes)
-        return df
+        codes = [code] if code else None
+        return self._oss.load(self._today_str(), "tick", codes)
 
     def get_order(self, code: Optional[str] = None) -> pd.DataFrame:
         """
@@ -188,14 +129,8 @@ class DataAPI:
         Args:
             code: 股票代码，None表示所有股票
         """
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            return pd.DataFrame()
-        df = store.get_order(code)
-        if df.empty:
-            codes = [code] if code else None
-            return self._oss.load(self._today_str(), "order", codes)
-        return df
+        codes = [code] if code else None
+        return self._oss.load(self._today_str(), "order", codes)
 
     def get_deal(self, code: Optional[str] = None) -> pd.DataFrame:
         """
@@ -204,14 +139,8 @@ class DataAPI:
         Args:
             code: 股票代码，None表示所有股票
         """
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            return pd.DataFrame()
-        df = store.get_deal(code)
-        if df.empty:
-            codes = [code] if code else None
-            return self._oss.load(self._today_str(), "deal", codes)
-        return df
+        codes = [code] if code else None
+        return self._oss.load(self._today_str(), "deal", codes)
 
     def get_quote(self, code: str) -> dict:
         """
@@ -223,17 +152,11 @@ class DataAPI:
         Returns:
             行情字典
         """
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            return {}
-        return store.get_quote(code)
+        return {}
 
     def get_all_quotes(self) -> Dict[str, dict]:
         """获取所有股票最新行情"""
-        store = self._get_realtime_store()
-        if self.mode != "realtime" or store is None:
-            return {}
-        return store.get_all_quotes()
+        return {}
 
     def get_daily_basic(self, date: Optional[str] = None) -> pd.DataFrame:
         """
@@ -245,43 +168,13 @@ class DataAPI:
         Returns:
             日频基础数据DataFrame
         """
-        # 实时模式且未指定日期，从内存获取
         if date is None:
-            store = self._get_realtime_store()
-            if self.mode != "realtime" or store is None:
-                return pd.DataFrame()
-            df = store.get_daily_basic()
-            if df.empty:
-                return self._oss.load(self._today_str(), "daily_basic")
-            return df
+            return self._oss.load(self._today_str(), "daily_basic")
 
         # 指定日期，从OSS加载
         return self._oss.load(date, "daily_basic")
 
     # ==================== 历史数据（磁盘读取）====================
-
-    def _get_realtime_df(self, data_type: str, codes: Optional[List[str]] = None) -> pd.DataFrame:
-        store = self._get_realtime_store()
-        if store is None:
-            return pd.DataFrame()
-        if data_type in ("tick", "order", "deal"):
-            if data_type == "tick":
-                df = store.get_tick(None)
-            elif data_type == "order":
-                df = store.get_order(None)
-            else:
-                df = store.get_deal(None)
-        elif data_type.startswith("kline_"):
-            freq = data_type.split("_", 1)[1]
-            df = store.get_kline(freq)
-        else:
-            return pd.DataFrame()
-
-        if df.empty:
-            return df
-        if codes and "Code" in df.columns:
-            df = df[df["Code"].isin(codes)]
-        return df
 
     def _filter_time_range(self, df: pd.DataFrame, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
         if df.empty or "Time" not in df.columns:
@@ -303,14 +196,6 @@ class DataAPI:
         end_dt = pd.to_datetime(end_time)
         if end_dt < start_dt:
             start_dt, end_dt = end_dt, start_dt
-
-        if self.mode == "realtime" and self._get_realtime_store() is not None:
-            today = datetime.now().date()
-            if start_dt.date() == today and end_dt.date() == today:
-                df = self._get_realtime_df(data_type, codes)
-                df = self._filter_time_range(df, start_dt, end_dt)
-                if not df.empty:
-                    return df
 
         return self._oss.load_time_range(start_time, end_time, data_type, codes)
 
@@ -582,17 +467,13 @@ class DataAPI:
             "oss_path": str(self._oss.base_path),
         }
 
-        if self._memory:
-            stats["memory"] = self._memory.get_stats()
-            stats["memory_usage"] = self._memory.get_memory_usage()
-
         stats["oss_cache"] = self._oss.get_cache_info()
 
         return stats
 
     def is_realtime_available(self) -> bool:
         """检查实时数据是否可用"""
-        return self.mode == "realtime" and self._memory is not None
+        return False
 
     def load_factor_result(
         self,
@@ -715,8 +596,8 @@ class DataAPI:
 
 # 便捷创建函数
 def create_realtime_api(oss_base_path: Optional[str] = None) -> DataAPI:
-    """创建实盘模式DataAPI"""
-    return DataAPI(mode="realtime", oss_base_path=oss_base_path)
+    """创建兼容 API；实盘实时读取由 native_engine 负责。"""
+    return DataAPI(mode="backtest", oss_base_path=oss_base_path)
 
 
 def create_backtest_api(oss_base_path: Optional[str] = None) -> DataAPI:

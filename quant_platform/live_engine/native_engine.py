@@ -56,7 +56,7 @@ from ..inference.interface import (
     compute_index_composition,
     compute_trading_universe,
 )
-from .streaming_engine import (
+from .runtime_utils import (
     _is_trading_hours,
     _time_to_seconds,
     _upload_to_oss,
