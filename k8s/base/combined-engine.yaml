@@ -90,34 +90,32 @@ spec:
             - name: ROBOT_STRATEGY_NAME
               value: "robot_model"
             - name: PORTFOLIO_CONTEXT_MODULE
-              value: "quant_platform.broker.qmt_context"
+              value: "quant_platform.broker.order_context"
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: COMPUTE_SCHEDULES
               value: "minute,daily"
             - name: DAILY_FACTOR_TRIGGER_TIME
               value: "15:10"
-            # --- QMT gateway ---
-            - name: QMT_GATEWAY_URL
+            # --- Order gateway ---
+            - name: ORDER_GATEWAY_URL
               value: "http://172.16.0.47:18080"
-            - name: QMT_GATEWAY_TOKEN
+            - name: ORDER_GATEWAY_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: quant-secrets
-                  key: QMT_GATEWAY_TOKEN
+                  key: ORDER_GATEWAY_TOKEN
                   optional: true
-            - name: QMT_GATEWAY_TIMEOUT
+            - name: ORDER_GATEWAY_TIMEOUT
               value: "10"
-            - name: QMT_EXPORT_LOCAL_DIR
-              value: "/data/qmt/position"
-            - name: QMT_ACCOUNT_ID
+            - name: BROKER_TYPE
+              value: "atx"
+            - name: BROKER_ACCOUNT_ID
               value: "00033770"
-            - name: QMT_ACCOUNT_TYPE
-              value: "2"
-            - name: QMT_STRATEGY_NAME
+            - name: ORDER_DEFAULT_STRATEGY
               value: "quant_platform"
-            - name: QMT_DEFAULT_PRICE_TYPE
-              value: "1"
+            - name: ORDER_DEFAULT_PRICE_TYPE
+              value: "latest"
             - name: DATA_FLUSH_INTERVAL
               value: "0.01"
             - name: SHM_STORE_BACKEND

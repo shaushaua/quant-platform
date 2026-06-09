@@ -33,6 +33,7 @@
 """
 
 import logging
+import multiprocessing
 import os
 import pickle
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
@@ -50,6 +51,14 @@ from ..inference.interface import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fork-shared globals: set before pool creation, inherited by workers via COW
+# ---------------------------------------------------------------------------
+_shared_bundle = None           # type: Optional[_DayBundle]
+_shared_security_id_map = {}    # type: Dict[str, Optional[int]]
+_shared_factor_info = {}        # type: Dict
+_shared_calc_fn = None          # type: Optional[Callable]
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,7 @@ def calc_factors_by_date_range(
     _end_times = end_times if end_times else [""]
     zero_copy_stock_data = os.environ.get("FACTOR_ZERO_COPY", "1").lower() not in ("0", "false", "no")
     multi_slice = len(_end_times) > 1  # 多时间切片策略（分钟/10分钟/20分钟等）
+    force_streaming = os.environ.get("FACTOR_FORCE_STREAMING", "0").lower() in ("1", "true", "yes")
 
     # 判断是否为全市场模式
     is_explicit_list = securities and len(securities) > 0
@@ -122,7 +132,7 @@ def calc_factors_by_date_range(
     if is_explicit_list:
         # 明确指定了股票列表，使用传统预加载模式
         _securities = list(securities)
-        use_streaming = len(_securities) > 100
+        use_streaming = force_streaming or len(_securities) > 100
         logger.info("指定股票模式：%d 只股票", len(_securities))
     else:
         # 全市场模式（securities 为 None 或 []）：从 daily_basic 获取股票列表
@@ -164,7 +174,7 @@ def calc_factors_by_date_range(
 
         # 如果 securities 数量较大，使用流式加载模式（按股票逐个加载）
         # 避免一次性加载全市场数据导致 OOM
-        use_streaming = len(_securities) > 100  # 超过100只股票启用流式模式
+        use_streaming = force_streaming or len(_securities) > 100  # 超过100只股票启用流式模式
 
         if use_streaming:
             # 分批加载模式：将全市场股票分批，每批下载一次文件并过滤
@@ -200,22 +210,28 @@ def calc_factors_by_date_range(
                 and _infer_fn is None
             )
 
-            # --- Reusable pool for entire day (avoid process spawn overhead) ---
-            pool = None
-            enable_process_pool = os.environ.get("FACTOR_ENABLE_PROCESS_POOL", "1").lower() in ("1", "true", "yes")
-            if processes > 1 and _calc_fn is not None and enable_process_pool:
-                try:
-                    pickle.dumps(_calc_fn)
-                    pool = ProcessPoolExecutor(max_workers=processes)
-                except Exception as e:
-                    logger.warning(
-                        "factor_data_handler 不支持进程池序列化，降级为串行计算: %s",
-                        e,
-                    )
-            elif processes > 1 and _calc_fn is not None:
-                logger.info(
-                    "FACTOR_ENABLE_PROCESS_POOL=0，进程池已关闭，使用串行计算"
-                )
+            # --- Pool setup ---
+            FORK_SHARED = (
+                os.environ.get("FACTOR_FORK_SHARED_BUNDLE", "1").lower() in ("1", "true", "yes")
+                and processes > 1
+                and _calc_fn is not None
+            )
+            pool = None  # ProcessPoolExecutor (fallback path)
+            if not FORK_SHARED and processes > 1 and _calc_fn is not None:
+                enable_process_pool = os.environ.get("FACTOR_ENABLE_PROCESS_POOL", "1").lower() in ("1", "true", "yes")
+                if enable_process_pool:
+                    try:
+                        pickle.dumps(_calc_fn)
+                        pool = ProcessPoolExecutor(max_workers=processes)
+                    except Exception as e:
+                        logger.warning(
+                            "factor_data_handler 不支持进程池序列化，降级为串行计算: %s",
+                            e,
+                        )
+                else:
+                    logger.info("FACTOR_ENABLE_PROCESS_POOL=0，进程池已关闭，使用串行计算")
+            elif FORK_SHARED:
+                logger.info("使用 fork-shared bundle 模式（per-data_batch pool）")
 
             day_offsets = _parse_day_offsets(factor_info)
             hist_offsets = _history_load_offsets(day_offsets)
@@ -242,26 +258,112 @@ def calc_factors_by_date_range(
                     compute_batches = [data_batch_codes[i:i+COMPUTE_BATCH_SIZE]
                                        for i in range(0, len(data_batch_codes), COMPUTE_BATCH_SIZE)]
 
-                    for comp_batch in compute_batches:
-                        # Batch-load history for this compute batch
-                        hist_by_code: Dict[str, list] = {}
-                        if hist_offsets:
-                            hist_by_code = _load_history_bundles_batch(
-                                date, hist_offsets, factor_info, api, comp_batch, security_id_map)
+                    # Fork-shared path: create pool per data_batch AFTER bundle loaded
+                    fork_pool = None
+                    shared_state_set = False
+                    if FORK_SHARED:
+                        global _shared_bundle, _shared_security_id_map
+                        global _shared_factor_info, _shared_calc_fn
+                        _shared_bundle = bundle
+                        _shared_security_id_map = security_id_map
+                        _shared_factor_info = factor_info
+                        _shared_calc_fn = _calc_fn
+                        shared_state_set = True
+                        try:
+                            fork_ctx = multiprocessing.get_context("fork")
+                        except ValueError:
+                            logger.warning(
+                                "当前平台不支持 fork start method，降级为串行计算；"
+                                "fork-shared bundle 仅支持 Linux/Unix fork"
+                            )
+                            FORK_SHARED = False
+                        else:
+                            fork_pool = fork_ctx.Pool(
+                                processes=processes, maxtasksperchild=None,
+                            )
+                            logger.info("[Perf] data_batch %d: fork pool created (%d workers, bundle COW)",
+                                        data_batch_idx + 1, processes)
 
-                        if pool is not None:
-                            # --- PARALLEL: reuse pool, submit+harvest pipeline ---
-                            _t_par = _time.time()
-                            n_codes = 0
-                            max_inflight = processes * 2  # allow pipelining: main filters ahead while workers compute
-                            futures = {}
-                            submitted_at = {}
-                            task_codes = [comp_batch[i:i+TASK_CODE_BATCH_SIZE]
-                                          for i in range(0, len(comp_batch), TASK_CODE_BATCH_SIZE)]
+                    try:
+                        for comp_batch in compute_batches:
+                            # Batch-load history for this compute batch
+                            hist_by_code: Dict[str, list] = {}
+                            if hist_offsets:
+                                hist_by_code = _load_history_bundles_batch(
+                                    date, hist_offsets, factor_info, api, comp_batch, security_id_map)
 
-                            for task_code_batch in task_codes:
-                                # harvest completed futures to keep inflight bounded
-                                while len(futures) >= max_inflight:
+                            if fork_pool is not None:
+                                # --- FORK-SHARED PARALLEL: workers inherit bundle via COW ---
+                                _t_par = _time.time()
+                                task_codes = [comp_batch[i:i+TASK_CODE_BATCH_SIZE]
+                                              for i in range(0, len(comp_batch), TASK_CODE_BATCH_SIZE)]
+                                tasks = [
+                                    (batch, date, _end_times, day_offsets,
+                                     {c: hist_by_code.get(c, []) for c in batch})
+                                    for batch in task_codes
+                                ]
+                                n_codes = 0
+                                for results in fork_pool.imap_unordered(
+                                    _compute_codes_from_shared_bundle, tasks, chunksize=1,
+                                ):
+                                    for code, code_results in results.items():
+                                        for et, res in code_results.items():
+                                            if res is not None:
+                                                end_time_results[et].append(res)
+                                    n_codes += len(results)
+                                _par_elapsed = _time.time() - _t_par
+                                logger.info("[Perf] fork_parallel %d codes in %.2fs (%d processes)",
+                                            n_codes, _par_elapsed, processes)
+
+                            elif pool is not None:
+                                # --- PICKLE PARALLEL: reuse ProcessPoolExecutor (fallback) ---
+                                _t_par = _time.time()
+                                n_codes = 0
+                                max_inflight = processes * 2
+                                futures = {}
+                                submitted_at = {}
+                                task_codes = [comp_batch[i:i+TASK_CODE_BATCH_SIZE]
+                                              for i in range(0, len(comp_batch), TASK_CODE_BATCH_SIZE)]
+
+                                for task_code_batch in task_codes:
+                                    while len(futures) >= max_inflight:
+                                        done = _wait_one_future(
+                                            futures, submitted_at, end_time_results,
+                                            date, data_batch_idx, comp_batch,
+                                        )
+                                        if done is None:
+                                            continue
+
+                                    try:
+                                        _t_filter = _time.time()
+                                        filtered_codes = _filter_codes_from_bundle(
+                                            bundle, task_code_batch, security_id_map, factor_info,
+                                        )
+                                        filter_elapsed = _time.time() - _t_filter
+                                        fc_dicts = []
+                                        for fc in filtered_codes:
+                                            if day_offsets:
+                                                hist_bundles = _combine_history_bundles(
+                                                    date, day_offsets, fc, hist_by_code.get(fc.code, []))
+                                                _attach_history_to_filtered(fc, hist_bundles)
+                                            fc_dicts.append(_filtered_code_to_dict(fc))
+                                        _t_ser = _time.time()
+                                        future = pool.submit(
+                                            _compute_codes_all_endtimes,
+                                            fc_dicts, date, _end_times, _calc_fn, factor_info,
+                                        )
+                                        _t_submit_elapsed = _time.time() - _t_ser
+                                        futures[future] = list(task_code_batch)
+                                        submitted_at[future] = _time.time()
+                                        n_codes += len(task_code_batch)
+                                        if n_codes <= 20 or filter_elapsed > 1.0 or _t_submit_elapsed > 1.0:
+                                            logger.info(
+                                                "[Perf] codes=%d filter=%.3fs submit=%.3fs",
+                                                len(task_code_batch), filter_elapsed, _t_submit_elapsed)
+                                    except Exception as e:
+                                        logger.warning("Filter failed codes=%s: %s", task_code_batch[:5], e)
+
+                                while futures:
                                     done = _wait_one_future(
                                         futures, submitted_at, end_time_results,
                                         date, data_batch_idx, comp_batch,
@@ -269,80 +371,43 @@ def calc_factors_by_date_range(
                                     if done is None:
                                         continue
 
-                                try:
-                                    _t_filter = _time.time()
-                                    filtered_codes = _filter_codes_from_bundle(
-                                        bundle,
-                                        task_code_batch,
-                                        security_id_map,
-                                        factor_info,
-                                    )
-                                    filter_elapsed = _time.time() - _t_filter
-                                    fc_dicts = []
-                                    for fc in filtered_codes:
+                                _par_elapsed = _time.time() - _t_par
+                                logger.info("[Perf] pickle_parallel %d codes in %.2fs (%d processes)",
+                                            n_codes, _par_elapsed, processes)
+                            else:
+                                # --- SERIAL ---
+                                for code in comp_batch:
+                                    try:
+                                        security_id = security_id_map[code]
+                                        fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
                                         if day_offsets:
                                             hist_bundles = _combine_history_bundles(
-                                                date, day_offsets, fc, hist_by_code.get(fc.code, []))
+                                                date, day_offsets, fc, hist_by_code.get(code, []))
                                             _attach_history_to_filtered(fc, hist_bundles)
-                                        fc_dicts.append(_filtered_code_to_dict(fc))
-                                    _t_ser = _time.time()
-                                    _t_pickle = _time.time()
-                                    future = pool.submit(
-                                        _compute_codes_all_endtimes,
-                                        fc_dicts, date, _end_times, _calc_fn,
-                                        factor_info,
-                                    )
-                                    _t_submit_elapsed = _time.time() - _t_ser
-                                    futures[future] = list(task_code_batch)
-                                    submitted_at[future] = _time.time()
-                                    n_codes += len(task_code_batch)
-                                    if n_codes <= 20 or filter_elapsed > 1.0 or _t_submit_elapsed > 1.0:
-                                        logger.info(
-                                            "[Perf] codes=%d sample=%s filter=%.3fs pickle=%.3fs submit=%.3fs",
-                                            len(task_code_batch), task_code_batch[:3], filter_elapsed,
-                                            _t_pickle - _t_ser, _t_submit_elapsed)
-                                except Exception as e:
-                                    logger.warning("Filter failed codes=%s: %s", task_code_batch[:5], e)
 
-                            # harvest remaining
-                            while futures:
-                                done = _wait_one_future(
-                                    futures, submitted_at, end_time_results,
-                                    date, data_batch_idx, comp_batch,
-                                )
-                                if done is None:
-                                    continue
-
-                            _par_elapsed = _time.time() - _t_par
-                            logger.info("[Perf] comp_batch parallel %d codes in %.2fs (%d processes)",
-                                        n_codes, _par_elapsed, processes)
-                        else:
-                            # --- SERIAL (original path) ---
-                            for code in comp_batch:
-                                try:
-                                    security_id = security_id_map[code]
-
-                                    # filter + restore 一次，多个 end_time 复用
-                                    fc = _filter_code_from_bundle(bundle, code, security_id, factor_info)
-                                    if day_offsets:
-                                        hist_bundles = _combine_history_bundles(
-                                            date, day_offsets, fc, hist_by_code.get(code, []))
-                                        _attach_history_to_filtered(fc, hist_bundles)
-
-                                    for end_time in _end_times:
-                                        stock_data = _stock_data_from_filtered(
-                                            fc, date, end_time, factor_info=factor_info, zero_copy=zero_copy_stock_data
-                                        )
-                                        if _calc_fn is not None:
-                                            _t_calc = _time.time()
-                                            res = _calc_fn(stock_data, code, date, end_time)
-                                            _calc_elapsed = _time.time() - _t_calc
-                                            if _calc_elapsed > 1.0:
-                                                logger.info("[Perf] %s factor_calculation=%.2fs", code, _calc_elapsed)
-                                            if res is not None:
-                                                end_time_results[end_time].append(res)
-                                except Exception as e:
-                                    logger.warning("因子计算异常 date=%s code=%s: %s", date, code, e)
+                                        for end_time in _end_times:
+                                            stock_data = _stock_data_from_filtered(
+                                                fc, date, end_time, factor_info=factor_info, zero_copy=zero_copy_stock_data
+                                            )
+                                            if _calc_fn is not None:
+                                                _t_calc = _time.time()
+                                                res = _calc_fn(stock_data, code, date, end_time)
+                                                _calc_elapsed = _time.time() - _t_calc
+                                                if _calc_elapsed > 1.0:
+                                                    logger.info("[Perf] %s factor_calculation=%.2fs", code, _calc_elapsed)
+                                                if res is not None:
+                                                    end_time_results[end_time].append(res)
+                                    except Exception as e:
+                                        logger.warning("因子计算异常 date=%s code=%s: %s", date, code, e)
+                    finally:
+                        if fork_pool is not None:
+                            fork_pool.close()
+                            fork_pool.join()
+                        if shared_state_set:
+                            _shared_bundle = None
+                            _shared_security_id_map = {}
+                            _shared_factor_info = {}
+                            _shared_calc_fn = None
 
                     # Data batch completed, release bundle
                     del bundle
@@ -903,6 +968,73 @@ def _compute_codes_all_endtimes(
     return normalized
 
 
+def _compute_codes_from_shared_bundle(args):
+    """Fork worker: read shared bundle via COW, filter codes, batch strategy call.
+
+    Instead of receiving pickled DataFrames, this worker reads the bundle from
+    module globals (inherited via fork COW) and performs its own filtering.
+    Only the code list and small history data are passed via the task argument.
+
+    Returns {code: {end_time: result_or_None}}.
+    """
+    import time as _wtime
+    _t0 = _wtime.time()
+
+    try:
+        codes, date, end_times, day_offsets, hist_by_code = args
+
+        bundle = _shared_bundle
+        security_id_map = _shared_security_id_map
+        factor_info = _shared_factor_info
+        calc_fn = _shared_calc_fn
+        if bundle is None or calc_fn is None:
+            raise RuntimeError("fork shared state is not initialized")
+
+        # Worker-side filtering: groupby produces new DataFrames (no COW mutation)
+        filtered_codes = _filter_codes_from_bundle(
+            bundle, codes, security_id_map, factor_info,
+        )
+
+        data_map = {}
+        for fc in filtered_codes:
+            try:
+                if day_offsets:
+                    hist_bundles = _combine_history_bundles(
+                        date, day_offsets, fc, hist_by_code.get(fc.code, []),
+                    )
+                    _attach_history_to_filtered(fc, hist_bundles)
+                stock_data = _stock_data_from_filtered(
+                    fc, date,
+                    end_times[0] if len(end_times) == 1 else end_times,
+                    factor_info=factor_info,
+                    zero_copy=True,
+                )
+                data_map[fc.code] = stock_data
+            except Exception as e:
+                logger.warning("[ForkWorker] filter+build failed code=%s: %s", fc.code, e)
+
+        _t_build = _wtime.time()
+        raw = calc_fn(data_map, list(data_map.keys()), date, end_times) if data_map else {}
+        normalized = _normalize_multi_code_batch_results(list(data_map.keys()), end_times, raw)
+        if normalized is None:
+            raise ValueError(f"batch result protocol mismatch: {type(raw).__name__}")
+
+        _t_total = _wtime.time() - _t0
+        if _t_total > 1.0:
+            logger.info(
+                "[ForkWorker] codes=%d total=%.2fs build=%.3fs results=%d",
+                len(data_map), _t_total, _t_build - _t0,
+                sum(len(v) for v in normalized.values()),
+            )
+        return normalized
+    except Exception as e:
+        code_sample = args[0][:5] if args and isinstance(args[0], list) else []
+        logger.warning("[ForkWorker] task failed codes=%s: %s", code_sample, e)
+        codes = args[0] if args and isinstance(args[0], list) else []
+        end_times = args[2] if len(args) > 2 and isinstance(args[2], list) else [""]
+        return {code: {et: None for et in end_times} for code in codes}
+
+
 def _normalize_multi_code_batch_results(codes: list, end_times: list, value) -> Optional[dict]:
     """Normalize batch output to {code: {end_time: result_or_None}}."""
     if not isinstance(value, dict):
@@ -914,8 +1046,8 @@ def _normalize_multi_code_batch_results(codes: list, end_times: list, value) -> 
     for code in codes:
         code_value = value.get(code)
         if code_value is None:
-            code_keyed = False
-            break
+            normalized[code] = {et: None for et in end_times}
+            continue
         if not isinstance(code_value, dict):
             code_keyed = False
             break
@@ -1103,28 +1235,34 @@ def _filter_code_from_bundle(
         return df
 
     _t0 = _ptime.time()
-    deal_filtered = _filter(bundle.l2_deal)
+    order_filtered = _filter(bundle.l2_order)
     _t1 = _ptime.time()
-    deal_restored = _restore_oss_precision(deal_filtered, code)
+    order_restored = _restore_oss_precision(order_filtered, code)
     _t2 = _ptime.time()
-    tick_filtered = _filter(bundle.l1_tick)
+    deal_filtered = _filter(bundle.l2_deal)
     _t3 = _ptime.time()
-    tick_restored = _restore_oss_precision(tick_filtered, code)
+    deal_restored = _restore_oss_precision(deal_filtered, code)
     _t4 = _ptime.time()
-    market = _filter(bundle.market)
+    tick_filtered = _filter(bundle.l1_tick)
     _t5 = _ptime.time()
+    tick_restored = _restore_oss_precision(tick_filtered, code)
+    _t6 = _ptime.time()
+    market = _filter(bundle.market)
+    _t7 = _ptime.time()
 
-    if _perf_log and (_t5 - _t0) > 0.5:
+    if _perf_log and (_t7 - _t0) > 0.5:
         logger.info(
-            "[Perf] filter+restore code=%s deal_f=%.3fs deal_r=%.3fs(%drows) "
-            "tick_f=%.3fs tick_r=%.3fs(%drows) market_f=%.3fs total=%.3fs",
+            "[Perf] filter+restore code=%s order_f=%.3fs order_r=%.3fs(%drows) "
+            "deal_f=%.3fs deal_r=%.3fs(%drows) tick_f=%.3fs tick_r=%.3fs(%drows) "
+            "market_f=%.3fs total=%.3fs",
             code,
-            _t1 - _t0, _t2 - _t1, len(deal_restored),
-            _t3 - _t2, _t4 - _t3, len(tick_restored),
-            _t5 - _t4, _t5 - _t0,
+            _t1 - _t0, _t2 - _t1, len(order_restored),
+            _t3 - _t2, _t4 - _t3, len(deal_restored),
+            _t5 - _t4, _t6 - _t5, len(tick_restored),
+            _t7 - _t6, _t7 - _t0,
         )
 
-    l2_order = pd.DataFrame()  # need_l2_order=False for this strategy
+    l2_order = order_restored
     l2_deal = deal_restored
     l1_tick = tick_restored
 
@@ -1204,19 +1342,21 @@ def _filter_codes_from_bundle(
         }
         return {code: groups.get(code, pd.DataFrame()) for code in codes}
 
+    order_by_code = _split(bundle.l2_order)
     deal_by_code = _split(bundle.l2_deal)
     tick_by_code = _split(bundle.l1_tick)
     market_by_code = _split(bundle.market)
 
     filtered: List[_FilteredCode] = []
     for code in codes:
+        order = _restore_oss_precision(order_by_code.get(code, pd.DataFrame()), code)
         deal = _restore_oss_precision(deal_by_code.get(code, pd.DataFrame()), code)
         tick = _restore_oss_precision(tick_by_code.get(code, pd.DataFrame()), code)
         market = market_by_code.get(code, pd.DataFrame())
         filtered.append(_FilteredCode(
             code,
             security_id_map.get(code),
-            pd.DataFrame(),
+            order,
             deal,
             tick,
             market,

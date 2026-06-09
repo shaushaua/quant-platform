@@ -345,6 +345,28 @@ def main():
 
     daily_outfun, stats = _make_daily_outfun(user_outfun)
 
+    # ---- 自动计算 batch size：按 pod 股票数和 worker 数分配 ----
+    n_stocks = len(securities) if securities else 0
+    n_workers = max(PROCESSES, 1)
+    if n_stocks > 0:
+        full_shard_batch = os.environ.get("FACTOR_FULL_SHARD_BATCH", "0").lower() in ("1", "true", "yes")
+        max_data_batch = max(1, int(os.environ.get("FACTOR_MAX_DATA_BATCH_SIZE", "300")))
+        data_batch = n_stocks if full_shard_batch else min(n_stocks, max_data_batch)
+
+        # DATA_BATCH_SIZE: 默认受上限保护；需要整片 COW 加速时显式打开 FACTOR_FULL_SHARD_BATCH=1
+        os.environ.setdefault("DATA_BATCH_SIZE", str(data_batch))
+        # FACTOR_BATCH_SIZE: 默认同数据加载批次，仍可通过环境变量覆盖
+        os.environ.setdefault("FACTOR_BATCH_SIZE", str(data_batch))
+        # FACTOR_TASK_CODE_BATCH_SIZE: 拆成多于 worker 的 task，降低尾部慢任务影响
+        task_batch = max(1, math.ceil(data_batch / max(n_workers * 4, 1)))
+        os.environ.setdefault("FACTOR_TASK_CODE_BATCH_SIZE", str(task_batch))
+        _logger.info("自动 batch size",
+                     n_stocks=n_stocks, n_workers=n_workers,
+                     data_batch=os.environ.get("DATA_BATCH_SIZE"),
+                     compute_batch=os.environ.get("FACTOR_BATCH_SIZE"),
+                     task_batch=os.environ.get("FACTOR_TASK_CODE_BATCH_SIZE"),
+                     full_shard_batch=full_shard_batch)
+
     t0 = time.time()
     try:
         calc_factors_by_date_range(

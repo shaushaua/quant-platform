@@ -3,7 +3,7 @@
 
 The original robot script is a standalone CLI.  This module exposes the
 ``inference`` callable expected by ``quant_platform.live_engine`` and returns
-QMT order rows directly.
+order rows directly.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def _normalize_code6(value) -> Optional[str]:
     return digits[-6:].zfill(6)
 
 
-def _qmt_code(code6: str) -> str:
+def _order_code(code6: str) -> str:
     code6 = str(code6).zfill(6)
     return ("SH" if code6.startswith("6") else "SZ") + code6
 
@@ -192,7 +192,7 @@ def _current_positions(portfolio_context) -> dict[str, int]:
 
     result: dict[str, int] = {}
     for _, row in positions.iterrows():
-        code = _normalize_code6(row.get("code", row.get("stock_code", row.get("qmt_code", ""))))
+        code = _normalize_code6(row.get("code", row.get("stock_code", "")))
         if not code:
             continue
         raw = row.get("current_volume", row.get("volume", row.get("qty", 0)))
@@ -249,10 +249,10 @@ def _target_orders(scored: pd.DataFrame, portfolio_context) -> pd.DataFrame:
             if volume <= 0:
                 continue
         rows.append({
-            "code": _qmt_code(code6),
+            "code": _order_code(code6),
             "side": side,
             "volume": volume,
-            "price_type": os.environ.get("QMT_DEFAULT_PRICE_TYPE", "1"),
+            "price_type": os.environ.get("ORDER_DEFAULT_PRICE_TYPE", "latest"),
             "strategy": strategy,
             "note": f"{strategy}_{row['_date']}_{code6}_{side}",
             "pred": float(row["pred"]),
@@ -273,7 +273,7 @@ def inference(
     index_composition_df: Optional[pd.DataFrame] = None,
     portfolio_context=None,
 ) -> pd.DataFrame:
-    """Score latest factors and return QMT order rows."""
+    """Score latest factors and return order rows."""
     if intraday_factors_df is None or intraday_factors_df.empty:
         return pd.DataFrame()
 

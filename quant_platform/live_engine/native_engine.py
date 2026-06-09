@@ -396,8 +396,8 @@ class NativeEngine:
         self.outfun: Optional[Callable] = None
         self.inference_fn: Optional[Callable] = None
         self.portfolio_context_fn: Optional[Callable] = None
-        self._qmt_queue: Optional[multiprocessing.Queue] = None
-        self._qmt_process: Optional[multiprocessing.Process] = None
+        self._order_queue: Optional[multiprocessing.Queue] = None
+        self._order_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._prev_valid_rate: Optional[float] = None
         self._schedules: list = []  # List[ComputationSchedule]
@@ -431,35 +431,35 @@ class NativeEngine:
             initargs=(self.factor_module, self._daily_basic_df, self._market_df, self.factor_info),
         )
 
-    def _init_qmt_worker(self) -> None:
-        """Start a persistent QMT push worker when QMT is configured."""
-        if self._qmt_process is not None or not _qmt_push_configured():
+    def _init_order_worker(self) -> None:
+        """Start a persistent order gateway push worker when configured."""
+        if self._order_process is not None or not _order_push_configured():
             return
-        maxsize = int(os.environ.get("QMT_QUEUE_MAXSIZE", "32"))
-        self._qmt_queue = multiprocessing.Queue(maxsize=maxsize)
-        self._qmt_process = multiprocessing.Process(
-            target=_qmt_worker_loop,
-            args=(self._qmt_queue,),
-            name="qmt-gateway-worker",
+        maxsize = int(os.environ.get("ORDER_QUEUE_MAXSIZE", "32"))
+        self._order_queue = multiprocessing.Queue(maxsize=maxsize)
+        self._order_process = multiprocessing.Process(
+            target=_order_worker_loop,
+            args=(self._order_queue,),
+            name="order-gateway-worker",
         )
-        self._qmt_process.start()
-        logger.info("[qmt] started persistent worker pid=%d", self._qmt_process.pid)
+        self._order_process.start()
+        logger.info("[order-gateway] started persistent worker pid=%d", self._order_process.pid)
 
-    def _stop_qmt_worker(self) -> None:
-        """Stop the persistent QMT push worker."""
-        if self._qmt_queue is not None:
+    def _stop_order_worker(self) -> None:
+        """Stop the persistent order gateway push worker."""
+        if self._order_queue is not None:
             try:
-                self._qmt_queue.put_nowait(None)
+                self._order_queue.put_nowait(None)
             except Exception:
                 pass
-        if self._qmt_process is not None:
-            self._qmt_process.join(timeout=10)
-            if self._qmt_process.is_alive():
-                logger.warning("[qmt] worker did not stop in time; terminating")
-                self._qmt_process.terminate()
-                self._qmt_process.join(timeout=5)
-        self._qmt_queue = None
-        self._qmt_process = None
+        if self._order_process is not None:
+            self._order_process.join(timeout=10)
+            if self._order_process.is_alive():
+                logger.warning("[order-gateway] worker did not stop in time; terminating")
+                self._order_process.terminate()
+                self._order_process.join(timeout=5)
+        self._order_queue = None
+        self._order_process = None
 
     def _release_pool(self) -> None:
         """Release factor workers before memory-heavy post-close archive upload."""
@@ -1172,7 +1172,7 @@ class NativeEngine:
         self._check_factor_valid_rate(results)
 
     def _handle_output_child(self, pid: int, read_fd: int, date_str: str, end_time: str) -> None:
-        """Read inference output from the output child and enqueue QMT work in parent."""
+        """Read inference output from the output child and enqueue order work in parent."""
         positions_df = None
         try:
             with os.fdopen(read_fd, "rb") as pipe:
@@ -1181,7 +1181,7 @@ class NativeEngine:
                 except EOFError:
                     positions_df = None
         except Exception as exc:
-            logger.error("[output-child] failed to read QMT payload from pid=%d: %s", pid, exc)
+            logger.error("[output-child] failed to read order payload from pid=%d: %s", pid, exc)
         finally:
             try:
                 os.waitpid(pid, 0)
@@ -1191,16 +1191,16 @@ class NativeEngine:
         if positions_df is None or positions_df.empty:
             return
 
-        if self._qmt_queue is not None:
+        if self._order_queue is not None:
             try:
-                self._qmt_queue.put_nowait((positions_df, date_str, end_time))
-                logger.info("[qmt] enqueued %d rows date=%s end_time=%s",
+                self._order_queue.put_nowait((positions_df, date_str, end_time))
+                logger.info("[order-gateway] enqueued %d rows date=%s end_time=%s",
                             len(positions_df), date_str, end_time)
             except queue.Full:
-                logger.error("[qmt] queue full, drop %d rows date=%s end_time=%s",
+                logger.error("[order-gateway] queue full, drop %d rows date=%s end_time=%s",
                              len(positions_df), date_str, end_time)
         else:
-            _push_to_qmt(positions_df, date_str, end_time)
+            _push_to_order_gateway(positions_df, date_str, end_time)
 
     def _check_factor_valid_rate(self, results: list) -> None:
         """因子有效率自检：有效率骤降时告警。"""
@@ -1252,7 +1252,7 @@ class NativeEngine:
             if pid == 0:
                 os.close(read_fd)
                 try:
-                    qmt_payload = None
+                    order_payload = None
                     result_df = pd.DataFrame(results)
                     if output_path and not result_df.empty:
                         output_path.mkdir(parents=True, exist_ok=True)
@@ -1302,7 +1302,7 @@ class NativeEngine:
                                     positions_df.to_csv(pos_file, index=False)
                                     logger.info("[inference] wrote %d positions to %s",
                                                 len(positions_df), pos_file)
-                                qmt_payload = positions_df
+                                order_payload = positions_df
                         except Exception as exc:
                             logger.error("[inference] failed: %s", exc, exc_info=True)
                     if outfun is not None:
@@ -1311,7 +1311,7 @@ class NativeEngine:
                         except Exception as exc:
                             logger.error("[combined] outfun failed: %s", exc)
                     with os.fdopen(write_fd, "wb") as pipe:
-                        pickle.dump(qmt_payload, pipe, protocol=pickle.HIGHEST_PROTOCOL)
+                        pickle.dump(order_payload, pipe, protocol=pickle.HIGHEST_PROTOCOL)
                 except Exception as exc:
                     logger.error("[output-child] failed: %s", exc, exc_info=True)
                     try:
@@ -1394,7 +1394,7 @@ class NativeEngine:
             except Exception as exc:
                 logger.error("[native] failed to load inference module %s: %s", inference_module, exc)
 
-        # Load portfolio context provider (optional). The provider owns broker/QMT
+        # Load portfolio context provider (optional). The provider owns broker
         # file access and should expose get_portfolio_context(date_str, end_time).
         portfolio_context_module = os.environ.get("PORTFOLIO_CONTEXT_MODULE", "")
         if portfolio_context_module:
@@ -1447,7 +1447,7 @@ class NativeEngine:
 
         # Init pool
         self._init_pool()
-        self._init_qmt_worker()
+        self._init_order_worker()
 
         # Load previous day factors (for inference)
         if self.inference_fn is not None:
@@ -1505,74 +1505,69 @@ class NativeEngine:
         except Exception as exc:
             logger.warning("[native] final archive/upload failed: %s", exc)
         self._release_pool()
-        self._stop_qmt_worker()
+        self._stop_order_worker()
 
 
-def _qmt_worker_loop(qmt_queue) -> None:
-    """Persistent QMT gateway worker.
+def _order_worker_loop(order_queue) -> None:
+    """Persistent order gateway worker.
 
     It receives already-aggregated inference/order DataFrames. Factor workers
-    never call this function, so one compute round can produce at most one QMT
+    never call this function, so one compute round can produce at most one order
     upload task.
     """
-    logger.info("[qmt] worker loop started")
+    logger.info("[order-gateway] worker loop started")
     try:
         while True:
-            item = qmt_queue.get()
+            item = order_queue.get()
             if item is None:
                 break
             try:
                 orders_df, date_str, end_time = item
-                _push_to_qmt(orders_df, date_str, end_time)
+                _push_to_order_gateway(orders_df, date_str, end_time)
             except Exception as exc:
-                logger.error("[qmt] worker task failed: %s", exc, exc_info=True)
+                logger.error("[order-gateway] worker task failed: %s", exc, exc_info=True)
     finally:
-        logger.info("[qmt] worker loop stopped")
+        logger.info("[order-gateway] worker loop stopped")
 
 
-def _push_to_qmt(orders_df: pd.DataFrame, date_str: str, end_time: str) -> None:
-    """Push QMT orders through qmt-gateway.
+def _push_to_order_gateway(orders_df: pd.DataFrame, date_str: str, end_time: str) -> None:
+    """Push orders through order-gateway.
 
     Env vars:
-        QMT_GATEWAY_URL: HTTP gateway base URL, e.g. http://172.16.0.47:18080
-        QMT_GATEWAY_TOKEN: HTTP bearer token
-        QMT_GATEWAY_TIMEOUT: HTTP timeout seconds
-        QMT_ACCOUNT_ID:  QMT fund account used in signal file name
-        QMT_ACCOUNT_TYPE: QMT account type, default 2 (stock)
-        QMT_STRATEGY_NAME: default strategy name in signal rows
+        ORDER_GATEWAY_URL: HTTP gateway base URL, e.g. http://172.16.0.47:18080
+        ORDER_GATEWAY_TOKEN: HTTP bearer token
+        ORDER_GATEWAY_TIMEOUT: HTTP timeout seconds
+        BROKER_ACCOUNT_ID: optional account id
+        ORDER_DEFAULT_STRATEGY: default strategy name in rows
     """
-    gateway_url = os.environ.get("QMT_GATEWAY_URL", "")
+    gateway_url = os.environ.get("ORDER_GATEWAY_URL", "")
     if not gateway_url:
-        logger.warning("[qmt] QMT_GATEWAY_URL not configured, skip order push")
+        logger.warning("[order-gateway] ORDER_GATEWAY_URL not configured, skip order push")
         return
-    _push_to_qmt_gateway(orders_df, date_str, end_time, gateway_url)
+    _push_to_order_gateway_http(orders_df, date_str, end_time, gateway_url)
 
 
-def _qmt_push_configured() -> bool:
-    return bool(os.environ.get("QMT_GATEWAY_URL", ""))
+def _order_push_configured() -> bool:
+    return bool(os.environ.get("ORDER_GATEWAY_URL", ""))
 
 
-def _push_to_qmt_gateway(orders_df: pd.DataFrame, date_str: str, end_time: str, gateway_url: str) -> None:
-    account_id = os.environ.get("QMT_ACCOUNT_ID", "")
-    if not account_id:
-        logger.error("[qmt] QMT_ACCOUNT_ID not configured, skip gateway push")
-        return
-    orders = _build_qmt_gateway_orders(orders_df, date_str, end_time)
+def _push_to_order_gateway_http(orders_df: pd.DataFrame, date_str: str, end_time: str, gateway_url: str) -> None:
+    account_id = os.environ.get("BROKER_ACCOUNT_ID", "")
+    orders = _build_order_gateway_orders(orders_df, date_str, end_time)
     if not orders:
-        logger.warning("[qmt] no valid QMT gateway order rows; required columns include code, side/order_type, volume")
+        logger.warning("[order-gateway] no valid order rows; required columns include code, side, volume")
         return
 
     payload = {
         "account_id": account_id,
-        "account_type": os.environ.get("QMT_ACCOUNT_TYPE", "2"),
         "orders": orders,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("QMT_GATEWAY_TOKEN", "")
+    token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    timeout = float(os.environ.get("QMT_GATEWAY_TIMEOUT", "10"))
+    timeout = float(os.environ.get("ORDER_GATEWAY_TIMEOUT", "10"))
     url = f"{gateway_url.rstrip('/')}/v1/orders"
 
     try:
@@ -1584,71 +1579,76 @@ def _push_to_qmt_gateway(orders_df: pd.DataFrame, date_str: str, end_time: str, 
         except Exception:
             response = {}
         if response and not response.get("ok", False):
-            logger.error("[qmt] gateway push rejected: %s", response)
+            logger.error("[order-gateway] push rejected: %s", response)
             return
-        logger.info("[qmt] gateway pushed %d rows to %s signal=%s",
-                    len(orders), url, response.get("signal_file", "") if response else "")
+        logger.info("[order-gateway] pushed %d rows to %s file=%s",
+                    len(orders), url, response.get("order_file", "") if response else "")
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", errors="replace")
-        logger.error("[qmt] gateway HTTP %s: %s", exc.code, body_text[:500])
+        logger.error("[order-gateway] HTTP %s: %s", exc.code, body_text[:500])
     except Exception as exc:
-        logger.error("[qmt] gateway push failed: %s", exc)
+        logger.error("[order-gateway] push failed: %s", exc)
 
 
-def _build_qmt_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
+def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
     orders = []
     for idx, row in orders_df.iterrows():
-        code = _qmt_code(row.get("qmt_code", row.get("code", "")))
-        volume = _qmt_volume(row)
-        order_type = _qmt_order_type(row)
-        if not code or volume <= 0 or not order_type:
+        code = _order_symbol(row.get("symbol", row.get("code", "")))
+        volume = _order_volume(row)
+        side = _order_side(row)
+        if not code or volume <= 0 or not side:
             continue
-        price_type = _qmt_price_type(row)
-        price_raw = _qmt_price(row, price_type)
-        if price_type in {"3", "6"} and not price_raw:
-            logger.error("[qmt] skip %s %s: price_type=%s requires price",
-                         code, order_type, price_type)
+        price_type = _order_price_type(row)
+        price_raw = _order_price(row, price_type)
+        if price_type == "limit" and not price_raw:
+            logger.error("[order-gateway] skip %s %s: limit order requires price", code, side)
             continue
-        strategy = str(row.get("strategy", "") or os.environ.get("QMT_STRATEGY_NAME", "quant_platform"))
+        strategy = str(row.get("strategy", "") or os.environ.get("ORDER_DEFAULT_STRATEGY", "quant_platform"))
         note = str(row.get("note", "") or row.get("remark", "") or
-                   f"{strategy}_{date_str}{end_time}_{code}_{order_type}")
+                   f"{strategy}_{date_str}{end_time}_{code}_{side}")
         order_id = str(row.get("order_id", "") or note or f"{date_str}{end_time}_{idx}")
         try:
             price = float(price_raw) if price_raw not in {"", None} else 0.0
         except Exception:
             price = 0.0
-        orders.append({
+        order = {
             "order_id": order_id,
-            "qmt_code": code,
-            "qmt_order_type": order_type,
+            "symbol": code,
+            "side": side,
             "volume": int(volume),
-            "qmt_price_type": price_type,
+            "price_type": price_type,
             "price": price,
             "strategy": strategy,
             "note": note,
-        })
+        }
+        algo_param = row.get("algo_param", row.get("atx_algo_param", ""))
+        if algo_param not in {"", None} and not pd.isna(algo_param):
+            order["algo_param"] = str(algo_param)
+        orders.append(order)
     return orders
 
 
-def _qmt_code(code: object) -> str:
+def _order_symbol(code: object) -> str:
     raw = str(code or "").strip().upper()
     if not raw:
         return ""
-    if len(raw) == 8 and (raw.startswith("SH") or raw.startswith("SZ")):
-        return raw
     if raw.endswith(".SH"):
-        return "SH" + raw[:6]
+        return raw[:6] + ".SH"
     if raw.endswith(".SZ"):
-        return "SZ" + raw[:6]
+        return raw[:6] + ".SZ"
+    if len(raw) == 8 and raw.startswith("SH"):
+        return raw[2:] + ".SH"
+    if len(raw) == 8 and raw.startswith("SZ"):
+        return raw[2:] + ".SZ"
     if len(raw) == 6 and raw[0] == "6":
-        return "SH" + raw
+        return raw + ".SH"
     if len(raw) == 6 and raw[0] in {"0", "3"}:
-        return "SZ" + raw
+        return raw + ".SZ"
     return raw
 
 
-def _qmt_volume(row: pd.Series) -> int:
-    for col in ("qmt_volume", "order_volume", "volume", "qty", "quantity"):
+def _order_volume(row: pd.Series) -> int:
+    for col in ("order_volume", "volume", "qty", "quantity"):
         if col in row and pd.notna(row[col]):
             try:
                 return int(float(row[col]))
@@ -1657,38 +1657,36 @@ def _qmt_volume(row: pd.Series) -> int:
     return 0
 
 
-def _qmt_order_type(row: pd.Series) -> str:
-    for col in ("qmt_order_type", "order_type", "报单类型"):
-        if col in row and pd.notna(row[col]):
-            try:
-                return str(int(float(row[col])))
-            except Exception:
-                return str(row[col]).strip()
+def _order_side(row: pd.Series) -> str:
     side = str(row.get("side", row.get("action", "")) or "").strip().lower()
-    if side in {"buy", "b", "long", "23", "买", "买入"}:
-        return "23"
-    if side in {"sell", "s", "short", "24", "卖", "卖出"}:
-        return "24"
+    if side in {"buy", "b", "long", "1", "23", "买", "买入"}:
+        return "buy"
+    if side in {"sell", "s", "short", "2", "24", "卖", "卖出"}:
+        return "sell"
     return ""
 
 
-def _qmt_price_type(row: pd.Series) -> str:
-    raw = row.get("qmt_price_type", row.get("price_type", row.get("quote_type", "")))
-    value = str(raw or os.environ.get("QMT_DEFAULT_PRICE_TYPE", "1")).strip()
+def _order_price_type(row: pd.Series) -> str:
+    raw = row.get("price_type", row.get("quote_type", ""))
+    value = str(raw or os.environ.get("ORDER_DEFAULT_PRICE_TYPE", "latest")).strip()
     mapping = {
-        "latest": "1",
-        "market": "1",
-        "last": "1",
-        "limit": "3",
-        "fixed": "3",
+        "1": "latest",
+        "6": "latest",
+        "latest": "latest",
+        "market": "latest",
+        "last": "latest",
+        "3": "limit",
+        "0": "limit",
+        "limit": "limit",
+        "fixed": "limit",
     }
     return mapping.get(value.lower(), value)
 
 
-def _qmt_price(row: pd.Series, price_type: str) -> str:
-    raw = row.get("qmt_price", row.get("order_price", row.get("limit_price", row.get("price", ""))))
+def _order_price(row: pd.Series, price_type: str) -> str:
+    raw = row.get("order_price", row.get("limit_price", row.get("price", "")))
     if raw == "" or pd.isna(raw):
-        return "0" if price_type == "1" else ""
+        return "0" if price_type == "latest" else ""
     try:
         return f"{float(raw):.4f}".rstrip("0").rstrip(".")
     except Exception:

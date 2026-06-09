@@ -218,6 +218,20 @@ def main():
             print(f"   - {date} {end_time}: 无数据")
 
     try:
+        factor_handler = (
+            strategy.factor_calculation
+            if args.processes > 1
+            else BatchSignatureAdapter(strategy.factor_calculation)
+        )
+        call_signature = (
+            "batch direct ({code: StockData}, [code...], date, [end_time...])"
+            if args.processes > 1
+            else "batch adapter ({code: StockData}, [code], date, [end_time])"
+        )
+        print(f"   call_path: {call_signature}")
+        if args.processes > 1:
+            os.environ.setdefault("FACTOR_FORCE_STREAMING", "1")
+
         calc_factors_by_date_range(
             factor_info=factor_info,
             start_date=start_date,
@@ -225,7 +239,7 @@ def main():
             end_times=end_times,
             securities=test_codes,
             processes=args.processes,
-            factor_data_handler=BatchSignatureAdapter(strategy.factor_calculation),
+            factor_data_handler=factor_handler,
             outfun=collect_result,
             oss_base_path=None,
         )
