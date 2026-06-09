@@ -217,6 +217,13 @@ def _target_orders(scored: pd.DataFrame, portfolio_context) -> pd.DataFrame:
     max_orders = int(os.environ.get("ROBOT_MAX_ORDERS", "10"))
     default_price = float(os.environ.get("ROBOT_DEFAULT_PRICE", "10"))
     strategy = os.environ.get("ROBOT_STRATEGY_NAME", "robot_model")
+    meta = getattr(portfolio_context, "meta", {}) if portfolio_context is not None else {}
+    if meta.get("positions_stale") or meta.get("positions_usable") is False:
+        print(
+            "[robot-inference] skip orders: portfolio positions unavailable "
+            f"stale={meta.get('positions_stale')} source={meta.get('source_file', '')}"
+        )
+        return pd.DataFrame()
 
     current = _current_positions(portfolio_context)
     rows = []

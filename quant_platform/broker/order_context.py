@@ -23,6 +23,7 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
     timeout = float(os.environ.get("ORDER_GATEWAY_TIMEOUT", "10"))
     token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
     broker = os.environ.get("BROKER_TYPE", "atx")
+    max_stale_seconds = float(os.environ.get("ORDER_POSITION_MAX_STALE_SECONDS", "15"))
 
     positions = pd.DataFrame()
     as_of = ""
@@ -31,6 +32,8 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
         "date": date_str,
         "end_time": end_time,
         "gateway_url": gateway_url.rstrip("/") if gateway_url else "",
+        "positions_usable": False,
+        "positions_stale": False,
     }
 
     if not gateway_url:
@@ -52,7 +55,21 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
             if not payload.get("ok", False):
                 logger.warning("[order-context] gateway returned not ok: %s", payload.get("error", ""))
             else:
-                positions = _standardize_gateway_positions(pd.DataFrame(payload.get("positions") or []))
+                stale_seconds = payload.get("stale_seconds", None)
+                stale = bool(payload.get("stale", False))
+                try:
+                    stale_by_age = stale_seconds is not None and float(stale_seconds) > max_stale_seconds
+                except Exception:
+                    stale_by_age = False
+                if stale or stale_by_age:
+                    meta["positions_stale"] = True
+                    logger.error(
+                        "[order-context] stale positions ignored: stale=%s stale_seconds=%s max=%s source=%s",
+                        stale, stale_seconds, max_stale_seconds, payload.get("source_file", ""),
+                    )
+                else:
+                    positions = _standardize_gateway_positions(pd.DataFrame(payload.get("positions") or []))
+                    meta["positions_usable"] = True
                 as_of = str(payload.get("source_mtime", "") or "")
                 source = str(payload.get("source_file", "") or url)
                 meta.update({

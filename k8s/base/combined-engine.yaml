@@ -105,9 +105,10 @@ spec:
                 secretKeyRef:
                   name: quant-secrets
                   key: ORDER_GATEWAY_TOKEN
-                  optional: true
             - name: ORDER_GATEWAY_TIMEOUT
               value: "10"
+            - name: ORDER_POSITION_MAX_STALE_SECONDS
+              value: "15"
             - name: BROKER_TYPE
               value: "atx"
             - name: BROKER_ACCOUNT_ID
