@@ -27,6 +27,9 @@ local_test_result.*
 /vendor/pymdl/*.tar.gz
 /vendor/mdl_parser/*.whl
 
+# Local ECS lifecycle state
+.aliyun-research-ecs/
+
 # Rust build artifacts
 mdl_parser/target/
 
