@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import datetime
@@ -54,12 +53,13 @@ def _time_to_seconds(time_val) -> float:
 
 
 def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
-    """Upload live factor results to OSS as JSON.
+    """Upload live factor results to OSS as parquet.
 
     Caller should pass a compacted copy (round + float32) if storage reduction
     is desired; this function serializes df as-is.
     """
     try:
+        import io
         import oss2
 
         endpoint = os.environ.get("OSS_ENDPOINT", "")
@@ -78,10 +78,11 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
 
         year = date_str[:4]
         month = date_str[4:6]
-        key = f"{prefix}/{year}/{year}{month}/{date_str}/{end_time}.json"
+        key = f"{prefix}/{year}/{year}{month}/{date_str}/{end_time}.parquet"
 
-        records = df.to_dict(orient="records")
-        payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
+        buf = io.BytesIO()
+        df.to_parquet(buf, index=False)
+        payload = buf.getvalue()
         bucket.put_object(key, payload)
 
         logger.info(

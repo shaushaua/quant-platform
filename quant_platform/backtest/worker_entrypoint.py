@@ -180,30 +180,32 @@ def _get_bucket() -> oss2.Bucket:
 def _write_result(
     date: str,
     end_time: str,
-    records: list[dict],
+    df: pd.DataFrame,
     part_index: Optional[int] = None,
     part_count: Optional[int] = None,
 ) -> None:
     """
-    写入结果到 OSS。
+    写入结果到 OSS (parquet)。
 
     路径格式:
-    - 有 end_time: {STRATEGY_NAME}/{YYYY}/{YYYYMM}/{date}/{date}_{end_time}_s{shard}.json
-    - 无 end_time: {STRATEGY_NAME}/{YYYY}/{YYYYMM}/{date}/{date}_s{shard}.json
+    - 有 end_time: {STRATEGY_NAME}/{YYYY}/{YYYYMM}/{date}/{date}_{end_time}_s{shard}.parquet
+    - 无 end_time: {STRATEGY_NAME}/{YYYY}/{YYYYMM}/{date}/{date}_s{shard}.parquet
     """
     year = date[:4]
     month = date[4:6]
     shard_suffix = f"_s{STOCK_SHARD_INDEX}" if STOCK_SHARDS > 1 else ""
     part_suffix = f"_p{part_index}" if part_index is not None else ""
     if end_time:
-        filename = f"{date}_{end_time}{shard_suffix}{part_suffix}.json"
+        filename = f"{date}_{end_time}{shard_suffix}{part_suffix}.parquet"
     else:
-        filename = f"{date}{shard_suffix}{part_suffix}.json"
+        filename = f"{date}{shard_suffix}{part_suffix}.parquet"
     key = f"{STRATEGY_NAME}/{year}/{year}{month}/{date}/{filename}"
     bucket = _get_bucket()
-    payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
-    bucket.put_object(key, payload)
-    _logger.info("结果已写入 OSS", date=date, end_time=end_time, records=len(records),
+    import io
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    bucket.put_object(key, buf.getvalue())
+    _logger.info("结果已写入 OSS", date=date, end_time=end_time, records=len(df),
                  part_index=part_index if part_index is not None else "",
                  part_count=part_count if part_count is not None else "",
                  path=f"oss://{RESULT_BUCKET}/{key}")
@@ -250,19 +252,18 @@ def _make_daily_outfun(user_outfun=None):
             _logger.info("日期计算完成", date=date, end_time=end_time, records=0)
             return
 
-        # 写入副本 round(6)，原始 test 保持 float64 给 user_outfun
+        # 写入副本 round(6)+float32，原始 test 保持 float64 给 user_outfun
         _write_test = test.copy()
         _fcols = _write_test.select_dtypes(include=["float64", "float32"]).columns
         if len(_fcols) > 0:
-            _write_test[_fcols] = _write_test[_fcols].round(6)
-        records = _write_test.to_dict(orient="records")
+            _write_test[_fcols] = _write_test[_fcols].round(6).astype("float32")
         part_index = test.attrs.get("part_index")
         part_count = test.attrs.get("part_count")
-        _logger.info("日期计算完成", date=date, end_time=end_time, records=len(records))
+        _logger.info("日期计算完成", date=date, end_time=end_time, records=len(_write_test))
 
         try:
-            _write_result(date, end_time, records, part_index=part_index, part_count=part_count)
-            stats["total_records"] += len(records)
+            _write_result(date, end_time, _write_test, part_index=part_index, part_count=part_count)
+            stats["total_records"] += len(_write_test)
             stats["writes"] += 1
         except Exception as e:
             _logger.error("写入结果失败", date=date, end_time=end_time, error=str(e))
