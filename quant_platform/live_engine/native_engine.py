@@ -1256,11 +1256,16 @@ class NativeEngine:
                     result_df = pd.DataFrame(results)
                     if output_path and not result_df.empty:
                         output_path.mkdir(parents=True, exist_ok=True)
+                        # 写入副本降精度，原始 result_df 保持 float64 给推理/outfun
+                        _write_df = result_df.copy()
+                        _fcols = _write_df.select_dtypes(include=["float64"]).columns
+                        if len(_fcols) > 0:
+                            _write_df[_fcols] = _write_df[_fcols].astype("float32")
                         if is_daily:
                             out_file = output_path / f"{date_str}_daily.csv"
                         else:
                             out_file = output_path / f"{date_str}_{end_time}.csv"
-                        result_df.to_csv(out_file, index=False)
+                        _write_df.to_csv(out_file, index=False)
                         logger.info("[combined] wrote %s", out_file)
                     if not result_df.empty:
                         upload_end_time = "daily" if is_daily else end_time
@@ -1298,8 +1303,13 @@ class NativeEngine:
                             )
                             if positions_df is not None and not positions_df.empty:
                                 if output_path:
+                                    # 写入副本降精度，原始 positions_df 保持 float64 给 order_payload
+                                    _pos_write = positions_df.copy()
+                                    _fcols = _pos_write.select_dtypes(include=["float64"]).columns
+                                    if len(_fcols) > 0:
+                                        _pos_write[_fcols] = _pos_write[_fcols].astype("float32")
                                     pos_file = output_path / f"{date_str}_{end_time}_positions.csv"
-                                    positions_df.to_csv(pos_file, index=False)
+                                    _pos_write.to_csv(pos_file, index=False)
                                     logger.info("[inference] wrote %d positions to %s",
                                                 len(positions_df), pos_file)
                                 order_payload = positions_df

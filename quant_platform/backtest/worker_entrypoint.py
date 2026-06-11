@@ -250,7 +250,12 @@ def _make_daily_outfun(user_outfun=None):
             _logger.info("日期计算完成", date=date, end_time=end_time, records=0)
             return
 
-        records = test.to_dict(orient="records")
+        # 写入副本降精度，原始 test 保持 float64 给 user_outfun
+        _write_test = test.copy()
+        _fcols = _write_test.select_dtypes(include=["float64"]).columns
+        if len(_fcols) > 0:
+            _write_test[_fcols] = _write_test[_fcols].astype("float32")
+        records = _write_test.to_dict(orient="records")
         part_index = test.attrs.get("part_index")
         part_count = test.attrs.get("part_count")
         _logger.info("日期计算完成", date=date, end_time=end_time, records=len(records))
