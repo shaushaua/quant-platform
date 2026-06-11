@@ -255,10 +255,10 @@ def main():
     # 保存结果
     if results:
         df = pd.DataFrame(results)
-        # float64 → float32，减少产物存储体积
-        float_cols = df.select_dtypes(include=["float64"]).columns
+        # round(6) 减少产物存储体积
+        float_cols = df.select_dtypes(include=["float64", "float32"]).columns
         if len(float_cols) > 0:
-            df[float_cols] = df[float_cols].astype("float32")
+            df[float_cols] = df[float_cols].round(6)
         fmt = args.format
 
         # 根据格式确定输出路径
