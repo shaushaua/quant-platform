@@ -79,14 +79,15 @@ _base_ns: int = 0  # pd.Timestamp(trading_day).value, set once per day
 def _compact_output_copy(df: pd.DataFrame, decimal_places: int = 6) -> pd.DataFrame:
     """Return an output-only copy with float columns rounded to reduce storage size.
 
-    For JSON: round(n) shortens decimal representation, directly reducing bytes.
-    For CSV/parquet: also applies float32 downcast after rounding.
+    round(n) shortens decimal representation for both JSON and CSV text output.
+    Note: intentionally NOT downcasting to float32, because float32→float64 round-trip
+    introduces precision artifacts that make text representations LONGER.
     """
     float_cols = df.select_dtypes(include=["float64", "float32"]).columns
     if len(float_cols) == 0:
         return df
     out_df = df.copy()
-    out_df[float_cols] = out_df[float_cols].round(decimal_places).astype("float32")
+    out_df[float_cols] = out_df[float_cols].round(decimal_places)
     return out_df
 
 
