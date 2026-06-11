@@ -75,6 +75,21 @@ _reader_cache: Dict[str, NativeShmReader] = {}
 _strategy_cache: Dict[str, tuple[Callable, Dict[str, Any]]] = {}
 _base_ns: int = 0  # pd.Timestamp(trading_day).value, set once per day
 
+
+def _compact_output_copy(df: pd.DataFrame, decimal_places: int = 6) -> pd.DataFrame:
+    """Return an output-only copy with float columns rounded to reduce storage size.
+
+    For JSON: round(n) shortens decimal representation, directly reducing bytes.
+    For CSV/parquet: also applies float32 downcast after rounding.
+    """
+    float_cols = df.select_dtypes(include=["float64", "float32"]).columns
+    if len(float_cols) == 0:
+        return df
+    out_df = df.copy()
+    out_df[float_cols] = out_df[float_cols].round(decimal_places).astype("float32")
+    return out_df
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -1254,22 +1269,18 @@ class NativeEngine:
                 try:
                     order_payload = None
                     result_df = pd.DataFrame(results)
-                    if output_path and not result_df.empty:
-                        output_path.mkdir(parents=True, exist_ok=True)
-                        # 写入副本降精度，原始 result_df 保持 float64 给推理/outfun
-                        _write_df = result_df.copy()
-                        _fcols = _write_df.select_dtypes(include=["float64"]).columns
-                        if len(_fcols) > 0:
-                            _write_df[_fcols] = _write_df[_fcols].astype("float32")
-                        if is_daily:
-                            out_file = output_path / f"{date_str}_daily.csv"
-                        else:
-                            out_file = output_path / f"{date_str}_{end_time}.csv"
-                        _write_df.to_csv(out_file, index=False)
-                        logger.info("[combined] wrote %s", out_file)
                     if not result_df.empty:
+                        compact_df = _compact_output_copy(result_df)
+                        if output_path:
+                            output_path.mkdir(parents=True, exist_ok=True)
+                            if is_daily:
+                                out_file = output_path / f"{date_str}_daily.csv"
+                            else:
+                                out_file = output_path / f"{date_str}_{end_time}.csv"
+                            compact_df.to_csv(out_file, index=False)
+                            logger.info("[combined] wrote %s", out_file)
                         upload_end_time = "daily" if is_daily else end_time
-                        _upload_to_oss(result_df, date_str, upload_end_time)
+                        _upload_to_oss(compact_df, date_str, upload_end_time)
                     if run_inference and inference_fn is not None and not result_df.empty:
                         try:
                             portfolio_context = None
@@ -1303,13 +1314,8 @@ class NativeEngine:
                             )
                             if positions_df is not None and not positions_df.empty:
                                 if output_path:
-                                    # 写入副本降精度，原始 positions_df 保持 float64 给 order_payload
-                                    _pos_write = positions_df.copy()
-                                    _fcols = _pos_write.select_dtypes(include=["float64"]).columns
-                                    if len(_fcols) > 0:
-                                        _pos_write[_fcols] = _pos_write[_fcols].astype("float32")
                                     pos_file = output_path / f"{date_str}_{end_time}_positions.csv"
-                                    _pos_write.to_csv(pos_file, index=False)
+                                    _compact_output_copy(positions_df).to_csv(pos_file, index=False)
                                     logger.info("[inference] wrote %d positions to %s",
                                                 len(positions_df), pos_file)
                                 order_payload = positions_df

@@ -54,7 +54,11 @@ def _time_to_seconds(time_val) -> float:
 
 
 def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
-    """Upload live factor results to OSS. float64 columns are downcast to float32 for storage."""
+    """Upload live factor results to OSS as JSON.
+
+    Caller should pass a compacted copy (round + float32) if storage reduction
+    is desired; this function serializes df as-is.
+    """
     try:
         import oss2
 
@@ -76,12 +80,7 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
         month = date_str[4:6]
         key = f"{prefix}/{year}/{year}{month}/{date_str}/{end_time}.json"
 
-        # 写入副本降精度，不修改传入的 df
-        _write_df = df.copy()
-        _fcols = _write_df.select_dtypes(include=["float64"]).columns
-        if len(_fcols) > 0:
-            _write_df[_fcols] = _write_df[_fcols].astype("float32")
-        records = _write_df.to_dict(orient="records")
+        records = df.to_dict(orient="records")
         payload = json.dumps(records, ensure_ascii=False, default=str).encode("utf-8")
         bucket.put_object(key, payload)
 

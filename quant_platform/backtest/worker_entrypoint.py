@@ -250,11 +250,11 @@ def _make_daily_outfun(user_outfun=None):
             _logger.info("日期计算完成", date=date, end_time=end_time, records=0)
             return
 
-        # 写入副本降精度，原始 test 保持 float64 给 user_outfun
+        # 写入副本 round+float32，原始 test 保持 float64 给 user_outfun
         _write_test = test.copy()
-        _fcols = _write_test.select_dtypes(include=["float64"]).columns
+        _fcols = _write_test.select_dtypes(include=["float64", "float32"]).columns
         if len(_fcols) > 0:
-            _write_test[_fcols] = _write_test[_fcols].astype("float32")
+            _write_test[_fcols] = _write_test[_fcols].round(6).astype("float32")
         records = _write_test.to_dict(orient="records")
         part_index = test.attrs.get("part_index")
         part_count = test.attrs.get("part_count")
