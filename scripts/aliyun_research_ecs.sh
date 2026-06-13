@@ -776,7 +776,7 @@ encrypt_protected_dir() {
   )
 
   echo "==> 等待机器 SSH 可达；首次连上时会提示输入登录密码（即 create 输出的密码），仅这一次..." >&2
-  local max_wait=900 start now elapsed ready=no
+  local max_wait=900 start now elapsed
   start="$(date +%s)"
   while :; do
     now="$(date +%s)"; elapsed=$((now - start))
@@ -788,7 +788,7 @@ encrypt_protected_dir() {
     # 首次成功连接即建立 ControlMaster 主连接（交易员手敲密码）；命令随后反复执行直到 READY
     if ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
         'test -f /opt/quant-platform/READY && command -v fscrypt >/dev/null 2>&1'; then
-      ready=yes; break
+      break
     fi
     sleep 10
   done
