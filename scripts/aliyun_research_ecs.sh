@@ -47,6 +47,10 @@ DEV_USER="${DEV_USER:-research}"
 DEV_PASSWORD="${DEV_PASSWORD:-}"
 GENERATE_DEV_PASSWORD="${GENERATE_DEV_PASSWORD:-true}"
 SSH_PASSWORD_AUTH="${SSH_PASSWORD_AUTH:-true}"
+# SSH 私钥路径（本地）：create 时交互指定，对应公钥注入 cloud-init 供机器免密登录。
+# 私钥始终留在本地，绝不进 UserData。默认空，resolve_ssh_key 中交互填充。
+SSH_KEY_PATH="${SSH_KEY_PATH:-}"
+SSH_AUTHORIZED_KEYS_YAML=""   # 由 resolve_ssh_key 填充，注入 cloud-init users 块；空则不注入
 
 # 目录加密：保护 home 下某子目录，磁盘上只存密文，密钥由交易员持有。
 # 关键约束：fscrypt 口令绝不进 UserData/cloud-init（UserData 对主账号可见），
@@ -82,6 +86,9 @@ Common optional environment:
   DEV_PASSWORD='...'                optional fixed login password for DEV_USER
   GENERATE_DEV_PASSWORD=true        generate one when DEV_PASSWORD is empty
   SSH_PASSWORD_AUTH=true            enable SSH password login
+  SSH_KEY_PATH=                     local private key; pubkey injected into the instance
+                                     for passwordless SSH (auto-encrypt + `ssh` subcommand).
+                                     Prompted at create (default ~/.ssh/id_ed25519); generates if absent.
   INSTALL_ALIYUN_CLI=true           auto-install aliyun CLI under .aliyun-research-ecs/bin
   INSTALL_DOCKER=true
   DOCKER_PULL_BACKTEST_IMAGE=false
@@ -97,6 +104,8 @@ Security:
   - /home/DEV_USER and /opt/quant-platform set to 0700
   - ~/private (ENCRYPTED_DIR) is fscrypt-encrypted at create time; passphrase is yours,
     never written to UserData / config / state — flows via SSH channel only
+  - SSH key auth: only your PUBLIC key goes into UserData (safe); the private key stays local.
+    Auto-encrypt polls the machine silently over key auth — no SSH password to type.
 
 Examples:
   scripts/aliyun_research_ecs.sh create
@@ -146,6 +155,7 @@ DEV_USER=${DEV_USER}
 DEV_PASSWORD=${DEV_PASSWORD}
 GENERATE_DEV_PASSWORD=${GENERATE_DEV_PASSWORD}
 SSH_PASSWORD_AUTH=${SSH_PASSWORD_AUTH}
+SSH_KEY_PATH=${SSH_KEY_PATH}
 AUTO_RELEASE_TIME=${AUTO_RELEASE_TIME}
 ENCRYPT_HOME_SUBDIR=${ENCRYPT_HOME_SUBDIR}
 ENCRYPTED_DIR=${ENCRYPTED_DIR}
@@ -292,6 +302,7 @@ PUBLIC_IP=${PUBLIC_IP}
 PRIVATE_IP=${PRIVATE_IP}
 DEV_USER=${DEV_USER}
 DEV_PASSWORD=${DEV_PASSWORD}
+SSH_KEY_PATH=${SSH_KEY_PATH}
 INSTANCE_NAME=${INSTANCE_NAME}
 EOF
   chmod 600 "${STATE_FILE}"
@@ -355,6 +366,35 @@ for item in items:
         print(sg)'
 }
 
+resolve_ssh_key() {
+  # 交易员手动指定私钥路径（默认 ~/.ssh/id_ed25519，其次 id_rsa）。
+  # 不存在则在该路径生成一把 ed25519；派生公钥内容用于 cloud-init 注入。
+  local default_key="${HOME}/.ssh/id_ed25519"
+  [[ -f "${default_key}" ]] || default_key="${HOME}/.ssh/id_rsa"
+  prompt_value SSH_KEY_PATH "SSH 私钥路径（对应公钥将注入机器用于免密登录）" "${SSH_KEY_PATH:-${default_key}}"
+  # 展开 ~ 为 $HOME
+  SSH_KEY_PATH="${SSH_KEY_PATH/#\~/${HOME}}"
+  [[ -n "${SSH_KEY_PATH}" ]] || die "SSH 私钥路径不能为空"
+  if [[ ! -f "${SSH_KEY_PATH}" ]]; then
+    local gen
+    prompt_value gen "未找到私钥 ${SSH_KEY_PATH}，是否在此路径生成新的 ed25519 key？y/n" "y"
+    if [[ "${gen}" =~ ^[Yy] ]]; then
+      mkdir -p "$(dirname "${SSH_KEY_PATH}")"
+      chmod 700 "$(dirname "${SSH_KEY_PATH}")" 2>/dev/null || true
+      ssh-keygen -t ed25519 -f "${SSH_KEY_PATH}" -N "" -C "quant-ecs" >/dev/null 2>&1 \
+        || die "ssh-keygen 生成失败：${SSH_KEY_PATH}"
+      echo "已生成新的 SSH 密钥：${SSH_KEY_PATH}（私钥请妥善保管，勿外传）" >&2
+    else
+      die "未提供可用的 SSH 私钥，无法免密登录/自动加密。请指定一个已存在的路径或允许生成。"
+    fi
+  fi
+  local pub="${SSH_KEY_PATH}.pub"
+  [[ -f "${pub}" ]] || die "未找到对应公钥 ${pub}（私钥 ${SSH_KEY_PATH} 缺少 .pub 文件）"
+  # 公钥内容去换行，拼成 cloud-init users 块的两行 YAML（4/6 空格缩进对齐 - name:）
+  SSH_AUTHORIZED_KEYS_YAML=$'    ssh_authorized_keys:\n      - '"$(tr -d '\n' < "${pub}")"
+  [[ -n "${SSH_AUTHORIZED_KEYS_YAML}" ]] || die "公钥内容为空：${pub}"
+}
+
 resolve_create_defaults() {
   prompt_value INSTANCE_TYPE "实例规格" "${INSTANCE_TYPE}"
   prompt_value BILLING_MODE "计费方式：spot 抢占式 / postpaid 按量" "${BILLING_MODE}"
@@ -400,7 +440,17 @@ resolve_create_defaults() {
   if [[ "${enc_choice}" =~ ^[Yy] ]]; then
     ENCRYPT_HOME_SUBDIR=true
     ensure_local_encrypt_deps || die "本地缺少 expect 且自动安装失败；请手动安装后重试（Linux: sudo apt install expect），或在加密提示选 n 跳过"
-    prompt_value ENCRYPTED_DIR "要加密的保护目录" "${ENCRYPTED_DIR}"
+    # 加密走 SSH key 免密：先解析私钥路径并派生公钥（注入 cloud-init）
+    resolve_ssh_key
+    # ENCRYPTED_DIR 默认值跟随最终 DEV_USER：若沿用的是别的用户的 home 子目录
+    # （DEV_USER 在 create 时被改、或 init_config 模板写死了旧默认），重算到当前用户，
+    # 否则会因无权在 /home 下建别用户目录而 mkdir 失败。自定义路径（非 /home/*/private）保留。
+    case "${ENCRYPTED_DIR}" in
+      ""|/home/*/private)
+        [[ "${ENCRYPTED_DIR}" == "/home/${DEV_USER}/private" ]] || ENCRYPTED_DIR="/home/${DEV_USER}/private"
+        ;;
+    esac
+    prompt_value ENCRYPTED_DIR "要加密的保护目录" "${ENCRYPTED_DIR:-/home/${DEV_USER}/private}"
     # 校验：必须绝对路径；不能是 home 根目录本身（加密整个 home 会锁死 .ssh/.bashrc，重启后无法登录）
     [[ "${ENCRYPTED_DIR}" == /* ]] || die "保护目录必须是绝对路径（以 / 开头），当前输入：${ENCRYPTED_DIR}"
     case "${ENCRYPTED_DIR}" in
@@ -529,6 +579,7 @@ users:
     shell: /bin/bash
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
     lock_passwd: false
+${SSH_AUTHORIZED_KEYS_YAML}
 write_files:
   - path: /opt/quant-platform/requirements.txt.b64
     permissions: "0644"
@@ -713,7 +764,7 @@ EOF
 # 确保本地有 expect（fscrypt 自动加密需要）。缺失则自动安装。
 # macOS：系统自带 /usr/bin/expect，个别精简系统补 Xcode CLT；
 # Linux：apt/dnf/yum/pacman 安装。装完复查可用性。
-# 不依赖 sshpass：SSH 登录密码由交易员在首次连接时手敲（ControlMaster 复用）。
+# 不依赖 sshpass：SSH 走 key 认证（公钥注入 cloud-init），免密、静默轮询。
 ensure_local_encrypt_deps() {
   command -v expect >/dev/null 2>&1 && return 0
 
@@ -758,52 +809,63 @@ encrypt_protected_dir() {
   [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] || return 0
   [[ -n "${FSCRYPT_PASSPHRASE:-}" ]] || { echo "未设置加密口令，跳过自动加密（可稍后手动 SSH 运行 fscrypt encrypt）" >&2; return 0; }
   [[ -n "${PUBLIC_IP:-}" ]] || { echo "无公网 IP，跳过自动加密" >&2; unset FSCRYPT_PASSPHRASE; return 0; }
+  [[ -n "${SSH_KEY_PATH:-}" && -f "${SSH_KEY_PATH}" ]] || {
+    echo "无 SSH 私钥（${SSH_KEY_PATH:-未设置}），跳过自动加密。请手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+    unset FSCRYPT_PASSPHRASE; return 0; }
 
   ensure_local_encrypt_deps || {
     echo "本地缺少 expect 且无法自动安装，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
     unset FSCRYPT_PASSPHRASE; return 0
   }
 
-  # 不用 sshpass：用 SSH 连接复用（ControlMaster）。交易员在首次 SSH 时手敲一次登录密码
-  # 建立主连接，之后所有 ssh（就绪检查、mkdir、fscrypt encrypt）复用它，不再要密码。
-  # fscrypt 加密口令仍走 expect→远端 fscrypt pty（经已建立的 SSH 加密通道），不进 UserData/落盘。
-  local ssh_ctl="${TMPDIR:-/tmp}/quant-fscrypt-ssh-%r@%h:%p"
+  # 用 SSH key 免密：公钥已由 cloud-init 注入，私钥在本地。
+  # key 认证是静默的（不弹密码框），故不再需要 ControlMaster/ControlPath
+  # （也避开了 macOS socket 路径 ≤104 字符的限制）。
   local ssh_common=(
-    -o ControlMaster=auto -o ControlPath="${ssh_ctl}" -o ControlPersist=300
+    -i "${SSH_KEY_PATH}"
+    -o IdentitiesOnly=yes
+    -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o PasswordAuthentication=no
+    -o BatchMode=yes
     -o StrictHostKeyChecking=accept-new
-    -o PreferredAuthentications=password -o PubkeyAuthentication=no
-    -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1
+    -o ConnectTimeout=8
   )
 
-  echo "==> 等待机器 SSH 可达；首次连上时会提示输入登录密码（即 create 输出的密码），仅这一次..." >&2
-  local max_wait=900 start now elapsed
+  echo "==> 等待机器就绪（cloud-init 注入公钥 + 初始化完成）；用 SSH key 静默轮询，无需输入任何密码..." >&2
+  # 阿里云公网 IP 会回收复用：旧机器的 host key 可能残留在 known_hosts，导致
+  # StrictHostKeyChecking=accept-new 因 key 冲突失败（轮询会一直静默失败）。
+  # 先清掉该 IP 的旧记录，让 accept-new 重新接受新机器的 key。
+  ssh-keygen -R "${PUBLIC_IP}" 2>/dev/null || true
+  local max_wait=900 start now elapsed last_beat=0
   start="$(date +%s)"
   while :; do
     now="$(date +%s)"; elapsed=$((now - start))
     if (( elapsed > max_wait )); then
       echo "等待 cloud-init 完成超时（${elapsed}s）。请稍后手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
-      ssh -O exit -o ControlPath="${ssh_ctl}" "${DEV_USER}@${PUBLIC_IP}" 2>/dev/null || true
       unset FSCRYPT_PASSPHRASE; return 1
     fi
-    # 首次成功连接即建立 ControlMaster 主连接（交易员手敲密码）；命令随后反复执行直到 READY
+    # 公钥装入前会 Permission denied (publickey)，已 2>/dev/null 静默；装好后命令成功即跳出
     if ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
-        'test -f /opt/quant-platform/READY && command -v fscrypt >/dev/null 2>&1'; then
+        'test -f /opt/quant-platform/READY && command -v fscrypt >/dev/null 2>&1' 2>/dev/null; then
       break
+    fi
+    # 心跳：每 30s 报一次进度，避免静默等待看着像卡住
+    if (( elapsed - last_beat >= 30 )); then
+      echo "  ...仍在等待 cloud-init（已 ${elapsed}s）" >&2
+      last_beat=$elapsed
     fi
     sleep 10
   done
-  echo "==> 机器就绪（${elapsed}s），SSH 主连接已建立，加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 通道下发，不落盘/UserData）..."
+  echo "==> 机器就绪（${elapsed}s），加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 加密通道下发，不落盘/UserData）..."
 
-  # 确保保护目录存在：fscrypt encrypt 要求目标目录已存在且为空。复用主连接，不再提示密码。
+  # 确保保护目录存在：fscrypt encrypt 要求目标目录已存在且为空。
   if ! ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
-      "mkdir -p '${ENCRYPTED_DIR}' && chmod 0700 '${ENCRYPTED_DIR}' && test -d '${ENCRYPTED_DIR}'"; then
+      "mkdir -p '${ENCRYPTED_DIR}' && chmod 0700 '${ENCRYPTED_DIR}' && test -d '${ENCRYPTED_DIR}'" 2>/dev/null; then
     echo "无法创建保护目录 ${ENCRYPTED_DIR}（路径无权限或非法）" >&2
-    ssh -O exit -o ControlPath="${ssh_ctl}" "${DEV_USER}@${PUBLIC_IP}" 2>/dev/null || true
     unset FSCRYPT_PASSPHRASE; return 1
   fi
 
-  # expect 跑 fscrypt encrypt：复用主连接（ssh 不再要密码），只需应答 fscrypt 的交互提示。
-  # 口令通过 FSCRYPT_PP 环境变量传入 expect，再 send 到远端 fscrypt 的 pty——不进本地 ps/落盘/UserData。
+  # expect 跑 fscrypt encrypt：用 key 免密 ssh，只需应答 fscrypt 的交互提示。
+  # 口令通过 FSCRYPT_PP 环境变量传入 expect，再 send 到远端 fscrypt pty——不进本地 ps/落盘/UserData。
   local enc_script rc
   enc_script="$(mktemp)"
   cat > "${enc_script}" <<'EXPECT'
@@ -812,7 +874,7 @@ set timeout 300
 set dir    [lindex $argv 0]
 set pp     $env(FSCRYPT_PP)
 log_user 1
-spawn ssh -o ControlMaster=auto -o ControlPath=$env(SSH_CTL) -o StrictHostKeyChecking=accept-new $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
+spawn ssh -i $env(SSH_KEY) -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o BatchMode=yes -o StrictHostKeyChecking=accept-new $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
 expect {
   -re {source number for the new protector} { send "2\r"; exp_continue }
   -re {Enter a name for the new protector} { send "[file tail $dir]\r"; exp_continue }
@@ -828,12 +890,10 @@ catch wait result
 exit [lindex $result 3]
 EXPECT
   chmod 600 "${enc_script}"
-  SSH_USER="${DEV_USER}" SSH_HOST="${PUBLIC_IP}" SSH_CTL="${ssh_ctl}" \
+  SSH_USER="${DEV_USER}" SSH_HOST="${PUBLIC_IP}" SSH_KEY="${SSH_KEY_PATH}" \
     FSCRYPT_PP="${FSCRYPT_PASSPHRASE}" expect "${enc_script}" "${ENCRYPTED_DIR}"
   rc=$?
   rm -f "${enc_script}"
-  # 关闭主连接，释放 socket
-  ssh -O exit -o ControlPath="${ssh_ctl}" "${DEV_USER}@${PUBLIC_IP}" 2>/dev/null || true
   unset FSCRYPT_PASSPHRASE
   if (( rc == 0 )); then
     echo "==> 保护目录已加密：${ENCRYPTED_DIR}"
@@ -1051,6 +1111,14 @@ reset_password() {
 ssh_instance() {
   load_state
   [[ -n "${PUBLIC_IP:-}" ]] || die "PUBLIC_IP missing in ${STATE_FILE}"
+  # 优先用 create 时指定的 SSH key（免密登录）
+  if [[ -n "${SSH_KEY_PATH:-}" && -f "${SSH_KEY_PATH}" ]]; then
+    exec ssh -i "${SSH_KEY_PATH}" \
+      -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
+      -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+      "${DEV_USER}@${PUBLIC_IP}"
+  fi
+  # 回退到密码登录
   local ssh_opts=(
     -o StrictHostKeyChecking=accept-new
     -o PreferredAuthentications=password
@@ -1090,10 +1158,12 @@ DEV_USER=research
 DEV_PASSWORD=
 GENERATE_DEV_PASSWORD=true
 SSH_PASSWORD_AUTH=true
+SSH_KEY_PATH=
 AUTO_RELEASE_TIME=
 SYSTEM_DISK_SIZE=200
 ENCRYPT_HOME_SUBDIR=true
-ENCRYPTED_DIR=/home/research/private
+# ENCRYPTED_DIR 留空则自动用 /home/$DEV_USER/private；改 DEV_USER 时会自动跟随
+ENCRYPTED_DIR=
 EOF
   chmod 600 "${CONFIG_FILE}"
   echo "已创建配置文件：${CONFIG_FILE}"
