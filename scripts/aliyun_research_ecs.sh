@@ -399,6 +399,7 @@ resolve_create_defaults() {
   prompt_value enc_choice "是否加密保护目录（fscrypt）？y/n" "${enc_default}"
   if [[ "${enc_choice}" =~ ^[Yy] ]]; then
     ENCRYPT_HOME_SUBDIR=true
+    ensure_local_encrypt_deps || die "本地缺少 sshpass/expect 且自动安装失败；请手动安装后重试（macOS: brew install esolitos/ipa/sshpass），或在加密提示选 n 跳过"
     prompt_value ENCRYPTED_DIR "要加密的保护目录" "${ENCRYPTED_DIR}"
     # 校验：必须绝对路径；不能是 home 根目录本身（加密整个 home 会锁死 .ssh/.bashrc，重启后无法登录）
     [[ "${ENCRYPTED_DIR}" == /* ]] || die "保护目录必须是绝对路径（以 / 开头），当前输入：${ENCRYPTED_DIR}"
@@ -478,7 +479,8 @@ print(imgs[0].get("ImageId","") if imgs else "")'
     echo "正在自动选择交换机：${REGION_ID}，VPC ${VPC_ID}..." >&2
     VSWITCH_ID="$(aliyun vpc DescribeVSwitches --RegionId "${REGION_ID}" --VpcId "${VPC_ID}" | select_first_json_value 'VSwitches.VSwitch')" || VSWITCH_ID=""
     if [[ -z "${VSWITCH_ID}" ]]; then
-      prompt_value VSWITCH_ID "自动选择交换机失败，请输入 VSWITCH_ID"
+      VSWITCH_ID="vsw-bp1otl9t1l0v882z49cir"
+      echo "自动选择交换机失败，使用兜底交换机：${VSWITCH_ID}" >&2
     fi
   fi
 
@@ -708,19 +710,74 @@ runcmd:
 EOF
 }
 
+# 确保本地有 sshpass + expect（fscrypt 自动加密需要）。缺失则自动安装。
+# macOS：sshpass 走第三方 tap（esolitos/ipa/sshpass），expect 通常预装；
+# Linux：apt 安装。装完把 brew bin 目录纳入 PATH 并复查可用性。
+ensure_local_encrypt_deps() {
+  local missing=()
+  command -v sshpass >/dev/null 2>&1 || missing+=(sshpass)
+  command -v expect  >/dev/null 2>&1 || missing+=(expect)
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+
+  echo "本地缺少 ${missing[*]}（fscrypt 自动加密需要），尝试自动安装..." >&2
+  case "$(uname)" in
+    Darwin)
+      command -v brew >/dev/null 2>&1 || {
+        echo "未安装 Homebrew，无法自动安装。请手动：brew install esolitos/ipa/sshpass" >&2
+        return 1; }
+      for dep in "${missing[@]}"; do
+        if [[ "${dep}" == "sshpass" ]]; then
+          brew install esolitos/ipa/sshpass || { echo "brew 安装 sshpass 失败，请手动：brew install esolitos/ipa/sshpass" >&2; return 1; }
+        elif [[ "${dep}" == "expect" ]]; then
+          brew install expect || { echo "brew 安装 expect 失败" >&2; return 1; }
+        fi
+      done
+      # Apple Silicon (/opt/homebrew) 与 Intel (/usr/local) 两套路径都纳入 PATH
+      local p
+      for p in /opt/homebrew/bin /usr/local/bin; do
+        [[ -d "${p}" ]] && case ":${PATH}:" in *":${p}:"*) ;; *) PATH="${p}:${PATH}" ;; esac
+      done
+      ;;
+    Linux)
+      # WSL 也被识别为 Linux（apt 可用），所以 WSL 用户走这条路径
+      if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get install -y "${missing[@]}" || { echo "apt 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+      elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y "${missing[@]}" || { echo "dnf 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+      elif command -v yum >/dev/null 2>&1; then
+        sudo yum install -y "${missing[@]}" || { echo "yum 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+      elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm "${missing[@]}" || { echo "pacman 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+      else
+        echo "未识别的 Linux 包管理器，请手动安装 ${missing[*]}（sshpass + expect）" >&2; return 1
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # Windows Git Bash / MSYS / Cygwin：sshpass 与 expect 无原生支持
+      echo "Windows (Git Bash/Cygwin/MSYS) 不支持 sshpass/expect，自动加密无法运行。两个选择：" >&2
+      echo "  1) 在 WSL (Ubuntu) 里运行本脚本——WSL 会被识别为 Linux，apt 可装 sshpass/expect" >&2
+      echo "  2) 跳过自动加密：机器就绪后手动 SSH 进去运行 fscrypt encrypt '<保护目录>'" >&2
+      return 1
+      ;;
+    *) echo "无法识别的系统 ($(uname))，请手动安装 ${missing[*]}（sshpass + expect）" >&2; return 1 ;;
+  esac
+  # 复查：装完仍不可用则失败
+  for dep in "${missing[@]}"; do
+    command -v "${dep}" >/dev/null 2>&1 || { echo "${dep} 安装后仍不可用，请检查 PATH" >&2; return 1; }
+  done
+  echo "已安装 ${missing[*]}" >&2
+  return 0
+}
+
 encrypt_protected_dir() {
   [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] || return 0
   [[ -n "${FSCRYPT_PASSPHRASE:-}" ]] || { echo "未设置加密口令，跳过自动加密（可稍后手动 SSH 运行 fscrypt encrypt）" >&2; return 0; }
   [[ -n "${PUBLIC_IP:-}" ]] || { echo "无公网 IP，跳过自动加密" >&2; unset FSCRYPT_PASSPHRASE; return 0; }
 
-  if ! command -v expect >/dev/null 2>&1; then
-    echo "本地未安装 expect，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'（口令请妥善保管）" >&2
+  ensure_local_encrypt_deps || {
+    echo "本地缺少 sshpass/expect 且无法自动安装，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
     unset FSCRYPT_PASSPHRASE; return 0
-  fi
-  if ! command -v sshpass >/dev/null 2>&1; then
-    echo "本地未安装 sshpass，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
-    unset FSCRYPT_PASSPHRASE; return 0
-  fi
+  }
 
   echo "==> 等待机器完成环境初始化（含 fscrypt 就绪），之后加密保护目录..."
   local max_wait=900 start now elapsed ready=no
