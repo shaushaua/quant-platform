@@ -47,10 +47,9 @@ DEV_USER="${DEV_USER:-research}"
 DEV_PASSWORD="${DEV_PASSWORD:-}"
 GENERATE_DEV_PASSWORD="${GENERATE_DEV_PASSWORD:-true}"
 SSH_PASSWORD_AUTH="${SSH_PASSWORD_AUTH:-true}"
-# SSH 私钥路径（本地）：create 时交互指定，对应公钥注入 cloud-init 供机器免密登录。
-# 私钥始终留在本地，绝不进 UserData。默认空，resolve_ssh_key 中交互填充。
+DISABLE_CLOUD_ASSISTANT="${DISABLE_CLOUD_ASSISTANT:-false}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-}"
-SSH_AUTHORIZED_KEYS_YAML=""   # 由 resolve_ssh_key 填充，注入 cloud-init users 块；空则不注入
+SSH_AUTHORIZED_KEYS_YAML=""
 
 # 目录加密：保护 home 下某子目录，磁盘上只存密文，密钥由交易员持有。
 # 关键约束：fscrypt 口令绝不进 UserData/cloud-init（UserData 对主账号可见），
@@ -155,6 +154,7 @@ DEV_USER=${DEV_USER}
 DEV_PASSWORD=${DEV_PASSWORD}
 GENERATE_DEV_PASSWORD=${GENERATE_DEV_PASSWORD}
 SSH_PASSWORD_AUTH=${SSH_PASSWORD_AUTH}
+DISABLE_CLOUD_ASSISTANT=${DISABLE_CLOUD_ASSISTANT}
 SSH_KEY_PATH=${SSH_KEY_PATH}
 AUTO_RELEASE_TIME=${AUTO_RELEASE_TIME}
 ENCRYPT_HOME_SUBDIR=${ENCRYPT_HOME_SUBDIR}
@@ -393,6 +393,16 @@ resolve_ssh_key() {
   # 公钥内容去换行，拼成 cloud-init users 块的两行 YAML（4/6 空格缩进对齐 - name:）
   SSH_AUTHORIZED_KEYS_YAML=$'    ssh_authorized_keys:\n      - '"$(tr -d '\n' < "${pub}")"
   [[ -n "${SSH_AUTHORIZED_KEYS_YAML}" ]] || die "公钥内容为空：${pub}"
+  if [[ "${SSH_PASSWORD_AUTH}" == "true" ]]; then
+    local disable_pw
+    prompt_value disable_pw "已配置私钥，是否关闭密码登录（更安全，防他人用 UserData 里的密码登录）？y/n" "y"
+    [[ "${disable_pw}" =~ ^[Yy] ]] && SSH_PASSWORD_AUTH=false
+  fi
+  if [[ "${DISABLE_CLOUD_ASSISTANT}" != "true" ]]; then
+    local disable_ca
+    prompt_value disable_ca "是否关闭阿里云助手？（挡主账号自动化远程命令；reset-password 会失效）y/n" "n"
+    [[ "${disable_ca}" =~ ^[Yy] ]] && DISABLE_CLOUD_ASSISTANT=true
+  fi
 }
 
 resolve_create_defaults() {
@@ -599,15 +609,15 @@ write_files:
         if grep -qi ubuntu /etc/os-release; then
           codename="\$(. /etc/os-release && echo "\${VERSION_CODENAME:-jammy}")"
           {
-            echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ \${codename} main restricted universe multiverse"
-            echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ \${codename}-updates main restricted universe multiverse"
-            echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ \${codename}-security main restricted universe multiverse"
+            echo "deb https://mirrors.aliyun.com/ubuntu/ \${codename} main restricted universe multiverse"
+            echo "deb https://mirrors.aliyun.com/ubuntu/ \${codename}-updates main restricted universe multiverse"
+            echo "deb https://mirrors.aliyun.com/ubuntu/ \${codename}-security main restricted universe multiverse"
           } > /etc/apt/sources.list
         elif grep -qi debian /etc/os-release; then
           codename="\$(. /etc/os-release && echo "\${VERSION_CODENAME:-bookworm}")"
           {
-            echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian \${codename} main contrib non-free non-free-firmware"
-            echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian \${codename}-updates main contrib non-free non-free-firmware"
+            echo "deb https://mirrors.aliyun.com/debian/ \${codename} main contrib non-free non-free-firmware"
+            echo "deb https://mirrors.aliyun.com/debian/ \${codename}-updates main contrib non-free non-free-firmware"
           } > /etc/apt/sources.list
         fi
       }
@@ -634,8 +644,8 @@ write_files:
 
       python3 -m venv /opt/quant-platform/venv
       . /opt/quant-platform/venv/bin/activate
-      pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-      pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
+      pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+      pip config set global.trusted-host mirrors.aliyun.com
       pip install --upgrade pip setuptools wheel
       pip install --no-cache-dir -r requirements.txt
       pip install --no-cache-dir "pandas>=2.0,<3.0" aliyun-log-python-sdk "joblib>=1.3,<2" "cloudpickle>=2.2,<4" "scikit-learn>=1.3,<2" "paramiko>=3.0,<4"
@@ -717,10 +727,22 @@ write_files:
       sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
       # 禁止空密码
       sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
-      # 启用公钥认证（用户可在自己机器上配置免密登录）
       sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+      if [[ "${SSH_PASSWORD_AUTH}" == "false" ]]; then
+        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+        echo "==> 安全加固：已关闭密码登录（仅允许私钥认证）"
+      fi
       systemctl restart sshd || systemctl restart ssh || true
       echo "==> 安全加固：SSH 已配置（仅允许 ${DEV_USER}，禁止 root）"
+
+      if [[ "${DISABLE_CLOUD_ASSISTANT}" == "true" ]]; then
+        echo "==> 安全加固：关闭阿里云助手..."
+        for svc in aliyun-service aliyun-assist assistdaemon; do
+          systemctl disable --now "\${svc}" 2>/dev/null || true
+          systemctl mask "\${svc}" 2>/dev/null || true
+        done
+        echo "==> 安全加固：阿里云助手已关闭（主账号无法再经云助手远程执行）"
+      fi
 
       # 3. 限制 home / workspace 目录访问
       chmod 0700 /home/${DEV_USER}
@@ -1065,7 +1087,12 @@ create_instance() {
   echo "实例状态已保存：${STATE_FILE}"
   echo "公网 IP：${PUBLIC_IP:-N/A}"
   echo "内网 IP：${PRIVATE_IP:-N/A}"
-  [[ -n "${DEV_PASSWORD}" ]] && echo "登录账号：${DEV_USER} / ${DEV_PASSWORD}"
+  if [[ "${SSH_PASSWORD_AUTH}" == "false" ]]; then
+    echo "登录方式：仅私钥（密码登录已关闭）—— ssh -i ${SSH_KEY_PATH:-<私钥>} ${DEV_USER}@${PUBLIC_IP:-<public-ip>}"
+    [[ -n "${DEV_PASSWORD}" ]] && echo "（密码 ${DEV_PASSWORD} 仅作控制台/云助手救场用，不能 SSH 登录）"
+  else
+    [[ -n "${DEV_PASSWORD}" ]] && echo "登录账号：${DEV_USER} / ${DEV_PASSWORD}"
+  fi
   echo "机器还在自动安装环境，可用下面命令查看进度："
   echo "  ssh ${DEV_USER}@${PUBLIC_IP:-<public-ip>} 'sudo tail -f /var/log/cloud-init-output.log'"
   rm -f "${user_data}"
@@ -1158,6 +1185,7 @@ DEV_USER=research
 DEV_PASSWORD=
 GENERATE_DEV_PASSWORD=true
 SSH_PASSWORD_AUTH=true
+DISABLE_CLOUD_ASSISTANT=false
 SSH_KEY_PATH=
 AUTO_RELEASE_TIME=
 SYSTEM_DISK_SIZE=200
