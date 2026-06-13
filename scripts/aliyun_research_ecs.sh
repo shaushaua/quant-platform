@@ -399,7 +399,7 @@ resolve_create_defaults() {
   prompt_value enc_choice "是否加密保护目录（fscrypt）？y/n" "${enc_default}"
   if [[ "${enc_choice}" =~ ^[Yy] ]]; then
     ENCRYPT_HOME_SUBDIR=true
-    ensure_local_encrypt_deps || die "本地缺少 sshpass/expect 且自动安装失败；请手动安装后重试（macOS: brew install esolitos/ipa/sshpass），或在加密提示选 n 跳过"
+    ensure_local_encrypt_deps || die "本地缺少 expect 且自动安装失败；请手动安装后重试（Linux: sudo apt install expect），或在加密提示选 n 跳过"
     prompt_value ENCRYPTED_DIR "要加密的保护目录" "${ENCRYPTED_DIR}"
     # 校验：必须绝对路径；不能是 home 根目录本身（加密整个 home 会锁死 .ssh/.bashrc，重启后无法登录）
     [[ "${ENCRYPTED_DIR}" == /* ]] || die "保护目录必须是绝对路径（以 / 开头），当前输入：${ENCRYPTED_DIR}"
@@ -710,62 +710,47 @@ runcmd:
 EOF
 }
 
-# 确保本地有 sshpass + expect（fscrypt 自动加密需要）。缺失则自动安装。
-# macOS：sshpass 走第三方 tap（esolitos/ipa/sshpass），expect 通常预装；
-# Linux：apt 安装。装完把 brew bin 目录纳入 PATH 并复查可用性。
+# 确保本地有 expect（fscrypt 自动加密需要）。缺失则自动安装。
+# macOS：系统自带 /usr/bin/expect，个别精简系统补 Xcode CLT；
+# Linux：apt/dnf/yum/pacman 安装。装完复查可用性。
+# 不依赖 sshpass：SSH 登录密码由交易员在首次连接时手敲（ControlMaster 复用）。
 ensure_local_encrypt_deps() {
-  local missing=()
-  command -v sshpass >/dev/null 2>&1 || missing+=(sshpass)
-  command -v expect  >/dev/null 2>&1 || missing+=(expect)
-  [[ ${#missing[@]} -eq 0 ]] && return 0
+  command -v expect >/dev/null 2>&1 && return 0
 
-  echo "本地缺少 ${missing[*]}（fscrypt 自动加密需要），尝试自动安装..." >&2
+  echo "本地缺少 expect（fscrypt 自动加密需要），尝试自动安装..." >&2
   case "$(uname)" in
     Darwin)
-      command -v brew >/dev/null 2>&1 || {
-        echo "未安装 Homebrew，无法自动安装。请手动：brew install esolitos/ipa/sshpass" >&2
-        return 1; }
-      for dep in "${missing[@]}"; do
-        if [[ "${dep}" == "sshpass" ]]; then
-          brew install esolitos/ipa/sshpass || { echo "brew 安装 sshpass 失败，请手动：brew install esolitos/ipa/sshpass" >&2; return 1; }
-        elif [[ "${dep}" == "expect" ]]; then
-          brew install expect || { echo "brew 安装 expect 失败" >&2; return 1; }
-        fi
-      done
-      # Apple Silicon (/opt/homebrew) 与 Intel (/usr/local) 两套路径都纳入 PATH
-      local p
-      for p in /opt/homebrew/bin /usr/local/bin; do
-        [[ -d "${p}" ]] && case ":${PATH}:" in *":${p}:"*) ;; *) PATH="${p}:${PATH}" ;; esac
-      done
+      # macOS 自带 /usr/bin/expect；个别精简系统缺失时补 Xcode 命令行工具
+      command -v xcode-select >/dev/null 2>&1 && xcode-select --install 2>/dev/null
+      command -v expect >/dev/null 2>&1 && { echo "已具备 expect" >&2; return 0; }
+      echo "macOS 未找到 expect。请运行：xcode-select --install 安装命令行工具" >&2
+      return 1
       ;;
     Linux)
-      # WSL 也被识别为 Linux（apt 可用），所以 WSL 用户走这条路径
+      # WSL 也会被识别为 Linux（apt 可用），所以 WSL 用户走这条路径
       if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get install -y "${missing[@]}" || { echo "apt 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+        sudo apt-get install -y expect || { echo "apt 安装 expect 失败，请手动安装" >&2; return 1; }
       elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y "${missing[@]}" || { echo "dnf 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+        sudo dnf install -y expect || { echo "dnf 安装 expect 失败" >&2; return 1; }
       elif command -v yum >/dev/null 2>&1; then
-        sudo yum install -y "${missing[@]}" || { echo "yum 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+        sudo yum install -y expect || { echo "yum 安装 expect 失败" >&2; return 1; }
       elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --noconfirm "${missing[@]}" || { echo "pacman 安装失败，请手动安装 ${missing[*]}" >&2; return 1; }
+        sudo pacman -S --noconfirm expect || { echo "pacman 安装 expect 失败" >&2; return 1; }
       else
-        echo "未识别的 Linux 包管理器，请手动安装 ${missing[*]}（sshpass + expect）" >&2; return 1
+        echo "未识别的 Linux 包管理器，请手动安装 expect" >&2; return 1
       fi
       ;;
     MINGW*|MSYS*|CYGWIN*)
-      # Windows Git Bash / MSYS / Cygwin：sshpass 与 expect 无原生支持
-      echo "Windows (Git Bash/Cygwin/MSYS) 不支持 sshpass/expect，自动加密无法运行。两个选择：" >&2
-      echo "  1) 在 WSL (Ubuntu) 里运行本脚本——WSL 会被识别为 Linux，apt 可装 sshpass/expect" >&2
+      # Windows Git Bash / MSYS / Cygwin：expect 无原生支持
+      echo "Windows (Git Bash/Cygwin/MSYS) 无原生 expect，自动加密无法运行。两个选择：" >&2
+      echo "  1) 在 WSL (Ubuntu) 里运行本脚本——WSL 会被识别为 Linux，apt 可装 expect" >&2
       echo "  2) 跳过自动加密：机器就绪后手动 SSH 进去运行 fscrypt encrypt '<保护目录>'" >&2
       return 1
       ;;
-    *) echo "无法识别的系统 ($(uname))，请手动安装 ${missing[*]}（sshpass + expect）" >&2; return 1 ;;
+    *) echo "无法识别的系统 ($(uname))，请手动安装 expect" >&2; return 1 ;;
   esac
-  # 复查：装完仍不可用则失败
-  for dep in "${missing[@]}"; do
-    command -v "${dep}" >/dev/null 2>&1 || { echo "${dep} 安装后仍不可用，请检查 PATH" >&2; return 1; }
-  done
-  echo "已安装 ${missing[*]}" >&2
+  command -v expect >/dev/null 2>&1 || { echo "expect 安装后仍不可用，请检查 PATH" >&2; return 1; }
+  echo "已安装 expect" >&2
   return 0
 }
 
@@ -775,48 +760,50 @@ encrypt_protected_dir() {
   [[ -n "${PUBLIC_IP:-}" ]] || { echo "无公网 IP，跳过自动加密" >&2; unset FSCRYPT_PASSPHRASE; return 0; }
 
   ensure_local_encrypt_deps || {
-    echo "本地缺少 sshpass/expect 且无法自动安装，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+    echo "本地缺少 expect 且无法自动安装，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
     unset FSCRYPT_PASSPHRASE; return 0
   }
 
-  echo "==> 等待机器完成环境初始化（含 fscrypt 就绪），之后加密保护目录..."
+  # 不用 sshpass：用 SSH 连接复用（ControlMaster）。交易员在首次 SSH 时手敲一次登录密码
+  # 建立主连接，之后所有 ssh（就绪检查、mkdir、fscrypt encrypt）复用它，不再要密码。
+  # fscrypt 加密口令仍走 expect→远端 fscrypt pty（经已建立的 SSH 加密通道），不进 UserData/落盘。
+  local ssh_ctl="${TMPDIR:-/tmp}/quant-fscrypt-ssh-%r@%h:%p"
+  local ssh_common=(
+    -o ControlMaster=auto -o ControlPath="${ssh_ctl}" -o ControlPersist=300
+    -o StrictHostKeyChecking=accept-new
+    -o PreferredAuthentications=password -o PubkeyAuthentication=no
+    -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1
+  )
+
+  echo "==> 等待机器 SSH 可达；首次连上时会提示输入登录密码（即 create 输出的密码），仅这一次..." >&2
   local max_wait=900 start now elapsed ready=no
   start="$(date +%s)"
   while :; do
     now="$(date +%s)"; elapsed=$((now - start))
     if (( elapsed > max_wait )); then
       echo "等待 cloud-init 完成超时（${elapsed}s）。请稍后手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+      ssh -O exit -o ControlPath="${ssh_ctl}" "${DEV_USER}@${PUBLIC_IP}" 2>/dev/null || true
       unset FSCRYPT_PASSPHRASE; return 1
     fi
-    if SSHPASS="${DEV_PASSWORD}" sshpass -e ssh \
-        -o StrictHostKeyChecking=accept-new \
-        -o PreferredAuthentications=password \
-        -o PubkeyAuthentication=no \
-        -o ConnectTimeout=8 \
-        -o NumberOfPasswordPrompts=1 \
-        "${DEV_USER}@${PUBLIC_IP}" \
+    # 首次成功连接即建立 ControlMaster 主连接（交易员手敲密码）；命令随后反复执行直到 READY
+    if ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
         'test -f /opt/quant-platform/READY && command -v fscrypt >/dev/null 2>&1'; then
       ready=yes; break
     fi
     sleep 10
   done
-  echo "==> 机器就绪（${elapsed}s），加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 通道下发，不落盘/UserData）..."
+  echo "==> 机器就绪（${elapsed}s），SSH 主连接已建立，加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 通道下发，不落盘/UserData）..."
 
-  # 确保保护目录存在：fscrypt encrypt 要求目标目录已存在且为空，否则报错。
-  # cloud-init 已尝试创建，这里作为兜底（处理相对路径修正、自定义路径等情形）。
-  if ! SSHPASS="${DEV_PASSWORD}" sshpass -e ssh \
-      -o StrictHostKeyChecking=accept-new \
-      -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-      -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1 \
-      "${DEV_USER}@${PUBLIC_IP}" \
+  # 确保保护目录存在：fscrypt encrypt 要求目标目录已存在且为空。复用主连接，不再提示密码。
+  if ! ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
       "mkdir -p '${ENCRYPTED_DIR}' && chmod 0700 '${ENCRYPTED_DIR}' && test -d '${ENCRYPTED_DIR}'"; then
     echo "无法创建保护目录 ${ENCRYPTED_DIR}（路径无权限或非法）" >&2
+    ssh -O exit -o ControlPath="${ssh_ctl}" "${DEV_USER}@${PUBLIC_IP}" 2>/dev/null || true
     unset FSCRYPT_PASSPHRASE; return 1
   fi
 
-  # expect 在本地跑，spawn sshpass+ssh 连远端 fscrypt encrypt；
-  # 口令通过环境变量 FSCRYPT_PP 传入 expect，再 send 到远端 fscrypt 的 pty（经 SSH 加密通道）。
-  # 因此口令不进本地 ps（环境变量传递）、不落远端磁盘、不进 UserData。
+  # expect 跑 fscrypt encrypt：复用主连接（ssh 不再要密码），只需应答 fscrypt 的交互提示。
+  # 口令通过 FSCRYPT_PP 环境变量传入 expect，再 send 到远端 fscrypt 的 pty——不进本地 ps/落盘/UserData。
   local enc_script rc
   enc_script="$(mktemp)"
   cat > "${enc_script}" <<'EXPECT'
@@ -825,7 +812,7 @@ set timeout 300
 set dir    [lindex $argv 0]
 set pp     $env(FSCRYPT_PP)
 log_user 1
-spawn sshpass -e ssh -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
+spawn ssh -o ControlPath=$env(SSH_CTL) -o StrictHostKeyChecking=accept-new $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
 expect {
   -re {source number for the new protector} { send "2\r"; exp_continue }
   -re {Enter a name for the new protector} { send "[file tail $dir]\r"; exp_continue }
@@ -841,10 +828,12 @@ catch wait result
 exit [lindex $result 3]
 EXPECT
   chmod 600 "${enc_script}"
-  SSHPASS="${DEV_PASSWORD}" SSH_USER="${DEV_USER}" SSH_HOST="${PUBLIC_IP}" \
+  SSH_USER="${DEV_USER}" SSH_HOST="${PUBLIC_IP}" SSH_CTL="${ssh_ctl}" \
     FSCRYPT_PP="${FSCRYPT_PASSPHRASE}" expect "${enc_script}" "${ENCRYPTED_DIR}"
   rc=$?
   rm -f "${enc_script}"
+  # 关闭主连接，释放 socket
+  ssh -O exit -o ControlPath="${ssh_ctl}" "${DEV_USER}@${PUBLIC_IP}" 2>/dev/null || true
   unset FSCRYPT_PASSPHRASE
   if (( rc == 0 )); then
     echo "==> 保护目录已加密：${ENCRYPTED_DIR}"
