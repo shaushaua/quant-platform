@@ -812,7 +812,7 @@ set timeout 300
 set dir    [lindex $argv 0]
 set pp     $env(FSCRYPT_PP)
 log_user 1
-spawn ssh -o ControlPath=$env(SSH_CTL) -o StrictHostKeyChecking=accept-new $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
+spawn ssh -o ControlMaster=auto -o ControlPath=$env(SSH_CTL) -o StrictHostKeyChecking=accept-new $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
 expect {
   -re {source number for the new protector} { send "2\r"; exp_continue }
   -re {Enter a name for the new protector} { send "[file tail $dir]\r"; exp_continue }
