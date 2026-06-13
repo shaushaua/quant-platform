@@ -609,15 +609,15 @@ write_files:
         if grep -qi ubuntu /etc/os-release; then
           codename="\$(. /etc/os-release && echo "\${VERSION_CODENAME:-jammy}")"
           {
-            echo "deb https://mirrors.aliyun.com/ubuntu/ \${codename} main restricted universe multiverse"
-            echo "deb https://mirrors.aliyun.com/ubuntu/ \${codename}-updates main restricted universe multiverse"
-            echo "deb https://mirrors.aliyun.com/ubuntu/ \${codename}-security main restricted universe multiverse"
+            echo "deb http://mirrors.cloud.aliyuncs.com/ubuntu/ \${codename} main restricted universe multiverse"
+            echo "deb http://mirrors.cloud.aliyuncs.com/ubuntu/ \${codename}-updates main restricted universe multiverse"
+            echo "deb http://mirrors.cloud.aliyuncs.com/ubuntu/ \${codename}-security main restricted universe multiverse"
           } > /etc/apt/sources.list
         elif grep -qi debian /etc/os-release; then
           codename="\$(. /etc/os-release && echo "\${VERSION_CODENAME:-bookworm}")"
           {
-            echo "deb https://mirrors.aliyun.com/debian/ \${codename} main contrib non-free non-free-firmware"
-            echo "deb https://mirrors.aliyun.com/debian/ \${codename}-updates main contrib non-free non-free-firmware"
+            echo "deb http://mirrors.cloud.aliyuncs.com/debian/ \${codename} main contrib non-free non-free-firmware"
+            echo "deb http://mirrors.cloud.aliyuncs.com/debian/ \${codename}-updates main contrib non-free non-free-firmware"
           } > /etc/apt/sources.list
         fi
       }
@@ -644,8 +644,8 @@ write_files:
 
       python3 -m venv /opt/quant-platform/venv
       . /opt/quant-platform/venv/bin/activate
-      pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
-      pip config set global.trusted-host mirrors.aliyun.com
+      pip config set global.index-url http://mirrors.cloud.aliyuncs.com/pypi/simple/
+      pip config set global.trusted-host mirrors.cloud.aliyuncs.com
       pip install --upgrade pip setuptools wheel
       pip install --no-cache-dir -r requirements.txt
       pip install --no-cache-dir "pandas>=2.0,<3.0" aliyun-log-python-sdk "joblib>=1.3,<2" "cloudpickle>=2.2,<4" "scikit-learn>=1.3,<2" "paramiko>=3.0,<4"
@@ -763,11 +763,9 @@ write_files:
           if [[ "\${root_fs_type}" == "ext4" ]] && ! tune2fs -l "\${root_dev}" | grep -qi 'Filesystem features:.*encrypt'; then
             tune2fs -O encrypt "\${root_dev}" || echo "WARN: tune2fs -O encrypt 失败" >&2
           fi
-          # fscrypt setup（无参数）一次性完成：按本机 CPU 自动调参生成 /etc/fscrypt.conf，
-          # 并在根 FS 建 /.fscrypt 元数据目录。唯一交互提示是「是否允许非 root 用户创建
-          # 元数据 [y/N]」，用 yes 自动应答 y，这样 DEV_USER 才能跑 fscrypt encrypt。
-          # 注意：不能预写 conf——fscrypt 0.1.x 解析缺 options 字段的 conf 会 nil panic。
-          yes | fscrypt setup && fs_ok=yes || echo "WARN: fscrypt setup 失败（真实错误见上文）" >&2
+          # fscrypt setup 唯一交互提示「允许非 root 用户创建元数据 [y/N]」用 here-string 自动答 y。
+          # 不能用 `yes | fscrypt setup`——pipefail 下 yes 撞 SIGPIPE 退出 141 会让整个管道判失败。
+          fscrypt setup <<< 'y' && fs_ok=yes || echo "WARN: fscrypt setup 失败（真实错误见上文）" >&2
         else
           echo "WARN: 根文件系统 \${root_fs_type} 不支持 fscrypt，跳过目录加密准备" >&2
         fi
