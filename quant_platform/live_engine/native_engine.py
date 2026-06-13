@@ -1640,6 +1640,15 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
         algo_param = row.get("algo_param", row.get("atx_algo_param", ""))
         if algo_param not in {"", None} and not pd.isna(algo_param):
             order["algo_param"] = str(algo_param)
+        # 执行算法策略名 → Gateway 侧自动 resolveAlgoStrategy()
+        algo_strategy = row.get("algo_strategy", "")
+        if algo_strategy not in {"", None} and not pd.isna(algo_strategy):
+            order["algo_strategy"] = str(algo_strategy)
+        # POV 执行算法参数
+        for field in ("max_percent", "up_limit", "down_limit"):
+            val = row.get(field)
+            if val not in {"", None, 0} and not pd.isna(val):
+                order[field] = float(val)
         orders.append(order)
     return orders
 

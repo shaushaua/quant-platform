@@ -88,6 +88,9 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
         except Exception as exc:
             logger.warning("[order-context] gateway read failed: %s", exc)
 
+    # Fetch balance to populate account
+    account = _fetch_balance_to_df(gateway_url, account_id, token, timeout)
+
     return PortfolioContext(
         account_id=account_id,
         broker=broker,
@@ -95,7 +98,7 @@ def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
         as_of=as_of,
         source=source,
         positions=positions,
-        account=pd.DataFrame(),
+        account=account,
         orders=pd.DataFrame(),
         deals=pd.DataFrame(),
         meta=meta,
@@ -136,3 +139,97 @@ def _normalize_code(raw: object) -> str:
     if len(value) == 6 and value[0] in {"0", "3"}:
         return f"{value}.SZ"
     return value
+
+
+def _fetch_balance(gateway_url: str, account_id: str, token: str, timeout: float) -> dict:
+    """Fetch account balance from order-gateway."""
+    params = urllib.parse.urlencode({"account_id": account_id}) if account_id else ""
+    url = f"{gateway_url.rstrip('/')}/v1/balance"
+    if params:
+        url = f"{url}?{params}"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if not payload.get("ok", False):
+            logger.warning("[order-context] balance query not ok: %s", payload.get("error", ""))
+            return {}
+        return payload.get("balance", {}) or {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.warning("[order-context] balance HTTP %s: %s", exc.code, body[:300])
+    except Exception as exc:
+        logger.warning("[order-context] balance query failed: %s", exc)
+    return {}
+
+
+def _fetch_balance_to_df(gateway_url: str, account_id: str, token: str, timeout: float) -> pd.DataFrame:
+    """Fetch balance and return as single-row DataFrame for PortfolioContext.account."""
+    balance_info = _fetch_balance(gateway_url, account_id, token, timeout)
+    if balance_info:
+        return pd.DataFrame([balance_info])
+    return pd.DataFrame()
+
+
+# ── ATX 进程管理 ──────────────────────────────────────────────────────
+
+
+def atx_status(gateway_url: str, token: str = "") -> dict:
+    """Query ATX process status via GET /v1/atx/status."""
+    url = f"{gateway_url.rstrip('/')}/v1/atx/status"
+    return _atx_request(url, token)
+
+
+def atx_start(gateway_url: str, token: str = "") -> dict:
+    """Start ATX process via POST /v1/atx/start."""
+    url = f"{gateway_url.rstrip('/')}/v1/atx/start"
+    return _atx_request(url, token, method="POST")
+
+
+def atx_stop(gateway_url: str, token: str = "") -> dict:
+    """Stop ATX process via POST /v1/atx/stop."""
+    url = f"{gateway_url.rstrip('/')}/v1/atx/stop"
+    return _atx_request(url, token, method="POST")
+
+
+def list_dbf_files(gateway_url: str, token: str = "") -> list[dict]:
+    """List all DBF report files via GET /v1/atx/report."""
+    url = f"{gateway_url.rstrip('/')}/v1/atx/report"
+    result = _atx_request(url, token)
+    if isinstance(result, dict) and "files" in result:
+        return result["files"]
+    return []
+
+
+def read_dbf_file(gateway_url: str, token: str = "", file: str = "") -> dict:
+    """Read a specific DBF file via GET /v1/atx/report?file=xxx.dbf."""
+    params = urllib.parse.urlencode({"file": file}) if file else ""
+    url = f"{gateway_url.rstrip('/')}/v1/atx/report"
+    if params:
+        url = f"{url}?{params}"
+    return _atx_request(url, token)
+
+
+def _atx_request(url: str, token: str = "", method: str = "GET") -> dict:
+    """Low-level ATX HTTP request helper."""
+    timeout = float(os.environ.get("ORDER_GATEWAY_TIMEOUT", "10"))
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        data = None
+        if method == "POST":
+            data = b"{}"
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.warning("[order-context] ATX HTTP %s: %s", exc.code, body[:300])
+    except Exception as exc:
+        logger.warning("[order-context] ATX request failed: %s", exc)
+    return {"ok": False, "error": str(exc) if "exc" in locals() else "request failed"}

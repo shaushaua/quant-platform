@@ -48,6 +48,13 @@ DEV_PASSWORD="${DEV_PASSWORD:-}"
 GENERATE_DEV_PASSWORD="${GENERATE_DEV_PASSWORD:-true}"
 SSH_PASSWORD_AUTH="${SSH_PASSWORD_AUTH:-true}"
 
+# 目录加密：保护 home 下某子目录，磁盘上只存密文，密钥由交易员持有。
+# 关键约束：fscrypt 口令绝不进 UserData/cloud-init（UserData 对主账号可见），
+# 仅在 create 流程内经 SSH 通道下发到远端 fscrypt，机器上只留 protector 元数据。
+ENCRYPT_HOME_SUBDIR="${ENCRYPT_HOME_SUBDIR:-true}"
+ENCRYPTED_DIR="${ENCRYPTED_DIR:-/home/${DEV_USER}/private}"
+LIFETIME_HOURS="${LIFETIME_HOURS:-}"   # 存活小时数，create 时转成 AUTO_RELEASE_TIME 自动释放
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -80,6 +87,16 @@ Common optional environment:
   DOCKER_PULL_BACKTEST_IMAGE=false
   CREATE_DEV_CONTAINER=false
   BACKTEST_IMAGE=172.24.99.176:5000/quant-platform/backtest-base:latest
+  ENCRYPT_HOME_SUBDIR=true          fscrypt-encrypt ~/private at create time
+  ENCRYPTED_DIR=/home/$DEV_USER/private   directory to encrypt (passphrase prompted at create)
+  LIFETIME_HOURS=                   auto-release after N hours (blank = no auto-release)
+
+Security:
+  - UFW firewall blocks SSH from VPC private IPs (10/8, 172.16/12, 192.168/16)
+  - SSH server restricts login to DEV_USER only; root login disabled
+  - /home/DEV_USER and /opt/quant-platform set to 0700
+  - ~/private (ENCRYPTED_DIR) is fscrypt-encrypted at create time; passphrase is yours,
+    never written to UserData / config / state — flows via SSH channel only
 
 Examples:
   scripts/aliyun_research_ecs.sh create
@@ -130,6 +147,8 @@ DEV_PASSWORD=${DEV_PASSWORD}
 GENERATE_DEV_PASSWORD=${GENERATE_DEV_PASSWORD}
 SSH_PASSWORD_AUTH=${SSH_PASSWORD_AUTH}
 AUTO_RELEASE_TIME=${AUTO_RELEASE_TIME}
+ENCRYPT_HOME_SUBDIR=${ENCRYPT_HOME_SUBDIR}
+ENCRYPTED_DIR=${ENCRYPTED_DIR}
 EOF
   chmod 600 "${CONFIG_FILE}"
 }
@@ -349,6 +368,55 @@ resolve_create_defaults() {
     fi
   fi
 
+  # 存活时长：到点自动释放（阿里云 AutoReleaseTime，ISO8601 UTC）
+  local lifetime_hours
+  prompt_value lifetime_hours "存活时长（小时，到时自动释放；留空则不自动释放）" "${LIFETIME_HOURS:-}"
+  if [[ -n "${lifetime_hours}" ]]; then
+    if [[ "${lifetime_hours}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      # 取整小时；macOS 用 date -v，Linux 用 date -d
+      local whole_hours
+      whole_hours="$(python3 -c "import math,sys; print(int(math.ceil(float(sys.argv[1]))))" "${lifetime_hours}")"
+      AUTO_RELEASE_TIME="$(date -u -v+${whole_hours}H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -d "+${whole_hours} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+      if [[ -n "${AUTO_RELEASE_TIME}" ]]; then
+        echo "机器将于 ${AUTO_RELEASE_TIME}（UTC）自动释放" >&2
+      else
+        echo "WARN: 无法把存活时长转成释放时间，已忽略自动释放" >&2
+        AUTO_RELEASE_TIME=""
+      fi
+    else
+      echo "WARN: 存活时长 '${lifetime_hours}' 不是数字，已忽略自动释放" >&2
+      AUTO_RELEASE_TIME=""
+    fi
+  else
+    AUTO_RELEASE_TIME=""
+  fi
+
+  # 目录加密：保护 home 下某子目录，密钥由交易员持有，绝不进 UserData
+  local enc_default="n"
+  [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] && enc_default="y"
+  local enc_choice
+  prompt_value enc_choice "是否加密保护目录（fscrypt）？y/n" "${enc_default}"
+  if [[ "${enc_choice}" =~ ^[Yy] ]]; then
+    ENCRYPT_HOME_SUBDIR=true
+    prompt_value ENCRYPTED_DIR "要加密的保护目录" "${ENCRYPTED_DIR}"
+    # 校验：必须绝对路径；不能是 home 根目录本身（加密整个 home 会锁死 .ssh/.bashrc，重启后无法登录）
+    [[ "${ENCRYPTED_DIR}" == /* ]] || die "保护目录必须是绝对路径（以 / 开头），当前输入：${ENCRYPTED_DIR}"
+    case "${ENCRYPTED_DIR}" in
+      "/home/${DEV_USER}"|"/home/${DEV_USER}/") \
+        die "不能加密整个 home 目录（${ENCRYPTED_DIR}），会锁死 .ssh/.bashrc 导致重启后无法登录；请用 home 下子目录，如 /home/${DEV_USER}/private" ;;
+    esac
+    # 口令用 read -s 收集，绝不写入 config/state/日志；用完即 unset
+    prompt_value FSCRYPT_PASSPHRASE "fscrypt 加密口令（不回显，请妥善备份，丢失无法恢复）" "" true
+    [[ -n "${FSCRYPT_PASSPHRASE}" ]] || die "加密口令不能为空"
+    local pp_confirm
+    prompt_value pp_confirm "再次输入口令确认" "" true
+    [[ "${pp_confirm}" == "${FSCRYPT_PASSPHRASE}" ]] || die "两次口令不一致"
+    unset pp_confirm
+  else
+    ENCRYPT_HOME_SUBDIR=false
+  fi
+
   if [[ -n "${IMAGE_ID}" ]]; then
     local existing_image_size
     existing_image_size="$(image_size_gb "${IMAGE_ID}")" || existing_image_size=0
@@ -495,7 +563,7 @@ write_files:
         rm -rf /etc/apt/sources.list.d/* || true
         write_apt_sources
         apt-get update
-        apt-get install -y --no-install-recommends python3 python3-venv python3-pip python3-dev build-essential curl wget gnupg ca-certificates unzip git fuse libfuse2
+        apt-get install -y --no-install-recommends python3 python3-venv python3-pip python3-dev build-essential curl wget gnupg ca-certificates unzip git fuse libfuse2 ufw fscrypt keyutils
         if [[ "${INSTALL_DOCKER}" == "true" ]]; then
           apt-get install -y --no-install-recommends docker.io
           systemctl enable --now docker || true
@@ -564,9 +632,171 @@ write_files:
       print("duckdb", duckdb.__version__)
       PY
       touch /opt/quant-platform/READY
+
+      # ================================================================
+      # 权限加固：隔离本机与 VPC 内其他量化研究机器
+      # ================================================================
+
+      # 1. 封锁所有 VPC 私网 IP 对本机的 SSH 访问
+      #    交易员只能通过公网 IP 连接，VPC 内其他机器无法 SSH 进来
+      echo "==> 安全加固：配置 UFW 防火墙..."
+      ufw --force reset
+      # 先封锁 VPC 私网 SSH（deny 规则优先评估）
+      for cidr in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+        ufw deny proto tcp from "\${cidr}" to any port 22
+      done
+      # 再放通公网 SSH
+      ufw allow 22/tcp comment 'SSH from public internet'
+      ufw allow 80/tcp comment 'HTTP'
+      ufw allow 443/tcp comment 'HTTPS'
+      ufw --force enable
+      systemctl enable ufw || true
+      echo "==> 安全加固：UFW 防火墙已启用（已封锁所有私网 SSH）"
+
+      # 2. SSH 服务加固
+      echo "==> 安全加固：SSH 配置..."
+      if grep -q '^AllowUsers' /etc/ssh/sshd_config; then
+        sed -i "s/^AllowUsers.*/AllowUsers ${DEV_USER}/" /etc/ssh/sshd_config
+      else
+        echo "AllowUsers ${DEV_USER}" >> /etc/ssh/sshd_config
+      fi
+      # 禁止 root SSH 登录（匹配 #PermitRootLogin 或有注释的情况）
+      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+      # 禁止空密码
+      sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+      # 启用公钥认证（用户可在自己机器上配置免密登录）
+      sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+      systemctl restart sshd || systemctl restart ssh || true
+      echo "==> 安全加固：SSH 已配置（仅允许 ${DEV_USER}，禁止 root）"
+
+      # 3. 限制 home / workspace 目录访问
+      chmod 0700 /home/${DEV_USER}
+      chmod 0700 /opt/quant-platform
+      echo "==> 安全加固：/home/${DEV_USER} 和 /opt/quant-platform 已设为 0700"
+
+      # ================================================================
+      # 4. 目录加密准备：装好 fscrypt 并启用 ext4 encrypt，创建空保护目录
+      #    安全约束：口令绝不在此处出现（不进 UserData）；
+      #    实际加密由 create 流程经 SSH 通道下发口令完成。
+      # ================================================================
+      if [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]]; then
+        echo "==> 目录加密：准备 fscrypt..."
+        root_fs_type="\$(findmnt -no FSTYPE /)"
+        fs_ok=no
+        if [[ "\${root_fs_type}" == "ext4" || "\${root_fs_type}" == "f2fs" ]]; then
+          root_dev="\$(findmnt -no SOURCE /)"
+          if [[ "\${root_fs_type}" == "ext4" ]] && ! tune2fs -l "\${root_dev}" | grep -qi 'Filesystem features:.*encrypt'; then
+            tune2fs -O encrypt "\${root_dev}" || echo "WARN: tune2fs -O encrypt 失败" >&2
+          fi
+          # fscrypt setup（无参数）一次性完成：按本机 CPU 自动调参生成 /etc/fscrypt.conf，
+          # 并在根 FS 建 /.fscrypt 元数据目录。唯一交互提示是「是否允许非 root 用户创建
+          # 元数据 [y/N]」，用 yes 自动应答 y，这样 DEV_USER 才能跑 fscrypt encrypt。
+          # 注意：不能预写 conf——fscrypt 0.1.x 解析缺 options 字段的 conf 会 nil panic。
+          yes | fscrypt setup && fs_ok=yes || echo "WARN: fscrypt setup 失败（真实错误见上文）" >&2
+        else
+          echo "WARN: 根文件系统 \${root_fs_type} 不支持 fscrypt，跳过目录加密准备" >&2
+        fi
+        if [[ "\${fs_ok}" == "yes" ]]; then
+          mkdir -p "${ENCRYPTED_DIR}"
+          chown ${DEV_USER}:${DEV_USER} "${ENCRYPTED_DIR}"
+          chmod 0700 "${ENCRYPTED_DIR}"
+          echo "==> 目录加密：fscrypt 就绪，保护目录 ${ENCRYPTED_DIR}（等待 create 流程下发口令）"
+        fi
+      fi
 runcmd:
   - [bash, /opt/quant-platform/bootstrap-research-env.sh]
 EOF
+}
+
+encrypt_protected_dir() {
+  [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] || return 0
+  [[ -n "${FSCRYPT_PASSPHRASE:-}" ]] || { echo "未设置加密口令，跳过自动加密（可稍后手动 SSH 运行 fscrypt encrypt）" >&2; return 0; }
+  [[ -n "${PUBLIC_IP:-}" ]] || { echo "无公网 IP，跳过自动加密" >&2; unset FSCRYPT_PASSPHRASE; return 0; }
+
+  if ! command -v expect >/dev/null 2>&1; then
+    echo "本地未安装 expect，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'（口令请妥善保管）" >&2
+    unset FSCRYPT_PASSPHRASE; return 0
+  fi
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "本地未安装 sshpass，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+    unset FSCRYPT_PASSPHRASE; return 0
+  fi
+
+  echo "==> 等待机器完成环境初始化（含 fscrypt 就绪），之后加密保护目录..."
+  local max_wait=900 start now elapsed ready=no
+  start="$(date +%s)"
+  while :; do
+    now="$(date +%s)"; elapsed=$((now - start))
+    if (( elapsed > max_wait )); then
+      echo "等待 cloud-init 完成超时（${elapsed}s）。请稍后手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+      unset FSCRYPT_PASSPHRASE; return 1
+    fi
+    if SSHPASS="${DEV_PASSWORD}" sshpass -e ssh \
+        -o StrictHostKeyChecking=accept-new \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        -o ConnectTimeout=8 \
+        -o NumberOfPasswordPrompts=1 \
+        "${DEV_USER}@${PUBLIC_IP}" \
+        'test -f /opt/quant-platform/READY && command -v fscrypt >/dev/null 2>&1'; then
+      ready=yes; break
+    fi
+    sleep 10
+  done
+  echo "==> 机器就绪（${elapsed}s），加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 通道下发，不落盘/UserData）..."
+
+  # 确保保护目录存在：fscrypt encrypt 要求目标目录已存在且为空，否则报错。
+  # cloud-init 已尝试创建，这里作为兜底（处理相对路径修正、自定义路径等情形）。
+  if ! SSHPASS="${DEV_PASSWORD}" sshpass -e ssh \
+      -o StrictHostKeyChecking=accept-new \
+      -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1 \
+      "${DEV_USER}@${PUBLIC_IP}" \
+      "mkdir -p '${ENCRYPTED_DIR}' && chmod 0700 '${ENCRYPTED_DIR}' && test -d '${ENCRYPTED_DIR}'"; then
+    echo "无法创建保护目录 ${ENCRYPTED_DIR}（路径无权限或非法）" >&2
+    unset FSCRYPT_PASSPHRASE; return 1
+  fi
+
+  # expect 在本地跑，spawn sshpass+ssh 连远端 fscrypt encrypt；
+  # 口令通过环境变量 FSCRYPT_PP 传入 expect，再 send 到远端 fscrypt 的 pty（经 SSH 加密通道）。
+  # 因此口令不进本地 ps（环境变量传递）、不落远端磁盘、不进 UserData。
+  local enc_script rc
+  enc_script="$(mktemp)"
+  cat > "${enc_script}" <<'EXPECT'
+#!/usr/bin/env expect -f
+set timeout 300
+set dir    [lindex $argv 0]
+set pp     $env(FSCRYPT_PP)
+log_user 1
+spawn sshpass -e ssh -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no $env(SSH_USER)@$env(SSH_HOST) fscrypt encrypt $dir
+expect {
+  -re {source number for the new protector} { send "2\r"; exp_continue }
+  -re {Enter a name for the new protector} { send "[file tail $dir]\r"; exp_continue }
+  -re {Enter custom passphrase} { send "$pp\r"; exp_continue }
+  -re {Confirm passphrase} { send "$pp\r"; exp_continue }
+  -re {Should we destroy} { send "n\r"; exp_continue }
+  -re {refusing to encrypt|cannot be encrypted|Error:|Failed} { exit 1 }
+  -re {now encrypted|already encrypted|encrypted, unlocked} { }
+  timeout { exit 2 }
+  eof
+}
+catch wait result
+exit [lindex $result 3]
+EXPECT
+  chmod 600 "${enc_script}"
+  SSHPASS="${DEV_PASSWORD}" SSH_USER="${DEV_USER}" SSH_HOST="${PUBLIC_IP}" \
+    FSCRYPT_PP="${FSCRYPT_PASSPHRASE}" expect "${enc_script}" "${ENCRYPTED_DIR}"
+  rc=$?
+  rm -f "${enc_script}"
+  unset FSCRYPT_PASSPHRASE
+  if (( rc == 0 )); then
+    echo "==> 保护目录已加密：${ENCRYPTED_DIR}"
+    echo "    重启/重登后该目录锁定，需 fscrypt unlock '${ENCRYPTED_DIR}' + 口令解锁"
+    echo "    口令已从内存清除；请确认你本地已备份（丢失无法恢复）"
+  else
+    echo "==> 自动加密失败（rc=${rc}）。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+  fi
+  return $rc
 }
 
 create_instance() {
@@ -733,6 +963,11 @@ create_instance() {
   echo "机器还在自动安装环境，可用下面命令查看进度："
   echo "  ssh ${DEV_USER}@${PUBLIC_IP:-<public-ip>} 'sudo tail -f /var/log/cloud-init-output.log'"
   rm -f "${user_data}"
+
+  # 等待 cloud-init 完成，并加密保护目录（口令经 SSH 通道下发，不落盘/UserData）
+  if [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]]; then
+    encrypt_protected_dir || echo "（加密步骤未完成，不影响机器使用，可稍后手动加密）" >&2
+  fi
 }
 
 release_instance() {
@@ -811,6 +1046,8 @@ GENERATE_DEV_PASSWORD=true
 SSH_PASSWORD_AUTH=true
 AUTO_RELEASE_TIME=
 SYSTEM_DISK_SIZE=200
+ENCRYPT_HOME_SUBDIR=true
+ENCRYPTED_DIR=/home/research/private
 EOF
   chmod 600 "${CONFIG_FILE}"
   echo "已创建配置文件：${CONFIG_FILE}"
