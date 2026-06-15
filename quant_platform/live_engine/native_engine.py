@@ -681,7 +681,10 @@ class NativeEngine:
                 if current <= start:
                     continue
 
-                arr = reader.view_rows()[start:current]
+                try:
+                    arr = reader.view_rows()[start:current]
+                except Exception:
+                    continue
                 n = arr.shape[0]
                 if n == 0:
                     self._state_offsets[offset_key] = current
