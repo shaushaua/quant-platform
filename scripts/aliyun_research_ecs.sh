@@ -711,7 +711,10 @@ write_files:
         rm -rf /etc/apt/sources.list.d/* || true
         write_apt_sources
         apt-get update
-        apt-get install -y --no-install-recommends python3 python3-venv python3-pip python3-dev build-essential curl wget gnupg ca-certificates unzip git fuse libfuse2 ufw fscrypt keyutils
+        apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev python3.11-distutils build-essential curl wget gnupg ca-certificates unzip git fuse libfuse2 ufw fscrypt keyutils
+        # Install pip for Python 3.11 (Ubuntu 22.04 universe has python3.11 but not python3-pip for it)
+        curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
         if [[ "${INSTALL_DOCKER}" == "true" ]]; then
           apt-get install -y --no-install-recommends docker.io
           systemctl enable --now docker || true
@@ -727,7 +730,7 @@ write_files:
         exit 1
       fi
 
-      python3 -m venv /opt/quant-platform/venv
+      python3.11 -m venv /opt/quant-platform/venv
       . /opt/quant-platform/venv/bin/activate
       pip config set global.index-url http://mirrors.cloud.aliyuncs.com/pypi/simple/
       pip config set global.trusted-host mirrors.cloud.aliyuncs.com
@@ -770,7 +773,7 @@ write_files:
         fi
       fi
 
-      /opt/quant-platform/venv/bin/python - <<'PY'
+      /opt/quant-platform/venv/bin/python3.11 - <<'PY'
       import duckdb, numpy, pandas, pyarrow, sklearn
       print("quant research env ready")
       print("pandas", pandas.__version__)
