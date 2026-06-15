@@ -50,6 +50,9 @@ SSH_PASSWORD_AUTH="${SSH_PASSWORD_AUTH:-true}"
 DISABLE_CLOUD_ASSISTANT="${DISABLE_CLOUD_ASSISTANT:-false}"
 SSH_KEY_PATH="${SSH_KEY_PATH:-}"
 SSH_AUTHORIZED_KEYS_YAML=""
+RAM_USERNAME="${RAM_USERNAME:-}"
+RESTRICT_SSH_TO_CALLER_IP="${RESTRICT_SSH_TO_CALLER_IP:-true}"
+ALLOWED_SSH_CIDR="${ALLOWED_SSH_CIDR:-}"
 
 # 目录加密：保护 home 下某子目录，磁盘上只存密文，密钥由交易员持有。
 # 关键约束：fscrypt 口令绝不进 UserData/cloud-init（UserData 对主账号可见），
@@ -85,6 +88,12 @@ Common optional environment:
   DEV_PASSWORD='...'                optional fixed login password for DEV_USER
   GENERATE_DEV_PASSWORD=true        generate one when DEV_PASSWORD is empty
   SSH_PASSWORD_AUTH=true            enable SSH password login
+  RAM_USERNAME=                     RAM 子账号用户名；实例打 tag owner=<用户名>，
+                                    用于 RAM Policy 做 trader 隔离。强烈建议设置。
+  RESTRICT_SSH_TO_CALLER_IP=true    创建 per-trader 安全组，仅放行调用者公网 IP 进 SSH。
+                                    覆盖 0.0.0.0/0 默认 SG（更严的入站）。
+  ALLOWED_SSH_CIDR=                 手动指定放行 CIDR（如 VPN 网段 10.0.0.0/8）。
+                                    留空则自动用调用者公网 IP /32。
   SSH_KEY_PATH=                     local private key; pubkey injected into the instance
                                      for passwordless SSH (auto-encrypt + `ssh` subcommand).
                                      Prompted at create (default ~/.ssh/id_ed25519); generates if absent.
@@ -105,6 +114,28 @@ Security:
     never written to UserData / config / state — flows via SSH channel only
   - SSH key auth: only your PUBLIC key goes into UserData (safe); the private key stays local.
     Auto-encrypt polls the machine silently over key auth — no SSH password to type.
+  - VNC 登录密码不再写进 UserData（旧版漏洞：主账号 ecs:DescribeInstanceUserData 即可读到）；
+    改由 create 流程经 SSH 通道下发 chpasswd，仅在本地 state 文件保存。
+  - RAM_USERNAME 打 tag owner=<user>，配合 RAM Policy 做 trader 隔离
+    （Policy 模板见本脚本末尾「RAM Policy 模板」）。
+  - RESTRICT_SSH_TO_CALLER_IP=true（默认）创建 per-trader 安全组，SSH 仅放行调用者公网 IP。
+  - 云助手关闭后，systemd timer cloud-assistant-guard 每 10min 自检一次，
+    主账号通过 API 重新启用会被自动关闭 + 记 /var/log/cloud-assistant-guard.log。
+
+L3 现实防御 —— ActionTrail 审计（一次性控制台配置，不在脚本里）:
+  1) 阿里云控制台 → ActionTrail → 创建 trail，转发到独立子账号的 SLS Logstore 或 OSS WORM 桶
+     （主账号不能删 trail / 不能删日志，否则审计失效）
+  2) 配告警（钉钉 webhook / 邮件）监控以下主账号可疑事件：
+     - DescribeInstanceUserData        主账号在查 UserData（最可疑）
+     - ResetPassword                   重置实例密码
+     - ModifyInstanceAttribute         改实例属性
+     - CreateSnapshot + CopySnapshot   磁盘取证准备
+     - RunCommand                      云助手执行（应已禁，出现即告警）
+     - RebootInstance + 冷启动          可能配合内存 dump 攻击
+  3) ActionTrail 不记录 VNC 控制台操作 / 实例内文件读 —— 那部分只能靠 fscrypt + 限制 root 登录减缓
+
+  现实约束：主账号固有权力无法技术上堵死（detach 系统盘改 shadow、VNC、内存 dump 等）。
+  防御靠「审计 + 法务 + 合规」威慑，让主账号「不敢做」而非「做不了」。
 
 Examples:
   scripts/aliyun_research_ecs.sh create
@@ -156,6 +187,9 @@ GENERATE_DEV_PASSWORD=${GENERATE_DEV_PASSWORD}
 SSH_PASSWORD_AUTH=${SSH_PASSWORD_AUTH}
 DISABLE_CLOUD_ASSISTANT=${DISABLE_CLOUD_ASSISTANT}
 SSH_KEY_PATH=${SSH_KEY_PATH}
+RAM_USERNAME=${RAM_USERNAME}
+RESTRICT_SSH_TO_CALLER_IP=${RESTRICT_SSH_TO_CALLER_IP}
+ALLOWED_SSH_CIDR=${ALLOWED_SSH_CIDR}
 AUTO_RELEASE_TIME=${AUTO_RELEASE_TIME}
 ENCRYPT_HOME_SUBDIR=${ENCRYPT_HOME_SUBDIR}
 ENCRYPTED_DIR=${ENCRYPTED_DIR}
@@ -366,6 +400,57 @@ for item in items:
         print(sg)'
 }
 
+# 创建/复用 per-trader 安全组：仅放行 ALLOWED_SSH_CIDR（默认调用者公网 IP /32）进 SSH。
+# 思路：trader 隔离不该靠 0.0.0.0/0 默认 SG——全网都能扫到 22 端口。
+# 此 SG 命名包含 RAM_USERNAME，每个 trader 一个，互不影响。
+ensure_trader_sg() {
+  [[ "${RESTRICT_SSH_TO_CALLER_IP}" == "true" ]] || return 0
+  local sg_name="quant-research-${RAM_USERNAME:-default}"
+  local existing
+  existing="$(aliyun ecs DescribeSecurityGroups --RegionId "${REGION_ID}" --VpcId "${VPC_ID}" \
+      --SecurityGroupName "${sg_name}" 2>/dev/null \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+items=d.get("SecurityGroups",{}).get("SecurityGroup",[])
+print(items[0]["SecurityGroupId"] if items else "")' 2>/dev/null)"
+  if [[ -n "${existing}" ]]; then
+    echo "${existing}"
+    return 0
+  fi
+
+  local cidr="${ALLOWED_SSH_CIDR}"
+  if [[ -z "${cidr}" ]]; then
+    local caller_ip
+    caller_ip="$(curl -s --max-time 5 https://ifconfig.me || curl -s --max-time 5 https://ipinfo.io/ip || true)"
+    [[ -n "${caller_ip}" ]] || { echo "无法获取调用者公网 IP；请手动设置 ALLOWED_SSH_CIDR" >&2; return 1; }
+    cidr="${caller_ip}/32"
+  fi
+
+  echo "==> 创建 per-trader 安全组 ${sg_name}，SSH 仅放行 ${cidr}..." >&2
+  local sg_id
+  sg_id="$(aliyun ecs CreateSecurityGroup \
+      --RegionId "${REGION_ID}" \
+      --VpcId "${VPC_ID}" \
+      --SecurityGroupName "${sg_name}" \
+      --Description "Quant research SG for ${RAM_USERNAME:-default}; SSH restricted to ${cidr}" \
+      --Tag.1.Key=owner --Tag.1.Value="${RAM_USERNAME:-default}" \
+    2>&1 | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin)["SecurityGroupId"])
+except Exception:
+    print("")' 2>/dev/null)"
+  [[ -n "${sg_id}" ]] || { echo "创建 SG 失败" >&2; return 1; }
+
+  aliyun ecs AuthorizeSecurityGroup --SecurityGroupId "${sg_id}" \
+      --IpProtocol tcp --PortRange 22/22 --SourceCidrIp "${cidr}" \
+      --Description "SSH from trader IP" >/dev/null 2>&1 || true
+  # 出站全开（apt/pip/docker pull 等需要）
+  aliyun ecs AuthorizeSecurityGroupEgress --SecurityGroupId "${sg_id}" \
+      --IpProtocol all --PortRange -1/-1 --DestCidrIp 0.0.0.0/0 \
+      --Description "egress all" >/dev/null 2>&1 || true
+  echo "${sg_id}"
+}
+
 resolve_ssh_key() {
   # 交易员手动指定私钥路径（默认 ~/.ssh/id_ed25519，其次 id_rsa）。
   # 不存在则在该路径生成一把 ed25519；派生公钥内容用于 cloud-init 注入。
@@ -406,6 +491,12 @@ resolve_ssh_key() {
 }
 
 resolve_create_defaults() {
+  if [[ -z "${RAM_USERNAME}" ]]; then
+    echo "==> 警告：RAM_USERNAME 未设置。" >&2
+    echo "    实例不会打 owner tag，RAM Policy 无法做 trader 隔离（其他 trader 的子账号可能看到/操作此实例）。" >&2
+    echo "    建议 export RAM_USERNAME=<你的 RAM 用户名> 后再 create。" >&2
+    prompt_value RAM_USERNAME "RAM 子账号用户名（回车跳过则不启用 tag 隔离）" "${RAM_USERNAME}"
+  fi
   prompt_value INSTANCE_TYPE "实例规格" "${INSTANCE_TYPE}"
   prompt_value BILLING_MODE "计费方式：spot 抢占式 / postpaid 按量" "${BILLING_MODE}"
   prompt_value DEV_USER "登录用户名" "${DEV_USER}"
@@ -576,19 +667,13 @@ make_cloud_init() {
 #cloud-config
 package_update: false
 ssh_pwauth: ${SSH_PASSWORD_AUTH}
-chpasswd:
-  expire: false
-  users:
-    - name: ${DEV_USER}
-      password: ${DEV_PASSWORD}
-      type: text
 users:
   - default
   - name: ${DEV_USER}
     groups: sudo,docker
     shell: /bin/bash
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    lock_passwd: false
+    lock_passwd: true
 ${SSH_AUTHORIZED_KEYS_YAML}
 write_files:
   - path: /opt/quant-platform/requirements.txt.b64
@@ -670,9 +755,6 @@ write_files:
       } >/etc/profile.d/quant-platform.sh
 
       chown -R ${DEV_USER}:${DEV_USER} /opt/quant-platform /data /results /logs
-      if [[ -n "${DEV_PASSWORD}" ]]; then
-        echo "${DEV_USER}:${DEV_PASSWORD}" | chpasswd
-      fi
 
       if [[ "${INSTALL_DOCKER}" == "true" ]]; then
         usermod -aG docker ${DEV_USER} || true
@@ -741,7 +823,42 @@ write_files:
           systemctl disable --now "\${svc}" 2>/dev/null || true
           systemctl mask "\${svc}" 2>/dev/null || true
         done
-        echo "==> 安全加固：阿里云助手已关闭（主账号无法再经云助手远程执行）"
+        cat >/usr/local/bin/disable-cloud-assistant.sh <<'WD'
+#!/bin/bash
+LOG=/var/log/cloud-assistant-guard.log
+ts() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
+for svc in aliyun-service aliyun-assist assistdaemon; do
+  if systemctl is-enabled "\${svc}" 2>/dev/null | grep -qiE 'enabled|static'; then
+    echo "[\$(ts)] WARN: \${svc} was re-enabled, disabling + masking" >> "\${LOG}"
+    systemctl disable --now "\${svc}" 2>/dev/null || true
+    systemctl mask "\${svc}" 2>/dev/null || true
+  fi
+done
+WD
+        chmod 0755 /usr/local/bin/disable-cloud-assistant.sh
+        cat >/etc/systemd/system/cloud-assistant-guard.service <<'SVC'
+[Unit]
+Description=Watchdog: re-disable Aliyun cloud assistant if re-enabled
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disable-cloud-assistant.sh
+SVC
+        cat >/etc/systemd/system/cloud-assistant-guard.timer <<'TMR'
+[Unit]
+Description=Run cloud-assistant-guard periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+TMR
+        systemctl daemon-reload
+        systemctl enable --now cloud-assistant-guard.timer
+        echo "==> 安全加固：阿里云助手已关闭；watchdog 每 10min 检查一次（事件记 /var/log/cloud-assistant-guard.log）"
       fi
 
       # 3. 限制 home / workspace 目录访问
@@ -825,22 +942,21 @@ ensure_local_encrypt_deps() {
   return 0
 }
 
-encrypt_protected_dir() {
-  [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] || return 0
-  [[ -n "${FSCRYPT_PASSPHRASE:-}" ]] || { echo "未设置加密口令，跳过自动加密（可稍后手动 SSH 运行 fscrypt encrypt）" >&2; return 0; }
-  [[ -n "${PUBLIC_IP:-}" ]] || { echo "无公网 IP，跳过自动加密" >&2; unset FSCRYPT_PASSPHRASE; return 0; }
+post_create_ssh_init() {
+  [[ -n "${PUBLIC_IP:-}" ]] || { echo "无公网 IP，跳过 SSH 后置配置（密码不会设置；加密跳过）" >&2; return 0; }
   [[ -n "${SSH_KEY_PATH:-}" && -f "${SSH_KEY_PATH}" ]] || {
-    echo "无 SSH 私钥（${SSH_KEY_PATH:-未设置}），跳过自动加密。请手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
-    unset FSCRYPT_PASSPHRASE; return 0; }
+    echo "无 SSH 私钥（${SSH_KEY_PATH:-未设置}），跳过 SSH 后置配置" >&2
+    echo "  → 密码不会被设置（VNC 救场将不可用）" >&2
+    [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] && echo "  → 保护目录不会自动加密，请手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+    unset FSCRYPT_PASSPHRASE 2>/dev/null || true
+    return 0; }
 
   ensure_local_encrypt_deps || {
-    echo "本地缺少 expect 且无法自动安装，跳过自动加密。请手动 SSH 后运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
-    unset FSCRYPT_PASSPHRASE; return 0
+    echo "本地缺少 expect 且无法自动安装，跳过 SSH 后置配置（密码不会设置；加密请手动执行）" >&2
+    unset FSCRYPT_PASSPHRASE 2>/dev/null || true
+    return 0
   }
 
-  # 用 SSH key 免密：公钥已由 cloud-init 注入，私钥在本地。
-  # key 认证是静默的（不弹密码框），故不再需要 ControlMaster/ControlPath
-  # （也避开了 macOS socket 路径 ≤104 字符的限制）。
   local ssh_common=(
     -i "${SSH_KEY_PATH}"
     -o IdentitiesOnly=yes
@@ -850,42 +966,57 @@ encrypt_protected_dir() {
     -o ConnectTimeout=8
   )
 
-  echo "==> 等待机器就绪（cloud-init 注入公钥 + 初始化完成）；用 SSH key 静默轮询，无需输入任何密码..." >&2
-  # 阿里云公网 IP 会回收复用：旧机器的 host key 可能残留在 known_hosts，导致
-  # StrictHostKeyChecking=accept-new 因 key 冲突失败（轮询会一直静默失败）。
-  # 先清掉该 IP 的旧记录，让 accept-new 重新接受新机器的 key。
+  echo "==> 等待机器就绪（cloud-init 注入公钥 + 初始化完成）；用 SSH key 静默轮询..." >&2
   ssh-keygen -R "${PUBLIC_IP}" 2>/dev/null || true
   local max_wait=900 start now elapsed last_beat=0
   start="$(date +%s)"
   while :; do
     now="$(date +%s)"; elapsed=$((now - start))
     if (( elapsed > max_wait )); then
-      echo "等待 cloud-init 完成超时（${elapsed}s）。请稍后手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
-      unset FSCRYPT_PASSPHRASE; return 1
+      echo "等待 cloud-init 完成超时（${elapsed}s）。请手动 SSH 后：" >&2
+      echo "  1) 设置 VNC 密码：echo '${DEV_USER}:<密码>' | sudo chpasswd" >&2
+      [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]] && echo "  2) 加密目录：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+      unset FSCRYPT_PASSPHRASE 2>/dev/null || true
+      return 1
     fi
-    # 公钥装入前会 Permission denied (publickey)，已 2>/dev/null 静默；装好后命令成功即跳出
     if ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
-        'test -f /opt/quant-platform/READY && command -v fscrypt >/dev/null 2>&1' 2>/dev/null; then
+        'test -f /opt/quant-platform/READY' 2>/dev/null; then
       break
     fi
-    # 心跳：每 30s 报一次进度，避免静默等待看着像卡住
     if (( elapsed - last_beat >= 30 )); then
       echo "  ...仍在等待 cloud-init（已 ${elapsed}s）" >&2
       last_beat=$elapsed
     fi
     sleep 10
   done
-  echo "==> 机器就绪（${elapsed}s），加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 加密通道下发，不落盘/UserData）..."
+  echo "==> 机器就绪（${elapsed}s），开始 SSH 后置配置..." >&2
 
-  # 确保保护目录存在：fscrypt encrypt 要求目标目录已存在且为空。
+  if [[ -n "${DEV_PASSWORD:-}" ]]; then
+    echo "==> 经 SSH 通道设置 ${DEV_USER} 密码（用于阿里云控制台 VNC 救场，不用于 SSH 登录）..."
+    if ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" "sudo chpasswd" <<<"${DEV_USER}:${DEV_PASSWORD}" 2>/dev/null; then
+      echo "==> 密码已设置（仅在本地 state 文件保存，主账号无法从 UserData 获取）"
+    else
+      echo "==> 设置密码失败（不影响 SSH key 登录；VNC 救场将不可用）" >&2
+    fi
+  fi
+
+  if [[ "${ENCRYPT_HOME_SUBDIR}" != "true" ]]; then
+    unset FSCRYPT_PASSPHRASE 2>/dev/null || true
+    return 0
+  fi
+  [[ -n "${FSCRYPT_PASSPHRASE:-}" ]] || { echo "未设置加密口令，跳过自动加密（可稍后手动 SSH 运行 fscrypt encrypt）" >&2; return 0; }
+
   if ! ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" \
       "mkdir -p '${ENCRYPTED_DIR}' && chmod 0700 '${ENCRYPTED_DIR}' && test -d '${ENCRYPTED_DIR}'" 2>/dev/null; then
     echo "无法创建保护目录 ${ENCRYPTED_DIR}（路径无权限或非法）" >&2
     unset FSCRYPT_PASSPHRASE; return 1
   fi
+  if ! ssh "${ssh_common[@]}" "${DEV_USER}@${PUBLIC_IP}" 'command -v fscrypt >/dev/null 2>&1' 2>/dev/null; then
+    echo "远端未安装 fscrypt（cloud-init 可能未完成）。请稍后手动 SSH 运行：fscrypt encrypt '${ENCRYPTED_DIR}'" >&2
+    unset FSCRYPT_PASSPHRASE; return 1
+  fi
 
-  # expect 跑 fscrypt encrypt：用 key 免密 ssh，只需应答 fscrypt 的交互提示。
-  # 口令通过 FSCRYPT_PP 环境变量传入 expect，再 send 到远端 fscrypt pty——不进本地 ps/落盘/UserData。
+  echo "==> 加密保护目录 ${ENCRYPTED_DIR}（口令经 SSH 加密通道下发，不落盘/UserData）..."
   local enc_script rc
   enc_script="$(mktemp)"
   cat > "${enc_script}" <<'EXPECT'
@@ -953,6 +1084,15 @@ create_instance() {
   fi
 
   echo "正在创建 ECS 实例：计费方式=${mode}，地域=${REGION_ID}..."
+  if [[ "${RESTRICT_SSH_TO_CALLER_IP}" == "true" ]]; then
+    local trader_sg
+    if trader_sg="$(ensure_trader_sg)" && [[ -n "${trader_sg}" ]]; then
+      [[ -n "${SECURITY_GROUP_ID}" ]] && SECURITY_GROUP_ID="${trader_sg} ${SECURITY_GROUP_ID}" || SECURITY_GROUP_ID="${trader_sg}"
+      save_state
+    else
+      echo "==> per-trader SG 创建/复用失败，回退到默认 SG 候选列表（注意：0.0.0.0/0 默认 SG 可能仍可被全网扫描）" >&2
+    fi
+  fi
   local vswitch_candidates security_group_candidates type_candidates run_json last_error candidate_vswitch candidate_sg candidate_type
   vswitch_candidates="${VSWITCH_ID}"
   while IFS= read -r candidate_vswitch; do
@@ -991,6 +1131,7 @@ create_instance() {
       [[ -n "${ZONE_ID}" && "${candidate_vswitch}" == "${VSWITCH_ID}" ]] && args+=(--ZoneId "${ZONE_ID}")
       [[ -n "${KEY_PAIR_NAME}" ]] && args+=(--KeyPairName "${KEY_PAIR_NAME}")
       [[ -n "${AUTO_RELEASE_TIME}" ]] && args+=(--AutoReleaseTime "${AUTO_RELEASE_TIME}")
+      [[ -n "${RAM_USERNAME}" ]] && args+=(--Tag.1.Key=owner --Tag.1.Value="${RAM_USERNAME}")
       if [[ "${mode}" == "spot" ]]; then
         args+=(--SpotStrategy "${SPOT_STRATEGY}")
         [[ -n "${SPOT_PRICE_LIMIT}" ]] && args+=(--SpotPriceLimit "${SPOT_PRICE_LIMIT}")
@@ -1046,6 +1187,7 @@ create_instance() {
           [[ -n "${ZONE_ID}" && "${candidate_vswitch}" == "${VSWITCH_ID}" ]] && args+=(--ZoneId "${ZONE_ID}")
           [[ -n "${KEY_PAIR_NAME}" ]] && args+=(--KeyPairName "${KEY_PAIR_NAME}")
           [[ -n "${AUTO_RELEASE_TIME}" ]] && args+=(--AutoReleaseTime "${AUTO_RELEASE_TIME}")
+          [[ -n "${RAM_USERNAME}" ]] && args+=(--Tag.1.Key=owner --Tag.1.Value="${RAM_USERNAME}")
           echo "正在尝试按量计费：规格=${candidate_type}，交换机=${candidate_vswitch}..." >&2
           if run_json="$(aliyun "${args[@]}" 2>&1)"; then
             VSWITCH_ID="${candidate_vswitch}"
@@ -1095,10 +1237,7 @@ create_instance() {
   echo "  ssh ${DEV_USER}@${PUBLIC_IP:-<public-ip>} 'sudo tail -f /var/log/cloud-init-output.log'"
   rm -f "${user_data}"
 
-  # 等待 cloud-init 完成，并加密保护目录（口令经 SSH 通道下发，不落盘/UserData）
-  if [[ "${ENCRYPT_HOME_SUBDIR}" == "true" ]]; then
-    encrypt_protected_dir || echo "（加密步骤未完成，不影响机器使用，可稍后手动加密）" >&2
-  fi
+  post_create_ssh_init || echo "（SSH 后置配置未完成，不影响机器使用，可稍后手动补完）" >&2
 }
 
 release_instance() {
@@ -1185,6 +1324,9 @@ GENERATE_DEV_PASSWORD=true
 SSH_PASSWORD_AUTH=true
 DISABLE_CLOUD_ASSISTANT=false
 SSH_KEY_PATH=
+RAM_USERNAME=
+RESTRICT_SSH_TO_CALLER_IP=true
+ALLOWED_SSH_CIDR=
 AUTO_RELEASE_TIME=
 SYSTEM_DISK_SIZE=200
 ENCRYPT_HOME_SUBDIR=true
@@ -1212,3 +1354,55 @@ main() {
 }
 
 main "$@"
+
+# ================================================================================
+# RAM Policy 模板（参考，控制台一次性配置，不在脚本里执行）
+# 给每个 RAM 子账号挂下面这个 Policy，实现 trader 隔离：
+# 只能管理带 owner=<自己用户名> tag 的 ECS 实例，互不可见。
+#
+# {
+#   "Version": "1",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Action": ["ecs:*"],
+#       "Resource": "*",
+#       "Condition": {
+#         "StringEquals": {"ecs:tag/owner": "${ram:UserName}"}
+#       }
+#     },
+#     {
+#       "Effect": "Allow",
+#       "Action": [
+#         "ecs:DescribeRegions",
+#         "ecs:DescribeZones",
+#         "ecs:DescribeInstanceTypes",
+#         "ecs:DescribeImages",
+#         "ecs:DescribeVSwitches",
+#         "ecs:DescribeVpcs",
+#         "ecs:DescribeSecurityGroups",
+#         "ecs:CreateSecurityGroup",
+#         "ecs:AuthorizeSecurityGroup",
+#         "ecs:AuthorizeSecurityGroupEgress"
+#       ],
+#       "Resource": "*"
+#     },
+#     {
+#       "Effect": "Deny",
+#       "Action": [
+#         "ecs:DescribeInstanceUserData",
+#         "ecs:ResetPassword",
+#         "ecs:ModifyInstanceAttribute"
+#       ],
+#       "Resource": "*"
+#     }
+#   ]
+# }
+#
+# 主账号自约束 Policy（防主账号自己滥用，靠 ActionTrail 审计兜底）：
+# 建议主账号 RAM 用户也加 Deny ecs:RunCommand（强制走审计可见的 API 路径，
+# 而非云助手这种「黑盒执行」），DescribeInstanceUserData 加白名单只允许只读。
+#
+# ActionTrail trail 必须转发到独立子账号的资源（SLS / OSS WORM），
+# 否则主账号能删 trail，审计形同虚设。
+# ================================================================================
