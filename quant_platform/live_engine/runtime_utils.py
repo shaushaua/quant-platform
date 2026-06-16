@@ -89,7 +89,7 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
             "[OSS] uploaded oss://%s/%s (%d rows, %d bytes)",
             bucket_name,
             key,
-            len(records),
+            len(df),
             len(payload),
         )
     except Exception as exc:
