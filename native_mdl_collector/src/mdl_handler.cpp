@@ -16,6 +16,7 @@ using namespace datayes::mdl;
 namespace quant::native_mdl {
 
 using namespace datayes::mdl;
+using namespace schema;
 
 MdlHandler::MdlHandler(ShmWriter& writer) : writer_(writer) {}
 
