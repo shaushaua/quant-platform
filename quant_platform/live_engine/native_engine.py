@@ -1565,62 +1565,97 @@ class NativeEngine:
 
 
 def _query_deal_latency(orders_df: pd.DataFrame, push_sec: float, date_str: str, end_time: str) -> None:
-    """Query DealOrder DBF and log latency from order push to trade execution."""
+    """Query DealOrder DBF and log market-data→deal total latency.
+
+    Computes total delay from the exchange timestamp of the market data
+    tick that triggered the order to the exchange timestamp of the trade fill.
+    """
     try:
         import json
+        import os
         import urllib.request
+        import pandas as pd
         gw = os.environ.get("ORDER_GATEWAY_URL", "")
         token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
         if not gw:
             return
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+        # Load factor result CSV for this cycle to get data_latency_ms
+        factor_path = f"/data/factors/{date_str}_{end_time}.csv"
+        data_latency = {}
+        if os.path.exists(factor_path):
+            try:
+                fdf = pd.read_csv(factor_path)
+                if "data_latency_ms" in fdf.columns and "ID_QI" in fdf.columns:
+                    for _, r in fdf.iterrows():
+                        lat = r["data_latency_ms"]
+                        if pd.notna(lat) and 100 < lat < 60000:
+                            data_latency[str(r["ID_QI"]).split(".")[0].zfill(6)] = int(lat)
+            except Exception:
+                pass
+
+        # Query DealOrder DBF
         req = urllib.request.Request(f"{gw.rstrip('/')}/v1/atx/report?file=DealOrder_{date_str}.dbf", headers=headers)
         try:
             resp = urllib.request.urlopen(req, timeout=5)
-            data = json.loads(resp.read()).get("rows", [])
+            all_deals = json.loads(resp.read()).get("rows", [])
         except Exception:
-            data = []
+            all_deals = []
 
-        if not data:
+        if not all_deals:
             return
 
-        # Get stock codes from orders_df
+        # Get pushed stock codes
         pushed_codes = set()
-        if "code" in orders_df.columns:
-            pushed_codes.update(orders_df["code"].astype(str).str.split(".").str[0].str.zfill(6).tolist())
-        if "symbol" in orders_df.columns:
-            pushed_codes.update(orders_df["symbol"].astype(str).str.split(".").str[0].str.zfill(6).tolist())
+        for col in ("code", "symbol"):
+            if col in orders_df.columns:
+                pushed_codes.update(orders_df[col].astype(str).str.split(".").str[0].str.zfill(6).tolist())
 
-        deal_times = {}
-        for d in data:
+        # For pushed orders, estimate market exchange time = push_sec - 6s(compute+fork) - data_latency_ms
+        # Then compute total: deal_exchange_time - market_exchange_time
+        deal_latencies = {}
+        for d in all_deals:
             sym = str(d.get("Symbol", ""))
             dt_raw = str(d.get("DealTime", ""))
-            ext = str(d.get("ExternalId", ""))
             if not dt_raw or len(dt_raw) < 17:
                 continue
             code6 = sym[:6].zfill(6)
             if code6 not in pushed_codes:
                 continue
-            # DealTime format: YYYYMMDDHHMMSSmmm
             h = int(dt_raw[8:10])
             m = int(dt_raw[10:12])
             s = int(dt_raw[12:14])
             ms = int(dt_raw[14:17])
             deal_sec = h * 3600 + m * 60 + s + ms / 1000
-            deal_latency = deal_sec - push_sec
-            if 0 < deal_latency < 120:
-                deal_times[sym] = deal_latency
 
-        if deal_times:
-            codes_str = " ".join(sorted(deal_times.keys()))
-            avg_lat = sum(deal_times.values()) / len(deal_times)
-            max_lat = max(deal_times.values())
+            # Estimate market data exchange timestamp
+            # push_sec - 6s = cycle snap time, minus data_latency_ms = exchange tick time
+            lat_ms = data_latency.get(code6, 1000)  # default 1s if no data
+            market_exchange_sec = push_sec - 6.0 - (lat_ms / 1000)
+            total_lat = deal_sec - market_exchange_sec
+            if 0 < total_lat < 180:
+                deal_latencies[sym] = (market_exchange_sec, deal_sec, total_lat)
+
+        if deal_latencies:
+            total_lats = [v[2] for v in deal_latencies.values()]
+            avg_lat = sum(total_lats) / len(total_lats)
+            max_lat = max(total_lats)
+            codes_str = " ".join(sorted(deal_latencies.keys()))
+            # Show one detailed example
+            ex = next(iter(deal_latencies.items()))
+            ex_sym, (ex_mkt, ex_deal, ex_lat) = ex
+            def _s2h(s):
+                hh = int(s // 3600); mm = int((s % 3600) // 60); ss = s % 60
+                return f"{hh:02d}:{mm:02d}:{ss:05.2f}"
             logger.info(
-                "[deal-latency] end_time=%s pushed=%d deals=%d avg=%.1fs max=%.1fs codes=%s",
-                end_time, len(pushed_codes), len(deal_times), avg_lat, max_lat, codes_str,
+                "[deal-latency] end_time=%s deals=%d avg=%.1fs max=%.1fs "
+                "eg=%s market=%s deal=%s total=%.1fs",
+                end_time, len(deal_latencies), avg_lat, max_lat,
+                ex_sym, _s2h(ex_mkt), _s2h(ex_deal), ex_lat,
             )
         else:
-            logger.info("[deal-latency] end_time=%s pushed=%d deals=0 (pending)", end_time, len(pushed_codes))
+            logger.info("[deal-latency] end_time=%s deals=0 (pending)", end_time)
     except Exception as exc:
         logger.warning("[deal-latency] query failed: %s", exc)
 
