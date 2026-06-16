@@ -675,10 +675,12 @@ class NativeEngine:
         Uses cached readers and vectorized numpy ops to minimize overhead.
         """
         dirty_codes: set = set()
-        _push_max_delay_ms = 0.0
-        _push_max_code = ""
-        _push_max_kind = ""
-        _push_max_exchange_secs = 0.0
+        _push_min_delay_ms = float('inf')
+        _push_min_code = ""
+        _push_min_kind = ""
+        _deal_min_delay_ms = float('inf')
+        _deal_min_code = ""
+        _deal_min_exchange_secs = 0.0
 
         for code, kinds in files_by_code.items():
             state = self._states.get(code)
@@ -725,19 +727,29 @@ class NativeEngine:
                 # Track push delay: wall time vs exchange timestamp
                 _row_time = float(arr[-1, 1])  # UpdateTime (seconds since midnight)
                 _delay_ms = (wall_secs - _row_time) * 1000
-                if 0 < _delay_ms < 600_000 and _delay_ms > _push_max_delay_ms:
-                    _push_max_delay_ms = _delay_ms
-                    _push_max_code = code
-                    _push_max_kind = _kind_names.get(kind, str(kind))
-                    _push_max_exchange_secs = _row_time
+                if 0 < _delay_ms < 600_000:
+                    if _delay_ms < _push_min_delay_ms:
+                        _push_min_delay_ms = _delay_ms
+                        _push_min_code = code
+                        _push_min_kind = _kind_names.get(kind, str(kind))
+                    if kind == KIND_DEAL and _delay_ms < _deal_min_delay_ms:
+                        _deal_min_delay_ms = _delay_ms
+                        _deal_min_code = code
+                        _deal_min_exchange_secs = _row_time
 
                 # Commit offset only after state update succeeds
                 self._state_offsets[offset_key] = current
 
-        if _push_max_delay_ms > 0:
+        # Log push delay (min = newest data, best indicator of real-time latency)
+        if _push_min_delay_ms < float('inf'):
             logger.info(
-                "[push-latency] code=%s kind=%s exchange_s=%.3f wall_s=%.0f delay=%.0fms",
-                _push_max_code, _push_max_kind, _push_max_exchange_secs, wall_secs, _push_max_delay_ms,
+                "[push-latency] newest=%s/%s delay=%.0fms snap_s=%.0f",
+                _push_min_code, _push_min_kind, _push_min_delay_ms, wall_secs,
+            )
+        if _deal_min_delay_ms < float('inf'):
+            logger.info(
+                "[deal-push] %s exchange_deal_s=%.3f snap_s=%.0f delay=%.0fms",
+                _deal_min_code, _deal_min_exchange_secs, wall_secs, _deal_min_delay_ms,
             )
 
         return dirty_codes, {code: copy.copy(self._states[code]) for code in dirty_codes}
