@@ -675,6 +675,11 @@ class NativeEngine:
         Uses cached readers and vectorized numpy ops to minimize overhead.
         """
         dirty_codes: set = set()
+        # Precise wall time at snap start (with ms precision)
+        from datetime import datetime as _snap_dt
+        _snap_now = _snap_dt.now()
+        _snap_wall_secs = (_snap_now.hour * 3600 + _snap_now.minute * 60
+                          + _snap_now.second + _snap_now.microsecond / 1_000_000)
         _push_min_delay_ms = float('inf')
         _push_min_code = ""
         _push_min_kind = ""
@@ -726,7 +731,7 @@ class NativeEngine:
 
                 # Track push delay: wall time vs exchange timestamp
                 _row_time = float(arr[-1, 1])  # UpdateTime (seconds since midnight)
-                _delay_ms = (wall_secs - _row_time) * 1000
+                _delay_ms = (_snap_wall_secs - _row_time) * 1000
                 if 0 < _delay_ms < 600_000:
                     if _delay_ms < _push_min_delay_ms:
                         _push_min_delay_ms = _delay_ms
@@ -743,13 +748,13 @@ class NativeEngine:
         # Log push delay (min = newest data, best indicator of real-time latency)
         if _push_min_delay_ms < float('inf'):
             logger.info(
-                "[push-latency] newest=%s/%s delay=%.0fms snap_s=%.0f",
-                _push_min_code, _push_min_kind, _push_min_delay_ms, wall_secs,
+                "[push-latency] newest=%s/%s delay=%.0fms snap_s=%.3f",
+                _push_min_code, _push_min_kind, _push_min_delay_ms, _snap_wall_secs,
             )
         if _deal_min_delay_ms < float('inf'):
             logger.info(
-                "[deal-push] %s exchange_deal_s=%.3f snap_s=%.0f delay=%.0fms",
-                _deal_min_code, _deal_min_exchange_secs, wall_secs, _deal_min_delay_ms,
+                "[deal-push] %s exchange_deal_s=%.3f snap_s=%.3f delay=%.0fms",
+                _deal_min_code, _deal_min_exchange_secs, _snap_wall_secs, _deal_min_delay_ms,
             )
 
         return dirty_codes, {code: copy.copy(self._states[code]) for code in dirty_codes}
