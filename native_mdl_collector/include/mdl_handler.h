@@ -38,6 +38,9 @@ private:
     std::atomic<std::uint64_t> deal_count_{0};
     std::atomic<std::uint64_t> error_count_{0};
     std::atomic<std::uint64_t> seq_gaps_{0};
+    std::atomic<std::uint64_t> push_sample_count_{0};
+
+    void _sample_push_delay(const char* kind, const std::string& code, double exch_sec, double recv_sec);
 
     // Per (serviceID, messageID) expected sequence tracking
     struct SeqKey {

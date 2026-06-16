@@ -8,6 +8,8 @@
 
 #include <iostream>
 #include <cstring>
+#include <cstdio>
+#include <ctime>
 
 using namespace datayes::mdl;
 
@@ -67,6 +69,13 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
     const char* body = msg->GetBody();
     auto body_size = msg->GetBodySize();
 
+    // Recv wall time (seconds since midnight)
+    struct timespec rts;
+    clock_gettime(CLOCK_REALTIME, &rts);
+    struct tm rtm;
+    localtime_r(&rts.tv_sec, &rtm);
+    double recv_sec = rtm.tm_hour * 3600.0 + rtm.tm_min * 60.0 + rtm.tm_sec + rts.tv_nsec / 1e9;
+
     check_seq(head->ServiceID, mid, seq);
 
     if (mid == mdl_shl2_msg::SHL2MarketData::MessageID) {
@@ -75,6 +84,7 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
         if (result.valid) {
             writer_.append_tick(result.code, result.row);
             tick_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("tick", result.code, result.row[tick::Time], recv_sec);
         }
     } else if (mid == mdl_shl2_msg::NGTSTick::MessageID) {
         // SH NGTS (MID=24) → order +/or deal
@@ -87,6 +97,7 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
             if (result.has_deal) {
                 writer_.append_deal(result.code, result.deal.row);
                 deal_count_.fetch_add(1, std::memory_order_relaxed);
+                _sample_push_delay("deal", result.code, result.deal.row[deal::Time], recv_sec);
             }
         }
     }
@@ -101,6 +112,13 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
     const char* body = msg->GetBody();
     auto body_size = msg->GetBodySize();
 
+    // Recv wall time (seconds since midnight)
+    struct timespec rts;
+    clock_gettime(CLOCK_REALTIME, &rts);
+    struct tm rtm;
+    localtime_r(&rts.tv_sec, &rtm);
+    double recv_sec = rtm.tm_hour * 3600.0 + rtm.tm_min * 60.0 + rtm.tm_sec + rts.tv_nsec / 1e9;
+
     check_seq(head->ServiceID, mid, seq);
 
     if (mid == mdl_szl2_msg::Snapshot300111_v2::MessageID) {
@@ -109,6 +127,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         if (result.valid) {
             writer_.append_tick(result.code, result.row);
             tick_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("tick", result.code, result.row[tick::Time], recv_sec);
         }
     } else if (mid == mdl_szl2_msg::Order300192_v2::MessageID) {
         // SZ order (MID=33)
@@ -123,10 +142,20 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         if (result.valid) {
             writer_.append_deal(result.code, result.row);
             deal_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("deal", result.code, result.row[deal::Time], recv_sec);
         }
     }
 
     msg_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MdlHandler::_sample_push_delay(const char* kind, const std::string& code, double exch_sec, double recv_sec) {
+    auto n = push_sample_count_.fetch_add(1, std::memory_order_relaxed);
+    if (n % 2000 == 0) {
+        double delay_ms = (recv_sec - exch_sec) * 1000.0;
+        fprintf(stderr, "[push-delay] %s %s exch=%.3f recv=%.3f delay=%.0fms\n",
+                kind, code.c_str(), exch_sec, recv_sec, delay_ms);
+    }
 }
 
 } // namespace quant::native_mdl
