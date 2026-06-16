@@ -771,18 +771,20 @@ class NativeEngine:
                             _deal_min_exchange_secs = _row_time
                 except Exception as exc:
                     # State update for this kind failed (e.g. malformed rows).
-                    # Mark dirty so the code is still considered active, but do
-                    # NOT commit offset — these rows are retried next round so
-                    # no data is silently dropped. Rate-limit the warning to
-                    # avoid log flooding when bad data persists.
+                    # Do NOT mark dirty: the state wasn't updated and the offset
+                    # is held for retry, so running factor computation now would
+                    # reuse stale state and risk duplicate/expired signals. The
+                    # code is simply skipped this round; once the data is healthy
+                    # again it re-enters the compute path naturally.
+                    # Offset is NOT committed, so these rows are retried next
+                    # round. Rate-limit the warning to avoid log flooding.
                     _now_warn = time.monotonic()
                     if _now_warn - self._sync_warn_ts.get(offset_key, 0.0) > 60.0:
                         self._sync_warn_ts[offset_key] = _now_warn
                         logger.warning(
                             "[sync] %s kind=%s update failed (%s); offset held at %d, "
-                            "will retry %d rows next round",
+                            "will retry %d rows next round (code skipped this round)",
                             code, _kind_names.get(kind, str(kind)), exc, start, n)
-                    dirty_codes.add(code)
                     continue
 
                 # Commit offset only after state update succeeds
