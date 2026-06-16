@@ -1564,13 +1564,69 @@ class NativeEngine:
         self._stop_order_worker()
 
 
-def _order_worker_loop(order_queue) -> None:
-    """Persistent order gateway worker.
+def _query_deal_latency(orders_df: pd.DataFrame, push_sec: float, date_str: str, end_time: str) -> None:
+    """Query DealOrder DBF and log latency from order push to trade execution."""
+    try:
+        import json
+        import urllib.request
+        gw = os.environ.get("ORDER_GATEWAY_URL", "")
+        token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
+        if not gw:
+            return
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        req = urllib.request.Request(f"{gw.rstrip('/')}/v1/atx/report?file=DealOrder_{date_str}.dbf", headers=headers)
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read()).get("rows", [])
+        except Exception:
+            data = []
 
-    It receives already-aggregated inference/order DataFrames. Factor workers
-    never call this function, so one compute round can produce at most one order
-    upload task.
-    """
+        if not data:
+            return
+
+        # Get stock codes from orders_df
+        pushed_codes = set()
+        if "code" in orders_df.columns:
+            pushed_codes.update(orders_df["code"].astype(str).str.split(".").str[0].str.zfill(6).tolist())
+        if "symbol" in orders_df.columns:
+            pushed_codes.update(orders_df["symbol"].astype(str).str.split(".").str[0].str.zfill(6).tolist())
+
+        deal_times = {}
+        for d in data:
+            sym = str(d.get("Symbol", ""))
+            dt_raw = str(d.get("DealTime", ""))
+            ext = str(d.get("ExternalId", ""))
+            if not dt_raw or len(dt_raw) < 17:
+                continue
+            code6 = sym[:6].zfill(6)
+            if code6 not in pushed_codes:
+                continue
+            # DealTime format: YYYYMMDDHHMMSSmmm
+            h = int(dt_raw[8:10])
+            m = int(dt_raw[10:12])
+            s = int(dt_raw[12:14])
+            ms = int(dt_raw[14:17])
+            deal_sec = h * 3600 + m * 60 + s + ms / 1000
+            deal_latency = deal_sec - push_sec
+            if 0 < deal_latency < 120:
+                deal_times[sym] = deal_latency
+
+        if deal_times:
+            codes_str = " ".join(sorted(deal_times.keys()))
+            avg_lat = sum(deal_times.values()) / len(deal_times)
+            max_lat = max(deal_times.values())
+            logger.info(
+                "[deal-latency] end_time=%s pushed=%d deals=%d avg=%.1fs max=%.1fs codes=%s",
+                end_time, len(pushed_codes), len(deal_times), avg_lat, max_lat, codes_str,
+            )
+        else:
+            logger.info("[deal-latency] end_time=%s pushed=%d deals=0 (pending)", end_time, len(pushed_codes))
+    except Exception as exc:
+        logger.warning("[deal-latency] query failed: %s", exc)
+
+
+def _order_worker_loop(order_queue) -> None:
+    """Persistent order gateway worker."""
     logger.info("[order-gateway] worker loop started")
     try:
         while True:
@@ -1580,6 +1636,11 @@ def _order_worker_loop(order_queue) -> None:
             try:
                 orders_df, date_str, end_time = item
                 _push_to_order_gateway(orders_df, date_str, end_time)
+                # Log push-to-deal latency
+                from datetime import datetime as _dt
+                _now = _dt.now()
+                push_sec = _now.hour * 3600 + _now.minute * 60 + _now.second + _now.microsecond / 1_000_000
+                _query_deal_latency(orders_df, push_sec, date_str, end_time)
             except Exception as exc:
                 logger.error("[order-gateway] worker task failed: %s", exc, exc_info=True)
     finally:
