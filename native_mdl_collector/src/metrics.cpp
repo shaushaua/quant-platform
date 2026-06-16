@@ -47,6 +47,9 @@ void metrics_loop(MdlHandler& handler, int interval_secs) {
         std::uint64_t cur_gaps   = handler.seq_gaps();
         std::uint64_t cur_dropped = handler.dropped();
 
+        // Flush any fully-elapsed per-minute push-delay buckets.
+        handler.flush_push_delay();
+
         double msg_rate   = (cur_msgs - last_msgs) / elapsed;
         double tick_rate  = (cur_ticks - last_ticks) / elapsed;
         double order_rate = (cur_orders - last_orders) / elapsed;

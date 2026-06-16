@@ -56,8 +56,16 @@ class ComputationSchedule:
         elif self.schedule_type == "time_trigger":
             if self._last_run_day == trading_day:
                 return False  # already triggered today
-            h, m = now_dt.hour, now_dt.minute
-            return any(h == th and m == tm for th, tm in (self.trigger_times or []))
+            # Fire once the first trigger time has been reached today. Using a
+            # ">=" window (rather than exact hour/minute match) tolerates the
+            # main loop missing the exact minute while busy (e.g. GIL held by a
+            # long minute compute); as long as the loop samples any later time
+            # in the same trading_day, the daily run still fires once.
+            now_sec = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+            for th, tm in (self.trigger_times or []):
+                if now_sec >= th * 3600 + tm * 60:
+                    return True
+            return False
 
         return False
 
@@ -65,6 +73,16 @@ class ComputationSchedule:
         """Record that this schedule has fired."""
         self._last_run_ts = now_ts
         self._last_run_day = trading_day
+
+    def unmark_run(self) -> None:
+        """Roll back a mark_run() if dispatch failed.
+
+        Restores the not-yet-run state so the schedule can fire again on the
+        next main-loop tick. Without this, a failed thread start would leave
+        a daily schedule permanently marked as run for the day.
+        """
+        self._last_run_ts = 0.0
+        self._last_run_day = ""
 
     @property
     def end_time_label(self) -> str:

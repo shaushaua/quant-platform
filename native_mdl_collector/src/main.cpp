@@ -147,6 +147,9 @@ int main(int argc, char* argv[]) {
     io_mgr->Shutdown();
     metrics_thread.join();
 
+    // Flush the last (in-progress) push-delay minute before reporting stats.
+    handler.flush_push_delay(true);
+
     // Print final stats
     std::cerr << "[main] final stats: "
               << "msg=" << handler.msg_count()

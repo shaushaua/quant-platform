@@ -28,6 +28,11 @@ public:
     std::uint64_t seq_gaps()    const { return seq_gaps_.load(std::memory_order_relaxed); }
     std::uint64_t dropped()     const { return writer_.total_dropped(); }
 
+    // Flush completed per-minute push-delay buckets to stderr. Called by the
+    // metrics thread; emits any minute that has fully elapsed and returns.
+    // When force=true (e.g. at shutdown), also emits the in-progress minute.
+    void flush_push_delay(bool force = false);
+
 private:
     ShmWriter& writer_;
 
@@ -41,6 +46,29 @@ private:
     std::atomic<std::uint64_t> push_sample_count_{0};
 
     void _sample_push_delay(const char* kind, const std::string& code, double exch_sec, double recv_sec);
+
+    // ── Per-minute push-delay aggregation ──────────────────────────────
+    // Accumulates delay samples bucketed by the integer minute of recv_sec.
+    // SH/SZ callbacks run concurrently (multithreaded subscriber), so all
+    // access is guarded by delay_mutex_. flush_push_delay() emits and resets
+    // a minute once it has fully elapsed.
+    struct DelayBucket {
+        long minute = -1;        // integer minute-of-day (HH*60+MM) of this bucket
+        long long count = 0;
+        double sum_ms = 0.0;
+        double min_ms = 0.0;
+        double max_ms = 0.0;
+        void reset(long m) {
+            minute = m; count = 0; sum_ms = 0.0; min_ms = 0.0; max_ms = 0.0;
+        }
+    };
+    // One bucket per kind: index 0=tick, 1=order, 2=deal (see _kind_index).
+    DelayBucket delay_buckets_[3];
+    std::mutex delay_mutex_;
+    static int _kind_index(const char* kind);
+    // Emit one bucket to stderr and reset it. NOT thread-safe — caller must
+    // hold delay_mutex_. kind_name is the label printed in the log line.
+    void _emit_bucket_(DelayBucket& b, const char* kind_name);
 
     // Per (serviceID, messageID) expected sequence tracking
     struct SeqKey {

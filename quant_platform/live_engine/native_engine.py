@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import importlib
 import json
 import logging
@@ -201,9 +202,16 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
 
     # Fast time conversion: f64 seconds → datetime64[ns]
+    # NaN/inf/negative seconds → NaT instead of 1970-01-01. np.int64 min is the
+    # canonical NaT marker for datetime64[ns].
     base_ns = _base_ns
-    df.iloc[:, time_idx] = (base_ns + (arr[:, time_idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
-    df.iloc[:, updtime_idx] = (base_ns + (arr[:, updtime_idx] * 1_000_000_000).astype(np.int64)).astype('datetime64[ns]')
+    _nat_int = np.datetime64('NaT').view('i8')  # int64 sentinel for NaT
+    for _tc_idx in (time_idx, updtime_idx):
+        _col_secs = arr[:, _tc_idx]
+        _valid = np.isfinite(_col_secs) & (_col_secs >= 0)
+        _ns = np.full(len(_col_secs), _nat_int, dtype=np.int64)
+        _ns[_valid] = base_ns + (_col_secs[_valid] * 1_000_000_000).astype(np.int64)
+        df.iloc[:, _tc_idx] = _ns.astype('datetime64[ns]')
 
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
@@ -225,9 +233,14 @@ def _read_native_df_for_worker(path: str, kind: int, code: str, trading_day: str
     buf_cols = columns[2:]
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
     base_ns = pd.Timestamp(trading_day).value
+    _nat_int = np.datetime64('NaT').view('i8')
     for col in ("Time", "UpdateTime"):
         if col in df.columns:
-            df[col] = (base_ns + (df[col].to_numpy() * 1_000_000_000).astype(np.int64)).astype("datetime64[ns]")
+            _secs = df[col].to_numpy()
+            _valid = np.isfinite(_secs) & (_secs >= 0)
+            _ns = np.full(len(_secs), _nat_int, dtype=np.int64)
+            _ns[_valid] = base_ns + (_secs[_valid] * 1_000_000_000).astype(np.int64)
+            df[col] = _ns.astype("datetime64[ns]")
     df.insert(0, "TradingDay", trading_day)
     df.insert(1, "Code", code)
     return df[columns]
@@ -249,7 +262,13 @@ def _clear_worker_cache() -> None:
     Prevents memory accumulation in persistent-pool workers across cycles.
     The underlying file page cache is retained by the kernel, so reopening
     on the next cycle is still fast.
+
+    Caller must clear data_map (or any DataFrame referencing view_rows()
+    output) BEFORE calling this — numpy zero-copy views pin the mmap buffer
+    and prevent close(), causing "BufferError: cannot close exported pointers".
     """
+    import gc
+    gc.collect()
     for path, reader in list(_reader_cache.items()):
         try:
             reader.close()
@@ -344,6 +363,7 @@ def _compute_code_batch_shm(args):
             _df_build_ms += build_ms
             _factor_ms += factor_ms
             _profile_count += 1
+            data_map.clear()
             _clear_worker_cache()
             return results, errors, build_ms, factor_ms, None
 
@@ -394,9 +414,14 @@ def _compute_code_batch_shm(args):
                         _factor_ms / max(_profile_count, 1),
                         (_df_build_ms + _factor_ms) / max(_profile_count, 1))
 
+        data_map.clear()
         _clear_worker_cache()
         return results, errors, build_ms, factor_ms, None
     except Exception as exc:
+        # Release zero-copy views BEFORE closing readers, mirroring the success
+        # path. Otherwise data_map DataFrames pin the mmap and reader.close()
+        # raises BufferError (swallowed below), leaking mmap/FDs across cycles.
+        data_map.clear()
         _clear_worker_cache()
         return results, len(codes), (time.perf_counter() - build_t0) * 1000, 0.0, str(exc)
 
@@ -451,6 +476,7 @@ class NativeEngine:
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
         self._cached_shm_files: Optional[Dict[str, Dict[int, str]]] = None
+        self._sync_warn_ts: Dict[Tuple[str, int], float] = {}  # rate-limited warning log
 
     def _init_pool(self) -> None:
         """Create persistent worker pool."""
@@ -644,7 +670,11 @@ class NativeEngine:
 
     @staticmethod
     def _raw_time_from_seconds(seconds: float) -> str:
-        if seconds <= 0:
+        # np.isfinite rejects NaN and inf; combined with `> 0` this covers NaN,
+        # -inf, +inf and non-positive values uniformly. `seconds <= 0` alone
+        # misses NaN (nan <= 0 is False), which would raise ValueError at
+        # int(nan * 1000) and abort the whole snapshot.
+        if not np.isfinite(seconds) or seconds <= 0:
             return ""
         total_ms = int(seconds * 1000)
         h, rem = divmod(total_ms, 3600_000)
@@ -719,31 +749,47 @@ class NativeEngine:
                     self._state_offsets[offset_key] = current
                     continue
 
-                dirty_codes.add(code)
-                state.last_update_ts = wall_secs
+                try:
+                    if kind == KIND_TICK:
+                        self._update_tick_vectorized(state, arr)
+                    elif kind == KIND_DEAL:
+                        self._update_deal_vectorized(state, arr)
+                    elif kind == KIND_ORDER:
+                        self._update_order_vectorized(state, arr)
 
-                if kind == KIND_TICK:
-                    self._update_tick_vectorized(state, arr)
-                elif kind == KIND_DEAL:
-                    self._update_deal_vectorized(state, arr)
-                elif kind == KIND_ORDER:
-                    self._update_order_vectorized(state, arr)
-
-                # Track push delay: wall time vs exchange timestamp
-                _row_time = float(arr[-1, 1])  # UpdateTime (seconds since midnight)
-                _delay_ms = (_snap_wall_secs - _row_time) * 1000
-                if 0 < _delay_ms < 600_000:
-                    if _delay_ms < _push_min_delay_ms:
-                        _push_min_delay_ms = _delay_ms
-                        _push_min_code = code
-                        _push_min_kind = _kind_names.get(kind, str(kind))
-                    if kind == KIND_DEAL and _delay_ms < _deal_min_delay_ms:
-                        _deal_min_delay_ms = _delay_ms
-                        _deal_min_code = code
-                        _deal_min_exchange_secs = _row_time
+                    # Track push delay: wall time vs exchange timestamp
+                    _row_time = float(arr[-1, 1])  # UpdateTime (seconds since midnight)
+                    _delay_ms = (_snap_wall_secs - _row_time) * 1000
+                    if 0 < _delay_ms < 600_000:
+                        if _delay_ms < _push_min_delay_ms:
+                            _push_min_delay_ms = _delay_ms
+                            _push_min_code = code
+                            _push_min_kind = _kind_names.get(kind, str(kind))
+                        if kind == KIND_DEAL and _delay_ms < _deal_min_delay_ms:
+                            _deal_min_delay_ms = _delay_ms
+                            _deal_min_code = code
+                            _deal_min_exchange_secs = _row_time
+                except Exception as exc:
+                    # State update for this kind failed (e.g. malformed rows).
+                    # Mark dirty so the code is still considered active, but do
+                    # NOT commit offset — these rows are retried next round so
+                    # no data is silently dropped. Rate-limit the warning to
+                    # avoid log flooding when bad data persists.
+                    _now_warn = time.monotonic()
+                    if _now_warn - self._sync_warn_ts.get(offset_key, 0.0) > 60.0:
+                        self._sync_warn_ts[offset_key] = _now_warn
+                        logger.warning(
+                            "[sync] %s kind=%s update failed (%s); offset held at %d, "
+                            "will retry %d rows next round",
+                            code, _kind_names.get(kind, str(kind)), exc, start, n)
+                    dirty_codes.add(code)
+                    continue
 
                 # Commit offset only after state update succeeds
                 self._state_offsets[offset_key] = current
+                # Mark dirty and stamp update time only after a successful update.
+                dirty_codes.add(code)
+                state.last_update_ts = wall_secs
 
         # Log push delay (min = newest data, best indicator of real-time latency)
         if _push_min_delay_ms < float('inf'):
@@ -843,9 +889,14 @@ class NativeEngine:
         buf_cols = columns[2:]
         df = pd.DataFrame(arr, columns=buf_cols, copy=False)
         base_ns = pd.Timestamp(self.trading_day).value
+        _nat_int = np.datetime64('NaT').view('i8')
         for col in ("Time", "UpdateTime"):
             if col in df.columns:
-                df[col] = (base_ns + (df[col].to_numpy() * 1_000_000_000).astype(np.int64)).astype("datetime64[ns]")
+                _secs = df[col].to_numpy()
+                _valid = np.isfinite(_secs) & (_secs >= 0)
+                _ns = np.full(len(_secs), _nat_int, dtype=np.int64)
+                _ns[_valid] = base_ns + (_secs[_valid] * 1_000_000_000).astype(np.int64)
+                df[col] = _ns.astype("datetime64[ns]")
         df.insert(0, "TradingDay", self.trading_day)
         df.insert(1, "Code", code)
         return df[columns]
@@ -924,7 +975,14 @@ class NativeEngine:
 
         map_tmp_path = disk_dir / "tmp_code_map.parquet"
         try:
-            map_df = self._daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
+            # _ID_QI_PAD is the zero-padded 6-digit code added by _add_code_key
+            # (e.g. "000001"). Using the raw ID_QI column risks losing leading
+            # zeros via `::VARCHAR` when ID_QI is integer-typed, which silently
+            # drops all XSHE (Shenzhen) codes from the archived parquet.
+            if "_ID_QI_PAD" in self._daily_basic_df.columns:
+                map_df = self._daily_basic_df[["_ID_QI_PAD", "SECURITY_ID"]].drop_duplicates()
+            else:
+                map_df = self._daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
             map_df.to_parquet(map_tmp_path, index=False)
         except Exception as exc:
             logger.error("[native-archive] code map write failed: %s", exc)
@@ -948,13 +1006,17 @@ class NativeEngine:
                     "(EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)"
                 )
                 select_clause = self._archive_select_clause(kind)
+                # map_df carries either "_ID_QI_PAD" (zero-padded str) or "ID_QI".
+                # regexp_extract(Code) yields the 6-digit zero-padded code, so join
+                # against the padded column when available.
+                map_code_col = "_ID_QI_PAD" if "_ID_QI_PAD" in self._daily_basic_df.columns else "ID_QI"
                 con.execute(f"""
                     COPY (
                         SELECT
                             {select_clause}
                         FROM read_parquet('{chunk_dir}/*.parquet') x
                         JOIN read_parquet('{map_tmp_path}') m
-                          ON regexp_extract(x.Code, '^\\d+') = m.ID_QI::VARCHAR
+                          ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
                         ORDER BY m.SECURITY_ID, x.SeqNum
                     ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
                 """)
@@ -1103,8 +1165,10 @@ class NativeEngine:
         except Exception as exc:
             logger.error("[combined] background compute failed: %s", exc, exc_info=True)
         finally:
-            if schedule is None or schedule.name == "minute":
-                self._compute_running = False
+            # Only the minute schedule sets _compute_running; reset it
+            # unconditionally so a crash or thread-start failure cannot
+            # permanently stall minute computation.
+            self._compute_running = False
 
     def _compute_and_output_locked(self, schedule: Optional[ComputationSchedule] = None) -> None:
         is_daily = schedule is not None and schedule.is_daily_result
@@ -1557,7 +1621,18 @@ class NativeEngine:
                             args=(schedule,),
                             daemon=True,
                         )
-                        t.start()
+                        try:
+                            t.start()
+                        except Exception:
+                            # Thread start failed: roll back the mark_run so the
+                            # schedule can fire again next tick (otherwise daily
+                            # would be permanently marked as run for the day),
+                            # and release the minute guard.
+                            schedule.unmark_run()
+                            if schedule.name == "minute":
+                                self._compute_running = False
+                            logger.error("[native] failed to start thread for schedule=%s",
+                                         schedule.name, exc_info=True)
                 time.sleep(1)
             except KeyboardInterrupt:
                 logger.info("[native] interrupted")
@@ -1761,7 +1836,7 @@ def _push_to_order_gateway_http(orders_df: pd.DataFrame, date_str: str, end_time
 
 def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
     orders = []
-    for idx, row in orders_df.iterrows():
+    for _, row in orders_df.iterrows():
         code = _order_symbol(row.get("symbol", row.get("code", "")))
         volume = _order_volume(row)
         side = _order_side(row)
@@ -1775,11 +1850,35 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
         strategy = str(row.get("strategy", "") or os.environ.get("ORDER_DEFAULT_STRATEGY", "quant_platform"))
         note = str(row.get("note", "") or row.get("remark", "") or
                    f"{strategy}_{date_str}{end_time}_{code}_{side}")
-        order_id = str(row.get("order_id", "") or note or f"{date_str}{end_time}_{idx}")
         try:
             price = float(price_raw) if price_raw not in {"", None} else 0.0
         except Exception:
             price = 0.0
+
+        # Minimal pre-trade sanity checks (position/capital validation stays in
+        # the gateway, which holds live account state).
+        #  - limit orders must carry a positive price
+        if price_type == "limit" and price <= 0:
+            logger.error("[order-gateway] skip %s %s: limit order price must be > 0 (got %s)",
+                         code, side, price_raw)
+            continue
+
+        explicit_id = str(row.get("order_id", "") or "")
+        if explicit_id:
+            order_id = explicit_id
+        else:
+            # Stable idempotent id derived from order content. The same logical
+            # order yields the same id across retries/re-runs so the gateway can
+            # deduplicate. Includes price/strategy/algo so that two orders with
+            # identical code+side+volume but different price/strategy are NOT
+            # collapsed into one id (which the gateway would wrongly dedup).
+            content = "|".join([
+                date_str, end_time, code, side, str(int(volume)),
+                price_type, f"{price:.6f}", strategy,
+                str(row.get("algo_strategy", "") or ""),
+                str(row.get("algo_param", "") or ""),
+            ])
+            order_id = "ord_" + hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
         order = {
             "order_id": order_id,
             "symbol": code,

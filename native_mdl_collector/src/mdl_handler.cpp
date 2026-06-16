@@ -94,6 +94,7 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
             if (result.has_order) {
                 writer_.append_order(result.code, result.order.row);
                 order_count_.fetch_add(1, std::memory_order_relaxed);
+                _sample_push_delay("order", result.code, result.order.row[order::Time], recv_sec);
             }
             if (result.has_deal) {
                 writer_.append_deal(result.code, result.deal.row);
@@ -136,6 +137,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         if (result.valid) {
             writer_.append_order(result.code, result.row);
             order_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("order", result.code, result.row[order::Time], recv_sec);
         }
     } else if (mid == mdl_szl2_msg::Transaction300191_v2::MessageID) {
         // SZ deal (MID=36)
@@ -150,12 +152,81 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
     msg_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+int MdlHandler::_kind_index(const char* kind) {
+    // Bucket layout: 0=tick, 1=order, 2=deal. Unknown kinds → -1 (ignored).
+    if (kind[0] == 't' && kind[1] == 'i') return 0;  // tick
+    if (kind[0] == 'o' && kind[1] == 'r') return 1;  // order
+    if (kind[0] == 'd' && kind[1] == 'e') return 2;  // deal
+    return -1;
+}
+
+static const char* const _kind_names_[3] = {"tick", "order", "deal"};
+
+void MdlHandler::_emit_bucket_(DelayBucket& b, const char* kind_name) {
+    // Emit a completed bucket and reset it. Caller holds delay_mutex_.
+    if (b.count <= 0 || b.minute < 0) return;
+    long hh = b.minute / 60;
+    long mm = b.minute % 60;
+    double avg_ms = b.sum_ms / static_cast<double>(b.count);
+    fprintf(stderr,
+            "[push-latency] %02ld:%02ld %s n=%lld min=%.0fms avg=%.0fms max=%.0fms\n",
+            hh, mm, kind_name, b.count, b.min_ms, avg_ms, b.max_ms);
+    b.reset(-1);
+}
+
 void MdlHandler::_sample_push_delay(const char* kind, const std::string& code, double exch_sec, double recv_sec) {
-    auto n = push_sample_count_.fetch_add(1, std::memory_order_relaxed);
-    if (n % 2000 == 0) {
-        double delay_ms = (recv_sec - exch_sec) * 1000.0;
-        fprintf(stderr, "[push-delay] %s %s exch=%.3f recv=%.3f delay=%.0fms\n",
-                kind, code.c_str(), exch_sec, recv_sec, delay_ms);
+    // Filter implausible samples (clock skew, pre-open timestamps) so they
+    // don't pollute the per-minute stats. Negative or huge delays indicate
+    // recv/exch clocks are not comparable for this row.
+    double delay_ms = (recv_sec - exch_sec) * 1000.0;
+    if (delay_ms < 0.0 || delay_ms > 600000.0) {
+        return;
+    }
+
+    int ki = _kind_index(kind);
+    if (ki < 0) return;
+
+    long recv_minute = static_cast<long>(recv_sec) / 60;  // integer minute-of-day
+
+    std::lock_guard<std::mutex> lock(delay_mutex_);
+    DelayBucket& b = delay_buckets_[ki];
+    if (b.minute != recv_minute) {
+        // Minute rolled over. Emit the previous minute now so its stats are not
+        // lost — the metrics thread polls every 10s and is not aligned to the
+        // minute boundary, so relying on it alone would drop the last minute.
+        _emit_bucket_(b, _kind_names_[ki]);
+        b.reset(recv_minute);
+    }
+    if (b.count == 0) {
+        b.min_ms = b.max_ms = delay_ms;
+    } else {
+        if (delay_ms < b.min_ms) b.min_ms = delay_ms;
+        if (delay_ms > b.max_ms) b.max_ms = delay_ms;
+    }
+    b.count++;
+    b.sum_ms += delay_ms;
+}
+
+void MdlHandler::flush_push_delay(bool force) {
+    // Emit any bucket whose minute has fully elapsed (current minute > bucket
+    // minute). Buckets for the still-accumulating current minute are kept,
+    // unless force=true (shutdown) which emits everything.
+    long now_minute = -1;
+    {
+        struct timespec rts;
+        clock_gettime(CLOCK_REALTIME, &rts);
+        struct tm rtm;
+        localtime_r(&rts.tv_sec, &rtm);
+        long now_sec = rtm.tm_hour * 3600L + rtm.tm_min * 60L + rtm.tm_sec;
+        now_minute = now_sec / 60;
+    }
+
+    std::lock_guard<std::mutex> lock(delay_mutex_);
+    for (int ki = 0; ki < 3; ++ki) {
+        DelayBucket& b = delay_buckets_[ki];
+        if (b.count == 0 || b.minute < 0) continue;
+        if (!force && b.minute >= now_minute) continue;  // minute still in progress
+        _emit_bucket_(b, _kind_names_[ki]);
     }
 }
 
