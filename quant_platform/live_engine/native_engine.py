@@ -475,7 +475,8 @@ class NativeEngine:
         self._compute_running = False
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
-        self._cached_shm_files: Optional[Dict[str, Dict[int, str]]] = None
+        # _cached_shm_files was removed — SHM files are created lazily by the
+        # collector, so every cycle must re-scan to pick up new stocks.
         self._sync_warn_ts: Dict[Tuple[str, int], float] = {}  # rate-limited warning log
 
     def _init_pool(self) -> None:
@@ -656,16 +657,16 @@ class NativeEngine:
 
     def _scan_shm_files(self) -> Dict[str, Dict[int, str]]:
         """Scan SHM directory, return {code: {kind: path}}.
-        Result is cached after first call — files don't change during the day."""
-        if self._cached_shm_files is not None:
-            return self._cached_shm_files
+        Not cached — collector creates files lazily throughout the
+        trading day (only ~1800 at startup, up to ~5200+ at peak),
+        so every cycle must re-scan to pick up newly-created files.
+        This is fast: Path.iterdir on 15k entries takes 1-2ms."""
         files = scan_shm_dir(self.shm_dir)
         by_code: Dict[str, Dict[int, str]] = {}
         for (code, kind), path in files.items():
             if code not in by_code:
                 by_code[code] = {}
             by_code[code][kind] = path
-        self._cached_shm_files = by_code
         return by_code
 
     @staticmethod
