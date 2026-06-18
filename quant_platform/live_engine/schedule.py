@@ -120,8 +120,8 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             name="minute",
             schedule_type="interval",
             interval_seconds=interval,
-            active_hours=((9, 25), (15, 5)),
-            active_sessions=[((9, 25), (11, 30)), ((13, 0), (15, 5))],
+            active_hours=((9, 25), (15, 30)),
+            active_sessions=[((9, 25), (11, 30)), ((13, 0), (15, 30))],
             run_inference=True,
             is_daily_result=False,
         ))

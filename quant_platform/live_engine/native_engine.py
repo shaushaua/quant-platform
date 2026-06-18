@@ -991,6 +991,29 @@ class NativeEngine:
             logger.error("[native-archive] code map write failed: %s", exc)
             return False
 
+        # Upload runs after all compute cycles are done (post-close,
+        # active_hours ended). Free ~80 GB of SHM mmap data so DuckDB
+        # has enough memory for the JOIN + ORDER BY merge.
+        import gc
+        logger.info("[native-archive] freeing pre-upload memory ...")
+        # 1) Close main-process SHM readers
+        for _path, _reader in list(self._main_readers.items()):
+            try:
+                _reader.close()
+            except Exception:
+                pass
+        self._main_readers.clear()
+        self._state_offsets.clear()
+        self._states.clear()
+        # 3) Release cached DataFrames
+        self._daily_basic_df = None
+        self._market_df = None
+        self._trading_universe_df = None
+        # 4) Collect; try a second pass for any cycle references
+        gc.collect()
+        gc.collect()
+        logger.info("[native-archive] pre-upload memory freed, starting upload")
+
         uploaded_any = False
         had_error = False
 
@@ -1003,7 +1026,7 @@ class NativeEngine:
             try:
                 tmp_file.unlink(missing_ok=True)
                 con = duckdb.connect(":memory:")
-                con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '8GB')}'")
+                con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '32GB')}'")
                 con.execute(
                     "CREATE MACRO epoch_us(ts) AS "
                     "(EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)"
