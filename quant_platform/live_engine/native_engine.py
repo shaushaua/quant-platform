@@ -256,27 +256,6 @@ def _cached_reader(path: str) -> NativeShmReader:
     return reader
 
 
-def _clear_worker_cache() -> None:
-    """Close all cached SHM readers to release mmap handles.
-
-    Prevents memory accumulation in persistent-pool workers across cycles.
-    The underlying file page cache is retained by the kernel, so reopening
-    on the next cycle is still fast.
-
-    Caller must clear data_map (or any DataFrame referencing view_rows()
-    output) BEFORE calling this — numpy zero-copy views pin the mmap buffer
-    and prevent close(), causing "BufferError: cannot close exported pointers".
-    """
-    import gc
-    gc.collect()
-    for path, reader in list(_reader_cache.items()):
-        try:
-            reader.close()
-        except Exception:
-            pass
-    _reader_cache.clear()
-
-
 _df_build_ms = 0.0
 _factor_ms = 0.0
 _profile_count = 0
@@ -364,7 +343,6 @@ def _compute_code_batch_shm(args):
             _factor_ms += factor_ms
             _profile_count += 1
             data_map.clear()
-            _clear_worker_cache()
             return results, errors, build_ms, factor_ms, None
 
         raw = factor_fn(data_map, requested_codes, date_str, [end_time]) if data_map else {}
@@ -415,14 +393,9 @@ def _compute_code_batch_shm(args):
                         (_df_build_ms + _factor_ms) / max(_profile_count, 1))
 
         data_map.clear()
-        _clear_worker_cache()
         return results, errors, build_ms, factor_ms, None
     except Exception as exc:
-        # Release zero-copy views BEFORE closing readers, mirroring the success
-        # path. Otherwise data_map DataFrames pin the mmap and reader.close()
-        # raises BufferError (swallowed below), leaking mmap/FDs across cycles.
         data_map.clear()
-        _clear_worker_cache()
         return results, len(codes), (time.perf_counter() - build_t0) * 1000, 0.0, str(exc)
 
 
