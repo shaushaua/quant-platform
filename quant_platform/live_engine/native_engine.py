@@ -1123,7 +1123,8 @@ class NativeEngine:
                 self._archive_offsets.update(pending_offsets)
 
     def _archive_loop(self) -> None:
-        logger.info("[native-archive] background archive loop started interval=%ds", self._archive_interval)
+        from datetime import timedelta
+        logger.info("[native-archive] background archive loop started (smart-sleep: 11:35/15:05)")
         last_archive_date = ""
         archived_lunch = False
         archived_close = False
@@ -1132,30 +1133,51 @@ class NativeEngine:
                 today = date.today().isoformat()
                 if today != last_archive_date:
                     last_archive_date = today
-                    archived_lunch = False
+                    now_init = datetime.now()
+                    archived_lunch = now_init.hour > 11 or (now_init.hour == 11 and now_init.minute >= 35)
                     archived_close = False
 
-                files_by_code = self._scan_shm_files()
-                if files_by_code:
-                    now = datetime.now()
-                    h, m = now.hour, now.minute
-                    if not archived_lunch and h == 11 and m >= 35:
+                now = datetime.now()
+                h, m = now.hour, now.minute
+
+                if h == 11 and m >= 35 and not archived_lunch:
+                    files_by_code = self._scan_shm_files()
+                    if files_by_code:
                         logger.info("[native-archive] lunch break snapshot starting...")
                         self._archive_native_incremental(files_by_code)
                         archived_lunch = True
                         logger.info("[native-archive] lunch break snapshot done")
-                    elif not archived_close and h >= 15 and m >= 5:
+
+                if h >= 15 and m >= 5 and not archived_close:
+                    files_by_code = self._scan_shm_files()
+                    if files_by_code:
                         logger.info("[native-archive] post-close snapshot starting...")
                         self._archive_native_incremental(files_by_code)
                         self._check_raw_upload_time(files_by_code)
                         archived_close = True
                         logger.info("[native-archive] post-close snapshot done")
+
+                if not archived_lunch:
+                    target_h, target_m = 11, 35
+                elif not archived_close:
+                    target_h, target_m = 15, 5
+                else:
+                    target_h, target_m = 0, 0
+
+                target = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+                if target <= now:
+                    target = target + timedelta(days=1)
+                sleep_sec = max(1, (target - now).total_seconds())
+
+                step = 60.0
+                slept = 0.0
+                while slept < sleep_sec and not self._stopped:
+                    actual = min(step, sleep_sec - slept)
+                    time.sleep(actual)
+                    slept += actual
             except Exception as exc:
                 logger.error("[native-archive] loop error: %s", exc, exc_info=True)
-            for _ in range(max(1, self._archive_interval)):
-                if self._stopped:
-                    break
-                time.sleep(1)
+                time.sleep(60)
 
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         try:
