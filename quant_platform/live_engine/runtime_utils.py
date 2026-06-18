@@ -12,7 +12,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _TRADING_START = (9, 15)
-_TRADING_END = (15, 30)
+_TRADING_END = (15, 0)
 
 
 def _is_trading_hours() -> bool:
