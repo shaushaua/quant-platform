@@ -498,6 +498,11 @@ resolve_create_defaults() {
     prompt_value RAM_USERNAME "RAM 子账号用户名（回车跳过则不启用 tag 隔离）" "${RAM_USERNAME}"
   fi
   prompt_value INSTANCE_TYPE "实例规格" "${INSTANCE_TYPE}"
+  prompt_value SYSTEM_DISK_SIZE "系统盘大小（GB）" "${SYSTEM_DISK_SIZE}"
+  while ! [[ "${SYSTEM_DISK_SIZE}" =~ ^[0-9]+$ ]] || (( SYSTEM_DISK_SIZE < 1 )); do
+    echo "磁盘大小必须是正整数，请重新输入。" >&2
+    prompt_value SYSTEM_DISK_SIZE "系统盘大小（GB）" "${SYSTEM_DISK_SIZE}"
+  done
   prompt_value BILLING_MODE "计费方式：spot 抢占式 / postpaid 按量" "${BILLING_MODE}"
   prompt_value DEV_USER "登录用户名" "${DEV_USER}"
   if [[ -z "${DEV_PASSWORD}" ]]; then
