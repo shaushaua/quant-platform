@@ -30,6 +30,9 @@ local_test_result.*
 # Local ECS lifecycle state
 .aliyun-research-ecs/
 
+# Local reference materials (trader examples, data samples)
+local/
+
 # Rust build artifacts
 mdl_parser/target/
 

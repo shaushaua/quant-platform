@@ -445,6 +445,7 @@ class NativeEngine:
         self._stopped = False
         self._archive_thread: Optional[threading.Thread] = None
         self._compute_lock = threading.Lock()
+        self._daily_position_lock = threading.Lock()
         self._compute_running = False
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
@@ -956,8 +957,10 @@ class NativeEngine:
             # zeros via `::VARCHAR` when ID_QI is integer-typed, which silently
             # drops all XSHE (Shenzhen) codes from the archived parquet.
             if "_ID_QI_PAD" in self._daily_basic_df.columns:
+                map_code_col = "_ID_QI_PAD"
                 map_df = self._daily_basic_df[["_ID_QI_PAD", "SECURITY_ID"]].drop_duplicates()
             else:
+                map_code_col = "ID_QI"
                 map_df = self._daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
             map_df.to_parquet(map_tmp_path, index=False)
         except Exception as exc:
@@ -1005,10 +1008,8 @@ class NativeEngine:
                     "(EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)"
                 )
                 select_clause = self._archive_select_clause(kind)
+                # map_code_col determined before _daily_basic_df was freed below;
                 # map_df carries either "_ID_QI_PAD" (zero-padded str) or "ID_QI".
-                # regexp_extract(Code) yields the 6-digit zero-padded code, so join
-                # against the padded column when available.
-                map_code_col = "_ID_QI_PAD" if "_ID_QI_PAD" in self._daily_basic_df.columns else "ID_QI"
                 con.execute(f"""
                     COPY (
                         SELECT
@@ -1180,27 +1181,36 @@ class NativeEngine:
                 time.sleep(60)
 
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
+        lock = (self._daily_position_lock
+                if (schedule is not None and schedule.name == "daily_position")
+                else self._compute_lock)
         try:
-            with self._compute_lock:
+            with lock:
                 self._compute_and_output_locked(schedule)
         except Exception as exc:
             logger.error("[combined] background compute failed: %s", exc, exc_info=True)
         finally:
-            # Only the minute schedule sets _compute_running; reset it
-            # unconditionally so a crash or thread-start failure cannot
-            # permanently stall minute computation.
-            self._compute_running = False
+            # Only the minute schedule sets _compute_running; reset it only for
+            # minute (or unscheduled) runs so a concurrent daily_position run
+            # cannot clear minute's guard while minute is still in flight.
+            if schedule is None or schedule.name == "minute":
+                self._compute_running = False
 
     def _compute_and_output_locked(self, schedule: Optional[ComputationSchedule] = None) -> None:
         is_daily = schedule is not None and schedule.is_daily_result
-        if not is_daily and not _is_trading_hours():
+        use_daily_module = is_daily or (
+            schedule is not None and getattr(schedule, 'use_daily_factor_module', False))
+        is_daily_worker = use_daily_module  # worker call signature: daily=single-code, minute=batch
+        # daily_result and daily_position are triggered by time_trigger (precise
+        # time point) so skip trading-hours check; only minute needs the guard.
+        if not is_daily and not use_daily_module and not _is_trading_hours():
             return
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        # Keep daily schedule compatible with historical daily factor runs:
-        # old strategies receive end_time="" for full-day calculation.
-        end_time = "" if is_daily else _minute_end_time(now_dt)
+        # Keep daily strategy compatible with historical daily factor runs:
+        # daily strategies receive end_time="" for full-day calculation.
+        end_time = "" if use_daily_module else _minute_end_time(now_dt)
         self._round_count += 1
 
         files_by_code = self._scan_shm_files()
@@ -1209,11 +1219,20 @@ class NativeEngine:
 
         snap_t0 = time.perf_counter()
         wall_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
-        dirty_codes, states_snapshot = self._sync_states(files_by_code, wall_secs)
-        snap_ms = (time.perf_counter() - snap_t0) * 1000
+        if use_daily_module and not is_daily:
+            # daily_position: skip _sync_states to avoid _state_offsets racing
+            # with the minute schedule running in parallel under another lock;
+            # full-market compute does not need dirty tracking. Take a read-only
+            # snapshot of the current StockState objects (GIL-protected).
+            dirty_codes = set()
+            states_snapshot = dict(self._states)
+            snap_ms = 0.0
+        else:
+            dirty_codes, states_snapshot = self._sync_states(files_by_code, wall_secs)
+            snap_ms = (time.perf_counter() - snap_t0) * 1000
 
-        # Daily: compute ALL stocks (no dirty tracking)
-        if is_daily:
+        # Daily / daily_position: compute ALL stocks (no dirty tracking)
+        if use_daily_module:
             all_codes = sorted(files_by_code.keys())
         elif not dirty_codes:
             return
@@ -1225,8 +1244,8 @@ class NativeEngine:
 
         t0 = time.time()
 
-        factor_module_path = self.daily_factor_module if (is_daily and self.daily_factor_module) else self.factor_module
-        active_factor_info = self._daily_factor_info if (is_daily and self._daily_factor_info) else self.factor_info
+        factor_module_path = self.daily_factor_module if (use_daily_module and self.daily_factor_module) else self.factor_module
+        active_factor_info = self._daily_factor_info if (use_daily_module and self._daily_factor_info) else self.factor_info
         global _market_df, _daily_basic_df, _base_ns
         _market_df = self._market_df
         _daily_basic_df = self._daily_basic_df
@@ -1248,7 +1267,7 @@ class NativeEngine:
              {code: tick_paths.get(code, "") for code in batch},
              {code: deal_paths.get(code, "") for code in batch},
              {code: order_paths.get(code, "") for code in batch},
-             date_str, factor_module_path, active_factor_info, is_daily)
+             date_str, factor_module_path, active_factor_info, is_daily_worker)
             for batch in code_batches
         ]
 
@@ -1395,6 +1414,19 @@ class NativeEngine:
             return
         is_daily = schedule is not None and schedule.is_daily_result
         run_inference = True if schedule is None else schedule.run_inference
+        # Storage label: daily -> "daily", daily_position -> result_label,
+        # minute -> actual end_time. Keeps files/oss keys from colliding.
+        if is_daily:
+            label = "daily"
+        elif schedule is not None and getattr(schedule, 'result_label', ''):
+            label = schedule.result_label
+        else:
+            label = end_time
+        # Runtime end_time for downstream (inference, portfolio context, order
+        # queue, latency query): daily_position passes "" to the factor function
+        # but uses label here so _query_deal_latency / file lookups resolve.
+        rt_end_time = label if (
+            schedule is not None and getattr(schedule, 'result_label', '')) else end_time
         output_path = self.output_path
         outfun = self.outfun
         inference_fn = self.inference_fn
@@ -1415,22 +1447,18 @@ class NativeEngine:
                         compact_df = _compact_output_copy(result_df)
                         if output_path:
                             output_path.mkdir(parents=True, exist_ok=True)
-                            if is_daily:
-                                out_file = output_path / f"{date_str}_daily.csv"
-                            else:
-                                out_file = output_path / f"{date_str}_{end_time}.csv"
+                            out_file = output_path / f"{date_str}_{label}.csv"
                             compact_df.to_csv(out_file, index=False)
                             logger.info("[combined] wrote %s", out_file)
-                        upload_end_time = "daily" if is_daily else end_time
-                        _upload_to_oss(compact_df, date_str, upload_end_time)
+                        _upload_to_oss(compact_df, date_str, label)
                     if run_inference and inference_fn is not None and not result_df.empty:
                         try:
                             portfolio_context = None
                             if portfolio_context_fn is not None:
-                                portfolio_context = portfolio_context_fn(date_str, end_time)
+                                portfolio_context = portfolio_context_fn(date_str, rt_end_time)
                             universe_extra = {
                                 "date": date_str,
-                                "end_time": end_time,
+                                "end_time": rt_end_time,
                                 "codes": _result_codes(result_df),
                                 "factor_result": result_df,
                                 "idx_cons_df": idx_cons_df,
@@ -1446,7 +1474,7 @@ class NativeEngine:
                             positions_df = call_inference(
                                 inference_fn,
                                 date_str,
-                                end_time,
+                                rt_end_time,
                                 prev_day_factors,
                                 result_df,
                                 daily_basic_df,
@@ -1456,7 +1484,7 @@ class NativeEngine:
                             )
                             if positions_df is not None and not positions_df.empty:
                                 if output_path:
-                                    pos_file = output_path / f"{date_str}_{end_time}_positions.csv"
+                                    pos_file = output_path / f"{date_str}_{label}_positions.csv"
                                     _compact_output_copy(positions_df).to_csv(pos_file, index=False)
                                     logger.info("[inference] wrote %d positions to %s",
                                                 len(positions_df), pos_file)
@@ -1465,7 +1493,7 @@ class NativeEngine:
                             logger.error("[inference] failed: %s", exc, exc_info=True)
                     if outfun is not None:
                         try:
-                            outfun(date_str, end_time, result_df)
+                            outfun(date_str, rt_end_time, result_df)
                         except Exception as exc:
                             logger.error("[combined] outfun failed: %s", exc)
                     with os.fdopen(write_fd, "wb") as pipe:
@@ -1482,7 +1510,7 @@ class NativeEngine:
             os.close(write_fd)
             threading.Thread(
                 target=self._handle_output_child,
-                args=(pid, read_fd, date_str, end_time),
+                args=(pid, read_fd, date_str, rt_end_time),
                 name=f"output-child-{pid}",
                 daemon=True,
             ).start()

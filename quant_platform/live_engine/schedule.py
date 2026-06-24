@@ -12,6 +12,35 @@ The factor_calculation function is the same regardless of schedule.
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_trigger_time(raw: str, default: Tuple[int, int],
+                        env_var: str) -> Tuple[int, int]:
+    """Parse "HH:MM" into (H, M); fall back to default on malformed input.
+
+    Tolerates extra parts (e.g. "14:50:00") and logs a warning on fallback so
+    a typo in k8s env does not crash engine startup.
+    """
+    parts = raw.split(":")
+    if len(parts) < 2:
+        logger.warning("[schedule] %s=%r malformed (expected HH:MM); using default %02d:%02d",
+                       env_var, raw, default[0], default[1])
+        return default
+    try:
+        h, m = int(parts[0]), int(parts[1])
+    except ValueError:
+        logger.warning("[schedule] %s=%r non-integer; using default %02d:%02d",
+                       env_var, raw, default[0], default[1])
+        return default
+    if not (0 <= h < 24 and 0 <= m < 60):
+        logger.warning("[schedule] %s=%r out of range; using default %02d:%02d",
+                       env_var, raw, default[0], default[1])
+        return default
+    return (h, m)
 
 
 @dataclass
@@ -32,6 +61,8 @@ class ComputationSchedule:
     # behavior flags
     run_inference: bool = True
     is_daily_result: bool = False               # result becomes next day's prev_day
+    use_daily_factor_module: bool = False       # select daily_factor_module + all stocks + single-code call + end_time=''
+    result_label: str = ""                      # storage label (csv/oss key); empty -> end_time
 
     # runtime state (managed by engine)
     _last_run_ts: float = field(default=0.0, repr=False)
@@ -107,8 +138,6 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
     factor_info override:
         compute_interval:           strategy-defined interval (takes precedence over env)
     """
-    import os
-
     enabled = [s.strip() for s in os.environ.get("COMPUTE_SCHEDULES", "minute").split(",")]
     # factor_info.compute_interval 优先，env var 次之
     fi = factor_info or {}
@@ -120,21 +149,36 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             name="minute",
             schedule_type="interval",
             interval_seconds=interval,
-            active_hours=((9, 25), (14, 59)),
-            active_sessions=[((9, 25), (11, 30)), ((13, 0), (14, 59))],
+            active_hours=((9, 15), (15, 0)),
+            active_sessions=[((9, 15), (11, 30)), ((13, 0), (15, 0))],
             run_inference=True,
             is_daily_result=False,
         ))
 
     if "daily" in enabled:
-        trigger_str = os.environ.get("DAILY_FACTOR_TRIGGER_TIME", "15:10")
-        parts = trigger_str.split(":")
+        t = _parse_trigger_time(
+            os.environ.get("DAILY_FACTOR_TRIGGER_TIME", "15:10"),
+            (15, 10), "DAILY_FACTOR_TRIGGER_TIME")
         schedules.append(ComputationSchedule(
             name="daily",
             schedule_type="time_trigger",
-            trigger_times=[(int(parts[0]), int(parts[1]))],
+            trigger_times=[t],
             run_inference=False,
             is_daily_result=True,
+        ))
+
+    if "daily_position" in enabled:
+        t = _parse_trigger_time(
+            os.environ.get("DAILY_POSITION_TRIGGER_TIME", "14:50"),
+            (14, 50), "DAILY_POSITION_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="daily_position",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            run_inference=True,
+            is_daily_result=False,
+            use_daily_factor_module=True,
+            result_label=f"{t[0]:02d}{t[1]:02d}00",
         ))
 
     return schedules

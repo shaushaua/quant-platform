@@ -94,9 +94,11 @@ spec:
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily"
+              value: "minute,daily,daily_position"
             - name: DAILY_FACTOR_TRIGGER_TIME
               value: "15:10"
+            - name: DAILY_POSITION_TRIGGER_TIME
+              value: "14:50"
             # --- Order gateway ---
             - name: ORDER_GATEWAY_URL
               value: "http://172.16.0.47:18080"
@@ -142,7 +144,7 @@ spec:
             - name: ARCHIVE_INTERVAL
               value: "1800"
             - name: RAW_DATA_UPLOAD_TIME
-              value: "15:10"
+              value: "15:30"
             - name: COLLECTOR_DISK_OUTPUT
               value: /data/collector_output
             # --- PML 录制（调试用，默认关闭，避免热路径复制 raw buffer）---

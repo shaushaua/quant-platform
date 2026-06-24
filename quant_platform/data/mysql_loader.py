@@ -271,7 +271,7 @@ class MySQLLoader:
                 t1.SECURITY_ID,
                 s.SEC_SHORT_NAME      AS SEC_SHORT_NAME,
                 s.SEC_FULL_NAME       AS SEC_FULL_NAME,
-                t2.OPEN_PRICE_2      AS open,
+                t2.OPEN_PRICE        AS open,
                 t2.HIGHEST_PRICE     AS high,
                 t2.LOWEST_PRICE      AS low,
                 t2.CLOSE_PRICE       AS close,
