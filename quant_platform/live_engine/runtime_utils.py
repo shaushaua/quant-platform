@@ -52,8 +52,13 @@ def _time_to_seconds(time_val) -> float:
         return 0.0
 
 
-def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
+def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str,
+                   category: str = "minutes") -> None:
     """Upload live factor results to OSS as parquet.
+
+    ``category`` controls the directory under the date prefix:
+        "daily"   -> {prefix}/{year}/{year_month}/{date}/daily-feature/{end_time}.parquet
+        "minutes" -> {prefix}/{year}/{year_month}/{date}/minutes-feature/{end_time}.parquet
 
     Caller should pass a compacted copy (round + float32) if storage reduction
     is desired; this function serializes df as-is.
@@ -78,7 +83,8 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str) -> None:
 
         year = date_str[:4]
         month = date_str[4:6]
-        key = f"{prefix}/{year}/{year}{month}/{date_str}/{end_time}.parquet"
+        sub_dir = "daily-feature" if category == "daily" else "minutes-feature"
+        key = f"{prefix}/{year}/{year}{month}/{date_str}/{sub_dir}/{end_time}.parquet"
 
         buf = io.BytesIO()
         df.to_parquet(buf, index=False)

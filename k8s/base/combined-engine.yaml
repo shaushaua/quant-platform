@@ -85,6 +85,14 @@ spec:
               value: "1"
             - name: OPEN_POSITION_TOTAL_CAPITAL
               value: "10000000"
+            # --- 一次性清仓：模拟盘启动时把 broker 持仓全平 ---
+            # 启用后 pod 起来 spawn daemon thread,等到 09:15 拉持仓并全推 sell。
+            # 幂等：/data/factors/{trading_day}_close_done.flag 写后不再重试。
+            # 用完务必改回 "0"，否则每个交易日 09:15 都会清仓。
+            - name: ONE_TIME_CLOSE_ON_STARTUP
+              value: "1"
+            - name: ONE_TIME_CLOSE_TRIGGER_TIME
+              value: "09:15"
             - name: TREE_MODEL_STRATEGY_NAME
               value: "tree_model"
             # tree_model_inference 的 OSS 缓存目录（model + daily_basic parquet）

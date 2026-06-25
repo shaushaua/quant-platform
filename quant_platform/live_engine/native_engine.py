@@ -1655,7 +1655,10 @@ class NativeEngine:
                             out_file = output_path / f"{date_str}_{label}.csv"
                             compact_df.to_csv(out_file, index=False)
                             logger.info("[combined] wrote %s", out_file)
-                        _upload_to_oss(compact_df, date_str, label)
+                        _upload_to_oss(
+                            compact_df, date_str, label,
+                            category="daily" if is_daily else "minutes",
+                        )
                     if run_inference and inference_fn is not None and not result_df.empty:
                         try:
                             portfolio_context = None
