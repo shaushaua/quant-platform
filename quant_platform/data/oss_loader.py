@@ -45,6 +45,7 @@ class OSSDataLoader:
         "order": "order",
         "deal": "deal",
         "daily_basic": "daily_basic_data",
+        "composition": "composition",
         "kline_1min": "kline_1min",
         "kline_5min": "kline_5min",
         "kline_10min": "kline_10min",
@@ -168,6 +169,84 @@ class OSSDataLoader:
         except Exception as e:
             logger.error(f"读取 OSS 小文件失败 {key}: {e}")
             return pd.DataFrame()
+
+    def read_composition(self, date_str: str) -> pd.DataFrame:
+        """
+        读取成分股+权重文件 (composition.parquet)。
+
+        由 deeptrade 流水线的 GenerateCompositionData 生成,路径:
+            {year}/{year}{month}/{year}{month}{day}/{year}{month}{day}_composition.parquet
+
+        长表 schema:
+            TS, INDEX_CODE, INDEX_ID, ID_QI, SECURITY_ID, SEC_SHORT_NAME, weight
+
+        Args:
+            date_str: 交易日 YYYYMMDD
+
+        Returns:
+            pd.DataFrame,失败返回空 DataFrame(由调用方决定是否 fallback MySQL)
+        """
+        key = self._object_key(date_str, "composition")
+        df = self._read_small_file(key)
+        if df.empty:
+            return df
+        # 标准化 ID_QI 为 6 位字符串
+        if "ID_QI" in df.columns:
+            df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
+        return df
+
+    def read_daily_basic(self, date_str: str) -> pd.DataFrame:
+        """
+        读取日线基础数据 (daily_basic_data.parquet)。
+
+        与 deeptrade 流水线 GenerateDailyBasicData 生成的 96 列 schema 对齐
+        (equity + barra48 + index24)。路径:
+            {year}/{year}{month}/{year}{month}{day}/{year}{month}{day}_daily_basic_data.parquet
+
+        Args:
+            date_str: 交易日 YYYYMMDD
+
+        Returns:
+            pd.DataFrame,失败返回空 DataFrame(由调用方决定是否 fallback MySQL)
+        """
+        key = self._object_key(date_str, "daily_basic")
+        df = self._read_small_file(key)
+        if df.empty:
+            return df
+        if "ID_QI" in df.columns:
+            df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
+        return df
+
+    def upload_daily_basic(self, date_str: str, df: pd.DataFrame) -> bool:
+        """将 daily_basic DataFrame 写成 parquet 上传 OSS (供 data_refresh 调用)。"""
+        return self._upload_parquet(date_str, "daily_basic", df)
+
+    def upload_composition(self, date_str: str, df: pd.DataFrame) -> bool:
+        """将 composition DataFrame 写成 parquet 上传 OSS (供 data_refresh 调用)。"""
+        return self._upload_parquet(date_str, "composition", df)
+
+    def _upload_parquet(self, date_str: str, data_type: str, df: pd.DataFrame) -> bool:
+        """通用 parquet 上传。"""
+        if self._oss_bucket is None:
+            logger.error("OSS bucket 未初始化,跳过上传")
+            return False
+        if df is None or df.empty:
+            logger.warning(f"{data_type} DataFrame 为空,跳过上传")
+            return False
+        key = self._object_key(date_str, data_type)
+        try:
+            buf = io.BytesIO()
+            df.to_parquet(buf, index=False, engine="pyarrow")
+            buf.seek(0)
+            self._oss_bucket.put_object(key, buf.getvalue())
+            logger.info(
+                f"OSS 上传成功: {key} ({len(df)} rows, {len(df.columns)} cols, "
+                f"{buf.tell()} bytes)"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"OSS 上传失败 {key}: {e}", exc_info=True)
+            return False
 
     def _resolve_security_ids(self, date_str: str, codes: List[str]) -> List[int]:
         """将 000001.SZ 格式的 codes 转成 SECURITY_ID 整数列表。

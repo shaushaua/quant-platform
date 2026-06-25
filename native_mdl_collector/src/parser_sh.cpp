@@ -38,7 +38,7 @@ using namespace schema;
 //   (no HighLimit/LowLimit in SH) → 0.0
 //   Channel → 0
 
-ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len, std::int64_t seq_id) {
+ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len, std::int64_t seq_id, double recv_sec) {
     ParseResult result;
     result.kind = DataKind::Tick;
     result.row.resize(kTickCols, 0.0);
@@ -62,7 +62,7 @@ ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len, std::int64_
     // Time
     double time_sec = mdl_time_to_seconds(msg->UpdateTime.m_Value);
     result.row[tick::Time]       = time_sec;
-    result.row[tick::UpdateTime] = time_sec;
+    result.row[tick::UpdateTime] = recv_sec;
 
     // Scalar fields
     result.row[tick::CurrentPrice]   = mdl_float_to_f64(msg->LastPrice.m_Value, 3);
@@ -118,7 +118,7 @@ ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len, std::int64_
 //
 // TickBSFlag: "B"→0 (buy), "S"→1 (sell), else→10
 
-NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len) {
+NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len, double recv_sec) {
     NgtsResult result;
 
     if (msg_len < sizeof(mdl_shl2_msg::NGTSTick)) {
@@ -167,7 +167,7 @@ NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len) {
         result.order.valid = true;
 
         result.order.row[order::Time]      = time_sec;
-        result.order.row[order::UpdateTime] = time_sec;
+        result.order.row[order::UpdateTime] = recv_sec;
         result.order.row[order::OrderID]   = static_cast<double>(buy_no + sell_no);
         result.order.row[order::Side]      = static_cast<double>(side);
         result.order.row[order::Price]     = price;
@@ -188,7 +188,7 @@ NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len) {
         double deal_money = (money != 0.0) ? money : (price * qty);
 
         result.deal.row[deal::Time]        = time_sec;
-        result.deal.row[deal::UpdateTime]   = time_sec;
+        result.deal.row[deal::UpdateTime]   = recv_sec;
         result.deal.row[deal::SaleOrderID]  = static_cast<double>(sell_no);
         result.deal.row[deal::BuyOrderID]   = static_cast<double>(buy_no);
         result.deal.row[deal::Side]         = static_cast<double>(side);

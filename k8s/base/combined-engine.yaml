@@ -74,31 +74,36 @@ spec:
             - name: DAILY_FACTOR_MODULE
               value: "quant_platform.strategies.protected_eillen_strategy"
             - name: INFERENCE_MODULE
-              value: "quant_platform.inference.robot_model_inference"
-            - name: ROBOT_TARGET_CAPITAL
-              value: "50000000"
-            - name: ROBOT_MAX_ORDERS
-              value: "10"
-            - name: ROBOT_POSITION_TAIL_FRAC
-              value: "0.10"
-            - name: ROBOT_LOT_SIZE
-              value: "100"
-            - name: ROBOT_DEFAULT_PRICE
-              value: "10"
-            - name: ROBOT_ENABLE_SELL
-              value: "true"
-            - name: ROBOT_STRATEGY_NAME
-              value: "robot_model"
+              value: "quant_platform.inference.tree_model_orders"
+            # --- 模拟盘资金（tree_model_orders 走 positions_to_orders helper） ---
+            # 实盘注释掉这两行，靠 portfolio_context.account.total_asset 取真实总资产
+            - name: OPEN_POSITION_SIM_MODE
+              value: "1"
+            - name: OPEN_POSITION_TOTAL_CAPITAL
+              value: "10000000"
+            - name: TREE_MODEL_STRATEGY_NAME
+              value: "tree_model"
+            # tree_model_inference 的 OSS 缓存目录（model + daily_basic parquet）
+            # 复用 factor-output 挂载点，避免容器 cwd 不可写
+            - name: TREE_MODEL_OSS_CACHE_DIR
+              value: "/data/factors/oss_cache/tree_model"
             - name: PORTFOLIO_CONTEXT_MODULE
               value: "quant_platform.broker.order_context"
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position"
+              value: "minute,daily,daily_position,open_position"
+            # 临时关闭分钟级下单：minute 继续算因子+同步 tick，但不推单
+            # 想恢复分钟下单把这个改成 true 即可
+            - name: MINUTE_RUN_INFERENCE
+              value: "false"
             - name: DAILY_FACTOR_TRIGGER_TIME
               value: "15:10"
             - name: DAILY_POSITION_TRIGGER_TIME
               value: "14:50"
+            # --- 9:30 开盘下单（用 T-1 因子 + 实时逐笔价 + 总资金） ---
+            - name: OPEN_POSITION_TRIGGER_TIME
+              value: "09:30"
             # --- Order gateway ---
             - name: ORDER_GATEWAY_URL
               value: "http://172.16.0.47:18080"
@@ -129,10 +134,19 @@ spec:
               value: /data/factors
             - name: DAILY_BASIC_MARKET_COUNT
               value: "5"
-            # --- 指数成分股（MySQL idx_cons 表，填指数 SECURITY_ID）---
-            # 1782=沪深300, 2103=中证500, 33736=中证1000, 3800=中证全指, 1200245=中证2000
-            - name: IDX_CONS_IDS
-              value: "1782,2103,33736,3800,1200245"
+            # --- 指数成分股(优先 OSS composition.parquet,fallback MySQL idx_cons)---
+            # TICKER 代码格式;若 mkt_idxd_csi 中出现重复 TICKER 可改用 TICKER.EXCHANGE 消歧
+            # 未配置时自动兼容旧的 IDX_CONS_IDS(SECURITY_ID)
+            # 000300=沪深300, 000905=中证500, 000852=中证1000, 000985=中证全指, 932000=中证2000
+            - name: IDX_CONS_CODES
+              value: "000300,000905,000852,000985,932000"
+            # --- 通联 DataYes API: 拉 Barra SW21 因子 (T+1 凌晨 2 点更新) ---
+            # Pod 启动时主动调 API 覆盖 MySQL 滞后的 barra 数据,生成 daily_basic parquet
+            - name: DATAYES_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: quant-secrets
+                  key: DATAYES_TOKEN
             # --- 交易员 trading_universe 接口（可选，配了则必须成功）---
             - name: TRADING_UNIVERSE_MODULE
               value: ""

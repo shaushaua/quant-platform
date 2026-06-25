@@ -65,6 +65,54 @@ _shared_calc_fn = None          # type: Optional[Callable]
 # 公开接口
 # ---------------------------------------------------------------------------
 
+def _init_idx_cons_cache_for_backtest():
+    """初始化回测用的成分股缓存(可选)。
+
+    通过环境变量 IDX_CONS_CODES(优先) 或 IDX_CONS_IDS(向后兼容) 控制是否启用。
+    未配置任何变量时返回 None,回测里跳过成分股相关逻辑(保持旧行为)。
+
+    数据源:OSS composition.parquet 优先,fallback MySQL 区间查询。
+    """
+    import os
+    codes_str = os.environ.get("IDX_CONS_CODES", "")
+    if not codes_str:
+        # 向后兼容:把 SECURITY_ID 映射回 TICKER
+        legacy = os.environ.get("IDX_CONS_IDS", "")
+        if legacy:
+            mapping = {"1782": "000300", "2103": "000905", "33736": "000852",
+                       "3800": "000985", "1200245": "932000"}
+            codes_str = ",".join(
+                mapping[s.strip()] for s in legacy.split(",")
+                if s.strip() and s.strip() in mapping
+            )
+
+    if not codes_str:
+        logger.info("[backtest] IDX_CONS_CODES 未配置,跳过成分股缓存初始化")
+        return None
+
+    codes = [s.strip() for s in codes_str.split(",") if s.strip()]
+
+    # 懒加载 OSSDataLoader(可选,失败不影响 MySQL fallback)
+    oss_loader = None
+    if os.environ.get("OSS_ACCESS_KEY_ID") and os.environ.get("OSS_ACCESS_KEY_SECRET"):
+        try:
+            from ..data.oss_loader import OSSDataLoader
+            oss_loader = OSSDataLoader()
+        except Exception as exc:
+            logger.warning("[backtest] OSSDataLoader init failed: %s", exc)
+
+    try:
+        from ..data.mysql_loader import IdxConsCache
+        cache = IdxConsCache(index_codes=codes, oss_loader=oss_loader)
+        logger.info("[backtest] idx_cons 缓存已初始化: codes=%s", codes)
+        return cache
+    except Exception as exc:
+        logger.warning("[backtest] idx_cons 缓存初始化失败: %s", exc)
+        return None
+
+
+
+
 def calc_factors_by_date_range(
     factor_info: Dict,
     start_date: str,
@@ -110,6 +158,11 @@ def calc_factors_by_date_range(
     _calc_fn = factor_data_handler
     _out_fn = outfun
     _infer_fn = inference_handler
+
+    # 初始化成分股缓存(可选,由 IDX_CONS_CODES / IDX_CONS_IDS 环境变量控制)
+    # 数据源优先 OSS composition.parquet,fallback MySQL 区间查询
+    # 用法:每个交易日按 date 查 cache,得到当日真实成分股(避免幸存者偏差)
+    _idx_cons_cache = _init_idx_cons_cache_for_backtest()
 
     # 交易日列表
     try:
@@ -450,8 +503,14 @@ def calc_factors_by_date_range(
                                 "codes": _securities,
                                 "factor_result": test,
                             }
+                            if _idx_cons_cache is not None:
+                                universe_extra["idx_cons_df"] = _idx_cons_cache.get_by_date(date)
                             trading_universe_df = compute_trading_universe(_daily, universe_extra)
-                            index_composition_df = compute_index_composition(_daily, universe_extra)
+                            index_composition_df = compute_index_composition(
+                                _daily, universe_extra,
+                                trading_day=date if _idx_cons_cache else None,
+                                idx_cons_cache=_idx_cons_cache,
+                            )
                             positions = call_inference(
                                 _infer_fn,
                                 date,
@@ -538,8 +597,14 @@ def calc_factors_by_date_range(
                             "codes": _securities,
                             "factor_result": test,
                         }
+                        if _idx_cons_cache is not None:
+                            universe_extra["idx_cons_df"] = _idx_cons_cache.get_by_date(date)
                         trading_universe_df = compute_trading_universe(_daily, universe_extra)
-                        index_composition_df = compute_index_composition(_daily, universe_extra)
+                        index_composition_df = compute_index_composition(
+                            _daily, universe_extra,
+                            trading_day=date if _idx_cons_cache else None,
+                            idx_cons_cache=_idx_cons_cache,
+                        )
                         positions = call_inference(
                             _infer_fn,
                             date,
@@ -639,6 +704,54 @@ def _load_day_bundle(date: str, factor_info: Dict, api: DataAPI, securities: Lis
     )
 
 
+def _restore_time_column(epoch_us: pd.Series, code: str) -> pd.Series:
+    """
+    将 int64 UnixMicro 时间戳还原为 Beijing datetime64[ns]。
+
+    两种编码兼容：
+      - 真实 UTC epoch（旧 live collector 写的）：UTC→北京 +8
+      - 北京 wallclock 当作 UTC 的 epoch（新 collector archive bug）：
+        原本就是北京 wallclock，不能再 +8，否则会得到 17:15-23:00 这种错位时段
+
+    兜底策略：采样后比较两种解读在 A 股交易时段 [08:30, 15:30] 内的行数，
+    取落在交易时段多的那种。这样无需关心 parquet 是哪个 collector 写的。
+    """
+    # 都先按 UTC 解
+    utc_dt = pd.to_datetime(epoch_us, unit="us", utc=True)
+    # A: 标准 UTC→北京
+    bj_via_utc = utc_dt.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+    # B: 直接当北京 wallclock（archive 双重编码兜底）
+    bj_direct = utc_dt.dt.tz_localize(None)
+
+    # 采样最多 200 行做判断，避免大表全量计算
+    n = len(epoch_us)
+    if n > 200:
+        step = max(1, n // 200)
+        sample_via = bj_via_utc.iloc[::step]
+        sample_direct = bj_direct.iloc[::step]
+    else:
+        sample_via = bj_via_utc
+        sample_direct = bj_direct
+
+    # A 股交易时段：08:30-15:30 北京时间（含集合竞价 9:15-9:25 + 盘后）
+    _TRADING_START = 8 * 60 + 30   # 08:30
+    _TRADING_END = 15 * 60 + 30    # 15:30
+    mins_via = sample_via.dt.hour * 60 + sample_via.dt.minute
+    mins_direct = sample_direct.dt.hour * 60 + sample_direct.dt.minute
+    n_via = int(((mins_via >= _TRADING_START) & (mins_via <= _TRADING_END)).sum())
+    n_direct = int(((mins_direct >= _TRADING_START) & (mins_direct <= _TRADING_END)).sum())
+
+    if n_direct > n_via:
+        # archive 把北京 wallclock 当 UTC 写了 epoch，直接按 wallclock 用
+        logger.warning(
+            "[精度还原] %s Time 检测到时区双重编码（UTC解读 in-trading=%d, "
+            "wallclock解读 in-trading=%d），按北京 wallclock 直解",
+            code, n_via, n_direct,
+        )
+        return bj_direct
+    return bj_via_utc
+
+
 def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     """
     将 OSS 历史压缩数据还原为原始精度。
@@ -702,9 +815,7 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
 
     # 3. 还原 Time 列：int64 UnixMicro → datetime64[ns]
     if "Time" in df.columns and pd.api.types.is_integer_dtype(df["Time"]):
-        # Unix 微秒时间戳转换为 datetime，默认是 UTC
-        # A 股数据是北京时间，需要转换为 Asia/Shanghai (UTC+8)
-        df["Time"] = pd.to_datetime(df["Time"], unit="us", utc=True).dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+        df["Time"] = _restore_time_column(df["Time"], code)
     # 还原 UpdateTime 列：int32 微秒偏移 → datetime64[ns]（基于已还原的 Time）
     if "UpdateTime" in df.columns and pd.api.types.is_integer_dtype(df["UpdateTime"]) and "Time" in df.columns:
         df["UpdateTime"] = df["Time"] + pd.to_timedelta(df["UpdateTime"], unit="us")

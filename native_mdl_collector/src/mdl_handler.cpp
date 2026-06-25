@@ -81,7 +81,7 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
 
     if (mid == mdl_shl2_msg::SHL2MarketData::MessageID) {
         // SH tick (MID=4)
-        auto result = parse_sh_tick(body, body_size, static_cast<std::int64_t>(seq));
+        auto result = parse_sh_tick(body, body_size, static_cast<std::int64_t>(seq), recv_sec);
         if (result.valid) {
             writer_.append_tick(result.code, result.row);
             tick_count_.fetch_add(1, std::memory_order_relaxed);
@@ -89,7 +89,7 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
         }
     } else if (mid == mdl_shl2_msg::NGTSTick::MessageID) {
         // SH NGTS (MID=24) → order +/or deal
-        auto result = parse_sh_ngts(body, body_size);
+        auto result = parse_sh_ngts(body, body_size, recv_sec);
         if (!result.code.empty()) {
             if (result.has_order) {
                 writer_.append_order(result.code, result.order.row);
@@ -125,7 +125,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
 
     if (mid == mdl_szl2_msg::Snapshot300111_v2::MessageID) {
         // SZ tick (MID=28)
-        auto result = parse_sz_tick(body, body_size, static_cast<std::int64_t>(seq));
+        auto result = parse_sz_tick(body, body_size, static_cast<std::int64_t>(seq), recv_sec);
         if (result.valid) {
             writer_.append_tick(result.code, result.row);
             tick_count_.fetch_add(1, std::memory_order_relaxed);
@@ -133,7 +133,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         }
     } else if (mid == mdl_szl2_msg::Order300192_v2::MessageID) {
         // SZ order (MID=33)
-        auto result = parse_sz_order(body, body_size);
+        auto result = parse_sz_order(body, body_size, recv_sec);
         if (result.valid) {
             writer_.append_order(result.code, result.row);
             order_count_.fetch_add(1, std::memory_order_relaxed);
@@ -141,7 +141,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         }
     } else if (mid == mdl_szl2_msg::Transaction300191_v2::MessageID) {
         // SZ deal (MID=36)
-        auto result = parse_sz_deal(body, body_size);
+        auto result = parse_sz_deal(body, body_size, recv_sec);
         if (result.valid) {
             writer_.append_deal(result.code, result.row);
             deal_count_.fetch_add(1, std::memory_order_relaxed);

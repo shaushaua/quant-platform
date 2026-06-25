@@ -63,6 +63,7 @@ class ComputationSchedule:
     is_daily_result: bool = False               # result becomes next day's prev_day
     use_daily_factor_module: bool = False       # select daily_factor_module + all stocks + single-code call + end_time=''
     result_label: str = ""                      # storage label (csv/oss key); empty -> end_time
+    skip_factor_compute: bool = False           # open_position: skip shm scan + factor calc, use prev_day_factors directly
 
     # runtime state (managed by engine)
     _last_run_ts: float = field(default=0.0, repr=False)
@@ -145,13 +146,19 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
     schedules: List[ComputationSchedule] = []
 
     if "minute" in enabled:
+        # MINUTE_RUN_INFERENCE=false: keep computing factors (and syncing tick
+        # state) but skip inference → no order push. Used when only daily
+        # frequency orders are desired (e.g. sim day with only open_position).
+        minute_run_inference = os.environ.get("MINUTE_RUN_INFERENCE", "true").lower() in {
+            "1", "true", "yes", "y", "on"
+        }
         schedules.append(ComputationSchedule(
             name="minute",
             schedule_type="interval",
             interval_seconds=interval,
             active_hours=((9, 15), (15, 0)),
             active_sessions=[((9, 15), (11, 30)), ((13, 0), (15, 0))],
-            run_inference=True,
+            run_inference=minute_run_inference,
             is_daily_result=False,
         ))
 
@@ -179,6 +186,21 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             is_daily_result=False,
             use_daily_factor_module=True,
             result_label=f"{t[0]:02d}{t[1]:02d}00",
+        ))
+
+    if "open_position" in enabled:
+        t = _parse_trigger_time(
+            os.environ.get("OPEN_POSITION_TRIGGER_TIME", "09:30"),
+            (9, 30), "OPEN_POSITION_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="open_position",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            run_inference=True,
+            is_daily_result=False,
+            use_daily_factor_module=False,
+            result_label=f"{t[0]:02d}{t[1]:02d}00",
+            skip_factor_compute=True,
         ))
 
     return schedules

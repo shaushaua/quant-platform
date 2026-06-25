@@ -30,19 +30,22 @@ struct NgtsResult {
 // msg_len: body size in bytes
 // seq_id: sequence ID from message header
 ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len,
-                          std::int64_t seq_id);
+                          std::int64_t seq_id, double recv_sec);
 
 // Parse SZ tick (MID=28, Snapshot300111_v2)
 ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len,
-                          std::int64_t seq_id);
+                          std::int64_t seq_id, double recv_sec);
 
 // Parse SH NGTS (MID=24, NGTSTick) -> may produce order and/or deal
-NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len);
+NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len,
+                         double recv_sec);
 
 // Parse SZ order (MID=33, Order300192_v2)
-ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len);
+ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len,
+                           double recv_sec);
 
 // Parse SZ deal (MID=36, Transaction300191_v2)
-ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len);
+ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len,
+                          double recv_sec);
 
 } // namespace quant::native_mdl

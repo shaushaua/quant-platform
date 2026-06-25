@@ -110,35 +110,67 @@ def inference(date_str: str, end_time: str,
 
 ### 5. index_composition_df — 指数成分分股数据
 
-`index_composition_df` 用于传入指数成分、权重、成分调整等分股数据。引擎启动时
-从 MySQL `idx_cons` 表加载，通过 `IDX_CONS_IDS` 环境变量配置指数 SECURITY_ID（逗号分隔）。
+`index_composition_df` 用于传入指数成分、权重、成分调整等分股数据。数据源优先级:
 
-`IDX_CONS_IDS` 默认值：`1782,2103,33736,3800,1200245`
-（沪深300/中证500/中证1000/中证全指/中证2000）。
+1. **OSS composition.parquet**(推荐):由 deeptrade 流水线生成,
+   路径 `{year}/{year}{month}/{year}{month}{day}/{year}{month}{day}_composition.parquet`,
+   含权重列(自由流通市值加权)。
+2. **MySQL idx_cons 直查**(fallback):按交易日区间过滤
+   `INTO_DATE <= T AND (OUT_DATE IS NULL OR OUT_DATE > T)`,避免幸存者偏差。
 
-原始查询列（从 IdxConsCache 获取）：
+通过 `IDX_CONS_CODES` 环境变量配置指数 TICKER(逗号分隔,**推荐**);
+未配置时兼容旧的 `IDX_CONS_IDS`(SECURITY_ID 数字)。
+
+`IDX_CONS_CODES` 默认值:`000300,000905,000852,000985,932000`
+(沪深300/中证500/中证1000/中证全指/中证2000)。
+
+已验证上述 5 个 TICKER 在 `mkt_idxd_csi` 表中唯一,无需 `.EXCHANGE` 后缀。
+若未来出现 TICKER 重复(不同交易所同一代码),可改用 `TICKER.EXCHANGE` 格式
+(如 `000300.XSHG`),SQL 会自动按 `TICKER_SYMBOL + EXCHANGE_CD` 双重过滤。
+
+历史回测会自动按 trading_day 切片,实盘则用当天数据。
+
+OSS 路径下的原始数据(长表):
+
+| 列 | 说明 |
+|----|------|
+| `TS` | 交易日 YYYYMMDD |
+| `INDEX_CODE` | 指数 TICKER,如 `000300` |
+| `INDEX_ID` | 指数 SECURITY_ID,如 `1782` |
+| `ID_QI` | 6 位股票代码 |
+| `SECURITY_ID` | 股票整数 ID |
+| `SEC_SHORT_NAME` | 股票简称 |
+| `weight` | 自由流通市值加权 [0,1],每个指数内 Σ=1.0 |
+
+MySQL fallback 路径返回的字段(无 weight):
 
 | 列 | 说明 |
 |----|------|
 | `INDEX_ID` | 指数内部 ID |
-| `INDEX_CODE` | 指数交易代码，如 `000300` |
+| `INDEX_CODE` | 指数交易代码,如 `000300` |
 | `STOCK_ID` | 成分股内部 SECURITY_ID |
-| `ID_QI` | 6 位股票代码，如 `000001` |
+| `ID_QI` | 6 位股票代码,如 `000001` |
 | `SEC_SHORT_NAME` | 股票简称 |
 | `INTO_DATE` | 入选日期 |
 | `OUT_DATE` | 剔除日期 |
 
-生成后的 `index_composition_df` 为宽表格式：
+生成后的 `index_composition_df` 为宽表格式(以 IDX_CONS_CODES 为例):
 
 | 列 | 说明 |
 |----|------|
 | `ID_QI` | 6 位股票代码 |
-| `SECURITY_ID` | 股票整数 ID（从 daily_basic 补充） |
-| `in_idx_1782` | 是否为沪深300成分股 |
-| `in_idx_2103` | 是否为中证500成分股 |
-| `in_idx_33736` | 是否为中证1000成分股 |
-| `in_idx_3800` | 是否为中证全指成分股 |
-| `in_idx_1200245` | 是否为中证2000成分股 |
+| `SECURITY_ID` | 股票整数 ID(从 daily_basic 补充) |
+| `in_idx_000300` | 是否为沪深300成分股 |
+| `in_idx_000905` | 是否为中证500成分股 |
+| `in_idx_000852` | 是否为中证1000成分股 |
+| `in_idx_000985` | 是否为中证全指成分股 |
+| `in_idx_932000` | 是否为中证2000成分股 |
+| `weight_000300` | 该股在沪深300中的权重(仅 OSS 路径有,否则不出现) |
+| `weight_000905` | 该股在中证500中的权重(同上) |
+| ... | 其他指数 weight 列(同上) |
+
+**注意**:列名后缀从旧版的 SECURITY_ID(如 `in_idx_1782`)改为 TICKER 代码
+(如 `in_idx_000300`),更可读且自描述。
 
 ### 6. portfolio_context — 当前账户上下文
 

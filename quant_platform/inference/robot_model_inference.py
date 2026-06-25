@@ -212,27 +212,78 @@ def _round_lot(volume: float) -> int:
     return max(0, int(volume // lot) * lot)
 
 
+def _resolve_capital(portfolio_context) -> float:
+    """Resolve total capital for sizing target positions.
+
+    Priority:
+        1. portfolio_context.account.total_asset (real trading, from /v1/balance)
+        2. ROBOT_TARGET_CAPITAL env (sim mode, explicit)
+
+    No silent default — missing capital must fail loudly.
+    """
+    if portfolio_context is not None:
+        acct = getattr(portfolio_context, "account", None)
+        if acct is not None and not acct.empty and "total_asset" in acct.columns:
+            try:
+                val = pd.to_numeric(acct["total_asset"].iloc[0], errors="coerce")
+                if math.isfinite(val) and val > 0:
+                    return float(val)
+            except Exception:
+                pass
+    cap_env = os.environ.get("ROBOT_TARGET_CAPITAL", "").strip()
+    if not cap_env:
+        raise ValueError(
+            "_resolve_capital: cannot resolve capital. Real trading needs "
+            "portfolio_context.account.total_asset>0 (check ORDER_GATEWAY_URL "
+            "and /v1/balance). Sim mode needs ROBOT_TARGET_CAPITAL env set."
+        )
+    try:
+        cap = float(cap_env)
+    except ValueError:
+        raise ValueError(f"ROBOT_TARGET_CAPITAL={cap_env!r} is not a number")
+    if cap <= 0:
+        raise ValueError(f"ROBOT_TARGET_CAPITAL must be > 0, got {cap}")
+    return cap
+
+
+def _resolve_price(code6: str, row, latest_prices: dict, default_price: float) -> float:
+    """Per-stock price for sizing. Priority:
+        1. latest_prices[code6] (engine realtime tick from portfolio_context.meta)
+        2. row.last_price / close / adj_close (daily_basic merge)
+        3. default_price fallback
+    """
+    price = latest_prices.get(code6, 0.0)
+    if price > 0:
+        return float(price)
+    price_raw = row.get("last_price", row.get("close", row.get("adj_close", default_price)))
+    try:
+        price = float(price_raw)
+    except Exception:
+        price = default_price
+    if not math.isfinite(price) or price <= 0:
+        price = default_price
+    return price
+
+
 def _target_orders(scored: pd.DataFrame, portfolio_context) -> pd.DataFrame:
-    capital = float(os.environ.get("ROBOT_TARGET_CAPITAL", "100000"))
+    capital = _resolve_capital(portfolio_context)
     max_orders = int(os.environ.get("ROBOT_MAX_ORDERS", "10"))
     default_price = float(os.environ.get("ROBOT_DEFAULT_PRICE", "10"))
     strategy = os.environ.get("ROBOT_STRATEGY_NAME", "robot_model")
     meta = getattr(portfolio_context, "meta", {}) if portfolio_context is not None else {}
+    latest_prices = meta.get("latest_prices") or {}
     current = _current_positions(portfolio_context)
     rows = []
     active = scored[scored["position"] != 0.0].copy()
     active["_abs_position"] = active["position"].abs()
     active = active.sort_values(["_abs_position", "pred"], ascending=[False, False]).head(max_orders)
 
+    missing_price_codes = []
     for _, row in active.iterrows():
         code6 = str(row["_code6"]).zfill(6)
-        price_raw = row.get("last_price", row.get("close", row.get("adj_close", default_price)))
-        try:
-            price = float(price_raw)
-        except Exception:
-            price = default_price
-        if not math.isfinite(price) or price <= 0:
-            price = default_price
+        price = _resolve_price(code6, row, latest_prices, default_price)
+        if code6 not in latest_prices:
+            missing_price_codes.append(code6)
 
         target_value = max(float(row["position"]), 0.0) * capital
         target_volume = _round_lot(target_value / price)
@@ -260,6 +311,12 @@ def _target_orders(scored: pd.DataFrame, portfolio_context) -> pd.DataFrame:
             "target_volume": int(target_volume),
             "current_volume": int(current_volume),
         })
+    if missing_price_codes:
+        print(
+            f"[robot-inference] WARN: {len(missing_price_codes)} stocks missing "
+            f"realtime tick (using daily_basic fallback). sample: "
+            f"{missing_price_codes[:5]}"
+        )
     return pd.DataFrame(rows)
 
 

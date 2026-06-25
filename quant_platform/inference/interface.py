@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -145,27 +148,72 @@ def compute_trading_universe(
 def compute_index_composition(
     daily_basic_df: Optional[pd.DataFrame],
     extra_fields: Optional[dict[str, Any]] = None,
+    trading_day: Optional[str] = None,
+    idx_cons_cache=None,
 ) -> pd.DataFrame:
     """Compute per-stock index composition data passed to inference.
 
-    If ``extra_fields["idx_cons_df"]`` is provided (from IdxConsCache), builds
-    a per-stock frame with index membership flags.  Otherwise returns empty.
+    Output columns (wide format):
+        ID_QI, SECURITY_ID (merged from daily_basic),
+        in_idx_{INDEX_CODE} (bool), weight_{INDEX_CODE} (float)
 
-    Expected idx_cons_df columns: INDEX_ID, INDEX_CODE, STOCK_ID, ID_QI, ...
+    Two data sources:
+        1. (Preferred) idx_cons_cache.get_by_date(trading_day) - OSS first,
+           MySQL fallback, supports any historical trading day
+        2. (Legacy) extra_fields["idx_cons_df"] - pre-loaded df
+
+    Expected idx_cons_df columns: INDEX_ID, INDEX_CODE, ID_QI, ...
+    Optional weight column (from OSS composition.parquet).
+
+    Args:
+        daily_basic_df:  当日基础数据(用于补全 SECURITY_ID)
+        extra_fields:    额外字段(含 idx_cons_df 或保留兼容旧接口)
+        trading_day:     交易日 YYYYMMDD(用于按日切片缓存)
+        idx_cons_cache:  IdxConsCache 实例(优先使用,按交易日查询)
     """
-    extra_fields = extra_fields or {}
-    idx_cons_df = extra_fields.get("idx_cons_df")
+    # 优先从 cache 按 trading_day 取(支持历史回测)
+    idx_cons_df: Optional[pd.DataFrame] = None
+    if idx_cons_cache is not None and trading_day:
+        idx_cons_df = idx_cons_cache.get_by_date(trading_day)
+    if idx_cons_df is None or idx_cons_df.empty:
+        # Fallback: 旧接口 extra_fields["idx_cons_df"]
+        idx_cons_df = (extra_fields or {}).get("idx_cons_df")
     if idx_cons_df is None or idx_cons_df.empty:
         return pd.DataFrame()
 
-    # Build a wide DataFrame: one row per stock (ID_QI), one boolean column per index
-    result = idx_cons_df[["ID_QI", "INDEX_ID"]].copy()
-    result["in_index"] = True
-    wide = result.pivot_table(
-        index="ID_QI", columns="INDEX_ID", values="in_index", fill_value=False,
+    # ID_QI 标准化
+    idx_cons_df = idx_cons_df.copy()
+    if "ID_QI" in idx_cons_df.columns:
+        idx_cons_df["ID_QI"] = idx_cons_df["ID_QI"].astype(str).str.zfill(6)
+
+    # 决定用什么列做 pivot 的 columns:
+    #   - 新数据(含 INDEX_CODE): 用 TICKER 代码("000300")
+    #   - 旧数据(只有 INDEX_ID): 用 SECURITY_ID(1782)
+    if "INDEX_CODE" in idx_cons_df.columns and idx_cons_df["INDEX_CODE"].notna().any():
+        col_key = "INDEX_CODE"
+    else:
+        col_key = "INDEX_ID"
+
+    has_weight = "weight" in idx_cons_df.columns and idx_cons_df["weight"].notna().any()
+
+    # 长表 → 宽表:每个指数一列 in_idx_{code},可选 weight_{code}
+    # 用 crosstab 做 membership 矩阵
+    membership = pd.crosstab(
+        idx_cons_df["ID_QI"], idx_cons_df[col_key]
     ).astype(bool)
-    wide.columns = [f"in_idx_{c}" for c in wide.columns]
-    wide = wide.reset_index()
+    membership.columns = [f"in_idx_{c}" for c in membership.columns]
+    wide = membership.reset_index()
+
+    if has_weight:
+        # weight 列单独 pivot(同一 ID_QI 在不同 INDEX_CODE 有不同权重)
+        if "weight" in idx_cons_df.columns:
+            weight_wide = idx_cons_df.pivot_table(
+                index="ID_QI", columns=col_key,
+                values="weight", fill_value=0.0,
+            )
+            weight_wide.columns = [f"weight_{c}" for c in weight_wide.columns]
+            weight_wide = weight_wide.reset_index()
+            wide = wide.merge(weight_wide, on="ID_QI", how="left")
 
     # Merge SECURITY_ID from daily_basic if available
     if daily_basic_df is not None and not daily_basic_df.empty:
@@ -237,3 +285,161 @@ def call_inference(
         kwargs["portfolio_context"] = portfolio_context
 
     return inference_fn(*base_args, *extra_args, **kwargs)
+
+
+def positions_to_orders(
+    positions_df: pd.DataFrame,
+    portfolio_context: Optional["PortfolioContext"],
+    daily_basic_df: Optional[pd.DataFrame] = None,
+    *,
+    price_type: str = "latest",
+    strategy: str = "open_position",
+    note: str = "",
+    total_capital_override: Optional[float] = None,
+) -> pd.DataFrame:
+    """Convert position-fraction output to order rows ready for order-gateway.
+
+    The existing inference module typically outputs a `position` column as a
+    weight/fraction (e.g. 0.02 = 2% of capital). This helper turns that into
+    concrete share volumes:
+
+        volume = floor(total_capital * position / price / 100) * 100
+
+    Price resolution order:
+        1. portfolio_context.meta['latest_prices']  (engine realtime tick,
+           injected by NativeEngine._snapshot_latest_prices at fork time)
+        2. portfolio_context.positions.last_price (broker)
+        3. rows with no price dropped — NO yesterday-close fallback
+
+    Total capital resolution order:
+        1. total_capital_override (caller-supplied, takes full responsibility)
+        2. portfolio_context.account.total_asset (real trading, must be > 0)
+        3. Sim mode ONLY: requires OPEN_POSITION_SIM_MODE=1 AND
+           OPEN_POSITION_TOTAL_CAPITAL=<explicit amount>. No silent default.
+
+    Args:
+        positions_df: Output of inference; must contain `code` and `position`.
+        portfolio_context: Account/positions snapshot from order-gateway.
+        daily_basic_df: Unused (kept for signature compatibility).
+        price_type, strategy, note: Order row metadata.
+        total_capital_override: Force a specific capital amount.
+
+    Returns:
+        DataFrame with columns [code, side, volume, price_type, strategy, note]
+        consumed by `_build_order_gateway_orders` in native_engine.py.
+    """
+    import math
+    import os
+
+    if positions_df is None or positions_df.empty:
+        return pd.DataFrame()
+    if "position" not in positions_df.columns:
+        raise ValueError(
+            "positions_to_orders: positions_df missing 'position' column; "
+            f"got {list(positions_df.columns)}"
+        )
+
+    df = positions_df.copy()
+    if "code" not in df.columns:
+        df["code"] = df.get("symbol", "")
+
+    # ── total capital ───────────────────────────────────────────────
+    # Resolve total capital. NO silent fallback — ambiguous capital is dangerous.
+    #
+    # Real trading: portfolio_context.account.total_asset must be > 0.
+    # Sim mode:     must explicitly set OPEN_POSITION_SIM_MODE=1 AND
+    #               OPEN_POSITION_TOTAL_CAPITAL=<amount> (no implicit default).
+    #
+    # total_capital_override always wins (caller takes responsibility).
+    total_capital = 0.0
+    if total_capital_override is not None and total_capital_override > 0:
+        total_capital = float(total_capital_override)
+    elif portfolio_context is not None:
+        acct = getattr(portfolio_context, "account", None)
+        if acct is not None and not acct.empty:
+            for col in ("total_asset", "available_cash", "market_value"):
+                if col in acct.columns:
+                    val = pd.to_numeric(acct[col].iloc[0], errors="coerce")
+                    if math.isfinite(val) and val > 0:
+                        total_capital = float(val)
+                        break
+
+    if total_capital <= 0:
+        sim_mode = os.environ.get("OPEN_POSITION_SIM_MODE", "0").strip() in ("1", "true", "True", "yes")
+        sim_cap = os.environ.get("OPEN_POSITION_TOTAL_CAPITAL", "").strip()
+        if sim_mode and sim_cap:
+            try:
+                total_capital = float(sim_cap)
+            except ValueError:
+                total_capital = 0.0
+        if total_capital <= 0:
+            raise ValueError(
+                "positions_to_orders: cannot resolve total_capital. "
+                "Real trading: ensure portfolio_context.account.total_asset > 0 "
+                "(check ORDER_GATEWAY_URL / /v1/balance). "
+                "Sim mode: set OPEN_POSITION_SIM_MODE=1 AND "
+                "OPEN_POSITION_TOTAL_CAPITAL=<amount> explicitly."
+            )
+        logger.warning(
+            "positions_to_orders: SIM MODE active, total_capital=%.0f from env",
+            total_capital)
+
+    # ── price per stock ─────────────────────────────────────────────
+    prices = pd.Series(0.0, index=df.index)
+
+    # Source 1: engine realtime tick (preferred at 9:30)
+    if portfolio_context is not None:
+        meta_prices = (portfolio_context.meta or {}).get("latest_prices") or {}
+        if meta_prices:
+            prices = df["code"].astype(str).map(meta_prices).fillna(0.0)
+
+    # Source 2: broker positions last_price
+    if (prices <= 0).any() and portfolio_context is not None:
+        pos = getattr(portfolio_context, "positions", None)
+        if pos is not None and not pos.empty and "last_price" in pos.columns \
+                and "code" in pos.columns:
+            price_map = (
+                pos[["code", "last_price"]]
+                .dropna()
+                .set_index("code")["last_price"]
+                .astype(float)
+            )
+            prices = prices.where(prices > 0, df["code"].map(price_map).fillna(0.0))
+    # No yesterday-close fallback — at 9:30 realtime tick must be available
+    df["_price"] = prices.astype(float)
+    dropped = (df["_price"] <= 0).sum()
+    if dropped > 0:
+        logger.warning(
+            "positions_to_orders: dropped %d rows with no realtime price "
+            "(check portfolio_context.meta['latest_prices'])", dropped)
+    df = df[df["_price"] > 0]
+    if df.empty:
+        return pd.DataFrame()
+
+    # ── target volume ───────────────────────────────────────────────
+    # position can be + (long) or - (short); size off absolute weight,
+    # then derive side from sign.
+    df["_position_num"] = pd.to_numeric(df["position"], errors="coerce").fillna(0.0)
+    df["target_value"] = total_capital * df["_position_num"].abs()
+    df["_raw_vol"] = df["target_value"] / df["_price"]
+    df["volume"] = (df["_raw_vol"] // 100).astype(int) * 100
+    df = df[df["volume"] > 0]
+    if df.empty:
+        return pd.DataFrame()
+
+    # side from sign(position): + → buy, − → sell
+    df["side"] = df["_position_num"].apply(
+        lambda p: "buy" if p > 0 else ("sell" if p < 0 else "")
+    )
+    df = df[df["side"] != ""]
+
+    out = pd.DataFrame({
+        "code": df["code"].astype(str),
+        "side": df["side"],
+        "volume": df["volume"].astype(int),
+        "price_type": price_type,
+        "strategy": strategy,
+        "note": note,
+    })
+    return out.reset_index(drop=True)
+

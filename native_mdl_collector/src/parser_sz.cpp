@@ -25,7 +25,7 @@ using namespace schema;
 //   - Has Channel (ChannelNo)
 //   - TotalAskVolume = TotalOfferQty (i64, not MDLDoubleT)
 
-ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len, std::int64_t seq_id) {
+ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len, std::int64_t seq_id, double recv_sec) {
     ParseResult result;
     result.kind = DataKind::Tick;
     result.row.resize(kTickCols, 0.0);
@@ -47,7 +47,7 @@ ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len, std::int64_
     // Time
     double time_sec = mdl_time_to_seconds(msg->UpdateTime.m_Value);
     result.row[tick::Time]       = time_sec;
-    result.row[tick::UpdateTime] = time_sec;
+    result.row[tick::UpdateTime] = recv_sec;
 
     // Channel
     result.row[tick::Channel] = static_cast<double>(msg->ChannelNo);
@@ -102,7 +102,7 @@ ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len, std::int64_
 // OrdType: 49→1(limit), 50→2(market), 85→3(best), else→0
 // SeqNum = ApplSeqNum
 
-ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len) {
+ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len, double recv_sec) {
     ParseResult result;
     result.kind = DataKind::Order;
     result.row.resize(kOrderCols, 0.0);
@@ -113,6 +113,7 @@ ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len) {
 
     const auto* msg = reinterpret_cast<const mdl_szl2_msg::Order300192_v2*>(msg_data);
 
+    // Filter: only stocks
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
     if (!is_stock_sz(code_raw, code_len)) {
@@ -140,7 +141,7 @@ ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len) {
     }
 
     result.row[order::Time]      = time_sec;
-    result.row[order::UpdateTime] = time_sec;
+    result.row[order::UpdateTime] = recv_sec;
     result.row[order::OrderID]   = static_cast<double>(msg->ApplSeqNum);
     result.row[order::Side]      = static_cast<double>(side);
     result.row[order::Price]     = mdl_double_to_f64(msg->Price.m_Value, 4);
@@ -162,7 +163,7 @@ ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len) {
 // Money = LastPx × LastQty
 // SaleOrderID = OfferApplSeqNum, BuyOrderID = BidApplSeqNum
 
-ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len) {
+ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len, double recv_sec) {
     ParseResult result;
     result.kind = DataKind::Deal;
     result.row.resize(kDealCols, 0.0);
@@ -173,6 +174,7 @@ ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len) {
 
     const auto* msg = reinterpret_cast<const mdl_szl2_msg::Transaction300191_v2*>(msg_data);
 
+    // Filter: only stocks
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
     if (!is_stock_sz(code_raw, code_len)) {
@@ -192,7 +194,7 @@ ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len) {
     if (msg->ExecType == 52) side = 4;
 
     result.row[deal::Time]        = time_sec;
-    result.row[deal::UpdateTime]   = time_sec;
+    result.row[deal::UpdateTime]   = recv_sec;
     result.row[deal::SaleOrderID]  = static_cast<double>(sell_id);
     result.row[deal::BuyOrderID]   = static_cast<double>(buy_id);
     result.row[deal::Side]         = static_cast<double>(side);

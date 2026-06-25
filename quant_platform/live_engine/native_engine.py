@@ -50,6 +50,7 @@ from ..data.native_shm_reader import (
     KIND_TICK, KIND_ORDER, KIND_DEAL, COLS_BY_KIND, SHM_HEADER_SIZE,
 )
 from ..data.mysql_loader import DailyBasicCache, IdxConsCache
+from ..data.oss_loader import OSSDataLoader
 from ..factor.base import StockData, StockState
 from ..inference.interface import (
     build_trading_universe_df,
@@ -521,6 +522,18 @@ class NativeEngine:
                     logger.warning("[native] failed to resolve factor market_count, fallback to 1: %s", exc)
 
         self._daily_cache = DailyBasicCache(market_count=market_count)
+        # 初始化 OSS loader 并传给 cache (优先 OSS,fallback MySQL)
+        oss_loader = None
+        if os.environ.get("OSS_ACCESS_KEY_ID") and os.environ.get("OSS_ACCESS_KEY_SECRET"):
+            try:
+                oss_loader = OSSDataLoader()
+                self._daily_cache._oss_loader = oss_loader
+            except Exception as exc:
+                logger.warning(
+                    "[native] OSSDataLoader init failed in _load_daily_basic (MySQL fallback): %s",
+                    exc,
+                )
+        # 走 OSS-first 路径
         self._daily_cache.load(self.trading_day)
         market_df = self._daily_cache.get_daily_basic()
         market_df = _add_code_key(market_df)
@@ -618,16 +631,66 @@ class NativeEngine:
         return None
 
     def _load_idx_cons(self) -> None:
-        """Load index constituent data from MySQL at startup."""
-        index_ids_str = os.environ.get("IDX_CONS_IDS", "")
-        index_ids = [s.strip() for s in index_ids_str.split(",") if s.strip()]
-        if not index_ids:
-            logger.warning("[native] IDX_CONS_IDS not configured, skip idx_cons loading")
+        """Load index constituent data at startup.
+
+        优先使用 IDX_CONS_CODES (TICKER 代码如 "000300,000905"),
+        向后兼容 IDX_CONS_IDS (SECURITY_ID 数字)。
+        数据源优先级:OSS composition.parquet > MySQL 直查(含日期)。
+        """
+        codes_str = os.environ.get("IDX_CONS_CODES", "")
+        if not codes_str:
+            # 向后兼容:把 IDX_CONS_IDS 映射回 TICKER
+            legacy_ids = os.environ.get("IDX_CONS_IDS", "")
+            codes_str = self._legacy_ids_to_codes(legacy_ids)
+
+        codes = [s.strip() for s in codes_str.split(",") if s.strip()]
+        if not codes:
+            logger.warning(
+                "[native] IDX_CONS_CODES / IDX_CONS_IDS 均未配置,跳过 idx_cons 加载"
+            )
             return
-        self._idx_cons_cache = IdxConsCache(index_ids=index_ids)
-        if self._idx_cons_cache.load():
-            self._idx_cons_df = self._idx_cons_cache.get_idx_cons()
-        logger.info("[native] idx_cons: %d rows loaded", len(self._idx_cons_df))
+
+        # 懒加载 OSSDataLoader (读取 composition.parquet 优先,失败 fallback MySQL)
+        oss_loader = None
+        if os.environ.get("OSS_ACCESS_KEY_ID") and os.environ.get("OSS_ACCESS_KEY_SECRET"):
+            try:
+                oss_loader = OSSDataLoader()
+            except Exception as exc:
+                logger.warning("[native] OSSDataLoader init failed (MySQL fallback): %s", exc)
+
+        self._idx_cons_cache = IdxConsCache(
+            index_codes=codes,
+            oss_loader=oss_loader,
+        )
+        # 启动时预加载当天数据(填充缓存,避免首轮推理时延迟)
+        self._idx_cons_df = self._idx_cons_cache.get_by_date(self.trading_day)
+        logger.info(
+            "[native] idx_cons: %d rows loaded for trading_day=%s (codes=%s)",
+            len(self._idx_cons_df), self.trading_day, codes,
+        )
+
+    @staticmethod
+    def _legacy_ids_to_codes(ids: str) -> str:
+        """IDX_CONS_IDS(SECURITY_ID) → IDX_CONS_CODES(TICKER) 映射,向后兼容。
+
+        1782=沪深300, 2103=中证500, 33736=中证1000,
+        3800=中证全指, 1200245=中证2000
+        """
+        if not ids:
+            return ""
+        mapping = {
+            "1782": "000300",
+            "2103": "000905",
+            "33736": "000852",
+            "3800": "000985",
+            "1200245": "932000",
+        }
+        out = []
+        for s in ids.split(","):
+            s = s.strip()
+            if s and s in mapping:
+                out.append(mapping[s])
+        return ",".join(out)
 
     def _scan_shm_files(self) -> Dict[str, Dict[int, str]]:
         """Scan SHM directory, return {code: {kind: path}}.
@@ -781,6 +844,28 @@ class NativeEngine:
             )
 
         return dirty_codes, {code: copy.copy(self._states[code]) for code in dirty_codes}
+
+    def _snapshot_latest_prices(self) -> dict:
+        """Snapshot {code: latest_price} from in-memory states (realtime tick).
+
+        Used to augment portfolio_context.meta['latest_prices'] so open_position
+        inference at 9:30 can size orders off live tick prices instead of
+        yesterday close. Returns {} if states are empty.
+
+        Takes a shallow copy of self._states first to avoid
+        "dictionary changed size during iteration" if the minute schedule
+        (running in parallel under _compute_lock) inserts new codes.
+        """
+        out: dict = {}
+        # GIL makes dict() copy atomic-ish; iteration then runs on private copy
+        for code, st in dict(self._states).items():
+            try:
+                p = getattr(st, "latest_price", 0.0)
+            except Exception:
+                continue
+            if p and float(p) > 0:
+                out[code] = float(p)
+        return out
 
     @staticmethod
     def _update_tick_vectorized(state: StockState, arr: np.ndarray) -> None:
@@ -1044,7 +1129,7 @@ class NativeEngine:
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
                 "epoch_us(x.Time) AS Time",
-                "(epoch_us(x.UpdateTime) - epoch_us(x.Time)) AS UpdateTime",
+                "epoch_us(x.UpdateTime) AS UpdateTime",
                 "x.OrderID::INTEGER AS OrderID",
                 "x.Side::TINYINT AS Side",
                 "ROUND(x.Price * 100)::INTEGER AS Price",
@@ -1056,7 +1141,7 @@ class NativeEngine:
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
                 "epoch_us(x.Time) AS Time",
-                "(epoch_us(x.UpdateTime) - epoch_us(x.Time)) AS UpdateTime",
+                "epoch_us(x.UpdateTime) AS UpdateTime",
                 "x.SaleOrderID::BIGINT AS SaleOrderID",
                 "x.BuyOrderID::BIGINT AS BuyOrderID",
                 "x.Side::TINYINT AS Side",
@@ -1068,7 +1153,7 @@ class NativeEngine:
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
                 "epoch_us(x.Time) AS Time",
-                "(epoch_us(x.UpdateTime) - epoch_us(x.Time)) AS UpdateTime",
+                "epoch_us(x.UpdateTime) AS UpdateTime",
                 "ROUND(x.CurrentPrice * 100)::INTEGER AS CurrentPrice",
                 "x.TotalVolume::BIGINT AS TotalVolume",
             ]
@@ -1182,7 +1267,7 @@ class NativeEngine:
 
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         lock = (self._daily_position_lock
-                if (schedule is not None and schedule.name == "daily_position")
+                if (schedule is not None and schedule.name in ("daily_position", "open_position"))
                 else self._compute_lock)
         try:
             with lock:
@@ -1201,6 +1286,21 @@ class NativeEngine:
         use_daily_module = is_daily or (
             schedule is not None and getattr(schedule, 'use_daily_factor_module', False))
         is_daily_worker = use_daily_module  # worker call signature: daily=single-code, minute=batch
+
+        # open_position: skip factor compute entirely, use prev_day_factors directly
+        if schedule is not None and getattr(schedule, 'skip_factor_compute', False):
+            date_str = self.trading_day
+            prev = self._prev_day_factors
+            if prev is None or prev.empty:
+                logger.error("[open_position] prev_day_factors empty, skip %s",
+                             schedule.name)
+                return
+            logger.info("[open_position] %s using prev_day_factors: %d rows",
+                        schedule.name, len(prev))
+            results = prev.to_dict("records")
+            self._write_results(results, date_str, "", schedule=schedule)
+            return
+
         # daily_result and daily_position are triggered by time_trigger (precise
         # time point) so skip trading-hours check; only minute needs the guard.
         if not is_daily and not use_daily_module and not _is_trading_hours():
@@ -1456,6 +1556,13 @@ class NativeEngine:
                             portfolio_context = None
                             if portfolio_context_fn is not None:
                                 portfolio_context = portfolio_context_fn(date_str, rt_end_time)
+                            # Augment with engine realtime tick prices (latest_price
+                            # from shm sync). Used by open_position at 9:30 to size
+                            # orders off live tick instead of daily_basic.close.
+                            if portfolio_context is not None:
+                                lp = self._snapshot_latest_prices()
+                                if lp:
+                                    portfolio_context.meta["latest_prices"] = lp
                             universe_extra = {
                                 "date": date_str,
                                 "end_time": rt_end_time,
@@ -1470,7 +1577,9 @@ class NativeEngine:
                                 tu_df = compute_trading_universe(
                                     daily_basic_df, universe_extra)
                             idx_comp_df = compute_index_composition(
-                                daily_basic_df, universe_extra)
+                                daily_basic_df, universe_extra,
+                                trading_day=date_str,
+                                idx_cons_cache=self._idx_cons_cache)
                             positions_df = call_inference(
                                 inference_fn,
                                 date_str,
@@ -1530,6 +1639,18 @@ class NativeEngine:
         self.trading_day = today.strftime("%Y%m%d")
         logger.info("[native] starting with trading_day=%s, shm_dir=%s",
                      self.trading_day, self.shm_dir)
+
+        # Pod startup data refresh: proactively generate T-1 and T-0 daily_basic +
+        # composition parquet and upload to OSS (matches deeptrade Go pipeline).
+        # Failures here must not block startup — MySQL fallback covers _load_*.
+        try:
+            from quant_platform.data.data_refresh import refresh_pod_startup
+            refresh_pod_startup(self.trading_day)
+        except Exception as exc:
+            logger.error(
+                "[native] pod startup data refresh failed (continue with fallback): %s",
+                exc, exc_info=True,
+            )
 
         # Load daily basic
         self._load_daily_basic()
