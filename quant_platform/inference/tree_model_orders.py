@@ -11,8 +11,9 @@ This module exposes ``inference`` that:
     2. Converts position fractions to share volumes using
        :func:`quant_platform.inference.interface.positions_to_orders` with
        total capital from ``portfolio_context.account.total_asset`` (real) or
-       ``TREE_MODEL_TARGET_CAPITAL`` env (sim), and price from
-       ``portfolio_context.meta['latest_prices']`` (9:30 realtime tick).
+       ``OPEN_POSITION_SIM_MODE=1`` + ``OPEN_POSITION_TOTAL_CAPITAL=<amount>``
+       env (sim), and price from ``portfolio_context.meta['latest_prices']``
+       (9:30 realtime tick).
 
 Configure via:
     INFERENCE_MODULE=quant_platform.inference.tree_model_orders

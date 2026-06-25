@@ -296,14 +296,29 @@ def positions_to_orders(
     strategy: str = "open_position",
     note: str = "",
     total_capital_override: Optional[float] = None,
+    delta_mode: str = "auto",
 ) -> pd.DataFrame:
     """Convert position-fraction output to order rows ready for order-gateway.
 
-    The existing inference module typically outputs a `position` column as a
-    weight/fraction (e.g. 0.02 = 2% of capital). This helper turns that into
-    concrete share volumes:
+    The inference module outputs a `position` column as a TARGET weight/fraction
+    (e.g. 0.02 = 2% of capital). This helper turns target weights into order
+    rows. By default (delta_mode="auto") it computes deltas against current
+    holdings so rebalancing doesn't double-buy existing positions:
 
-        volume = floor(total_capital * position / price / 100) * 100
+        current_weight[code] = (held_volume * price) / total_capital
+        delta_weight = target_weight - current_weight
+        volume = floor(|delta_weight| * total_capital / price / 100) * 100
+        side = buy if delta_weight > 0 else sell
+
+    delta_mode:
+        "auto"     — delta if portfolio_context.positions non-empty, else absolute
+        "delta"    — always delta (requires positions; missing → treat as 0)
+        "absolute" — treat position column as the desired trade itself
+                     (current behavior; for fresh-deploy sim with no positions)
+
+    volume formula (target → shares):
+
+        volume = floor(total_capital * |weight| / price / 100) * 100
 
     Price resolution order:
         1. portfolio_context.meta['latest_prices']  (engine realtime tick,
@@ -385,26 +400,40 @@ def positions_to_orders(
             total_capital)
 
     # ── price per stock ─────────────────────────────────────────────
+    # Code format mismatch risk: engine _snapshot_latest_prices keys by full
+    # format ("000001.XSHE"), tree_model_orders normalizes to 6-digit
+    # ("000001"), broker positions may use either. Normalize both sides to
+    # 6-digit for lookup so price maps always hit regardless of source format.
+    def _norm_code6(c) -> str:
+        s = str(c).strip().upper()
+        # strip .SH / .SZ / .XSHG / .XSHE suffix
+        for suf in (".XSHE", ".XSHG", ".SH", ".SZ"):
+            if s.endswith(suf):
+                s = s[: -len(suf)]
+                break
+        return s.zfill(6)
+
     prices = pd.Series(0.0, index=df.index)
+    df["_code6"] = df["code"].astype(str).map(_norm_code6)
+    code6 = df["_code6"]
 
     # Source 1: engine realtime tick (preferred at 9:30)
     if portfolio_context is not None:
         meta_prices = (portfolio_context.meta or {}).get("latest_prices") or {}
         if meta_prices:
-            prices = df["code"].astype(str).map(meta_prices).fillna(0.0)
+            price_map_6 = {_norm_code6(k): float(v) for k, v in meta_prices.items()}
+            prices = code6.map(price_map_6).fillna(0.0)
 
     # Source 2: broker positions last_price
     if (prices <= 0).any() and portfolio_context is not None:
         pos = getattr(portfolio_context, "positions", None)
         if pos is not None and not pos.empty and "last_price" in pos.columns \
                 and "code" in pos.columns:
-            price_map = (
-                pos[["code", "last_price"]]
-                .dropna()
-                .set_index("code")["last_price"]
-                .astype(float)
-            )
-            prices = prices.where(prices > 0, df["code"].map(price_map).fillna(0.0))
+            pos_c6 = pos["code"].astype(str).map(_norm_code6)
+            broker_map = pd.Series(
+                pos["last_price"].astype(float).values, index=pos_c6
+            ).dropna()
+            prices = prices.where(prices > 0, code6.map(broker_map).fillna(0.0))
     # No yesterday-close fallback — at 9:30 realtime tick must be available
     df["_price"] = prices.astype(float)
     dropped = (df["_price"] <= 0).sum()
@@ -416,20 +445,114 @@ def positions_to_orders(
     if df.empty:
         return pd.DataFrame()
 
-    # ── target volume ───────────────────────────────────────────────
-    # position can be + (long) or - (short); size off absolute weight,
-    # then derive side from sign.
+    # ── target vs delta weight ─────────────────────────────────────
+    # Default: delta against current holdings so rebalancing doesn't
+    # double-buy existing positions. Inference `position` is the TARGET
+    # weight; current_weight is computed from broker positions; trade the
+    # delta.
     df["_position_num"] = pd.to_numeric(df["position"], errors="coerce").fillna(0.0)
-    df["target_value"] = total_capital * df["_position_num"].abs()
+    df["_weight"] = df["_position_num"]  # target weight, signed
+    df["_current_weight"] = 0.0  # default; overwritten if delta resolves
+
+    positions_df_pos = (
+        getattr(portfolio_context, "positions", None)
+        if portfolio_context is not None else None
+    )
+    has_positions = (
+        positions_df_pos is not None and not positions_df_pos.empty
+        and "code" in positions_df_pos.columns
+    )
+
+    if delta_mode == "auto":
+        use_delta = has_positions
+    elif delta_mode == "delta":
+        use_delta = True
+    elif delta_mode == "absolute":
+        use_delta = False
+    else:
+        raise ValueError(
+            f"positions_to_orders: delta_mode must be 'auto'|'delta'|'absolute', "
+            f"got {delta_mode!r}"
+        )
+
+    # Build {code6: current_weight}. current_weight uses the same price
+    # source (meta latest_prices preferred, broker last_price fallback)
+    # so the comparison is consistent with the order price.
+    if use_delta and has_positions:
+        pos = positions_df_pos
+        vol_col = next(
+            (c for c in (
+                "volume", "total_qty", "qty", "quantity", "position_volume"
+            ) if c in pos.columns),
+            None,
+        )
+        if vol_col is None:
+            logger.warning(
+                "positions_to_orders: delta_mode needs positions volume "
+                "column (volume/total_qty/qty/quantity/position_volume); "
+                "falling back to absolute"
+            )
+        else:
+            pos_c6 = pos["code"].astype(str).map(_norm_code6)
+            pos_vol = pd.to_numeric(pos[vol_col], errors="coerce").fillna(0.0)
+            # Price for current holdings: prefer broker last_price
+            pos_price = pd.Series(0.0, index=pos.index)
+            if "last_price" in pos.columns:
+                pos_price = pd.to_numeric(
+                    pos["last_price"], errors="coerce"
+                ).fillna(0.0)
+            # Override with engine realtime tick where available (consistent
+            # with the price used for sizing the new order)
+            if portfolio_context is not None:
+                meta_prices = (
+                    (portfolio_context.meta or {}).get("latest_prices") or {}
+                )
+                if meta_prices:
+                    price_map_6 = {
+                        _norm_code6(k): float(v)
+                        for k, v in meta_prices.items()
+                    }
+                    tick_price = pos_c6.map(price_map_6).fillna(0.0)
+                    pos_price = pos_price.where(pos_price > 0, tick_price)
+            held_value = (pos_vol * pos_price).where(pos_price > 0, 0.0)
+            current_weight = (
+                pd.Series(held_value.values, index=pos_c6) / total_capital
+            )
+            # Aggregate duplicate codes (multiple rows per code possible)
+            current_weight = current_weight.groupby(level=0).sum()
+            df["_current_weight"] = (
+                df["_code6"].map(current_weight).fillna(0.0)
+            )
+
+    # delta_weight: + → buy, − → sell
+    df["_delta_weight"] = df["_weight"] - df["_current_weight"]
+
+    # ── target volume ───────────────────────────────────────────────
+    # Size off |delta_weight|; round_down to 100 shares.
+    df["target_value"] = total_capital * df["_delta_weight"].abs()
     df["_raw_vol"] = df["target_value"] / df["_price"]
     df["volume"] = (df["_raw_vol"] // 100).astype(int) * 100
+
+    # Cap sell volume at held volume (delta_mode only). A-share T+1 + no
+    # shorting means a sell exceeding holdings is invalid; clamp to held
+    # qty (rounded down to 100) and drop the row if it rounds to 0.
+    if use_delta and has_positions:
+        held_shares = (
+            df["_current_weight"] * total_capital / df["_price"]
+        ).fillna(0.0)
+        held_vol = (held_shares // 100).astype(int) * 100
+        sell_mask = df["_delta_weight"] < 0
+        df.loc[sell_mask, "volume"] = df.loc[sell_mask, "volume"].clip(
+            upper=held_vol.loc[sell_mask]
+        )
+
     df = df[df["volume"] > 0]
     if df.empty:
         return pd.DataFrame()
 
-    # side from sign(position): + → buy, − → sell
-    df["side"] = df["_position_num"].apply(
-        lambda p: "buy" if p > 0 else ("sell" if p < 0 else "")
+    # side from sign(delta_weight)
+    df["side"] = df["_delta_weight"].apply(
+        lambda w: "buy" if w > 0 else ("sell" if w < 0 else "")
     )
     df = df[df["side"] != ""]
 

@@ -9,6 +9,7 @@ __pycache__/
 *$py.class
 *.so
 !vendor/mdl-sdk/libs/linux/libmdl_api.so
+!quant_platform/inference/calc_predict_tree_model.so
 .Python
 *.egg-info/
 dist/
