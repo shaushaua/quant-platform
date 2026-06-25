@@ -561,6 +561,22 @@ def inference(
             sub = sub[sub["weight_000985"] > 0]
             if not sub.empty:
                 last_index_csi_all = sub.set_index("ID_QI")["weight_000985"]
+            # Melt wide → long so the .so (which expects INDEX_CODE/trade_date/
+            # weight columns) gets the same data shape as load_index_composition_from_oss.
+            # Without this, passing wide format causes KeyError 'INDEX_CODE' at
+            # predict_tree_model:2252 and passing None changes ~95% of positions.
+            weight_cols = [c for c in index_composition_df.columns if c.startswith("weight_")]
+            if weight_cols:
+                long_frames = []
+                for wc in weight_cols:
+                    code = wc[len("weight_"):]
+                    sub_l = index_composition_df[["ID_QI", wc]].rename(columns={wc: "weight"})
+                    sub_l = sub_l[sub_l["weight"].fillna(0) > 0]
+                    sub_l["INDEX_CODE"] = code
+                    long_frames.append(sub_l)
+                if long_frames:
+                    index_composition_df = pd.concat(long_frames, ignore_index=True)
+                    index_composition_df["trade_date"] = date_str
     signal_date = resolve_signal_date(
         daily_basic=daily_basic,
         trade_date=date_str,
