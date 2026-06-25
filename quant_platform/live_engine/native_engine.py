@@ -563,6 +563,89 @@ class NativeEngine:
             len(self._daily_basic_df), len(self._market_df), market_count,
         )
 
+    def _one_time_close_on_startup(self) -> None:
+        """Flatten all broker holdings once per trading day.
+
+        Triggered by env ONE_TIME_CLOSE_ON_STARTUP=1. Idempotent via
+        date-stamped flag file. Spawns a daemon thread that sleeps until
+        ONE_TIME_CLOSE_TRIGGER_TIME (default 09:15) then pulls broker
+        positions and pushes sell orders — pod may boot before broker ATX
+        is open, so the actual push is deferred to trading hours.
+        Used for sim reset only; production should leave this off.
+        """
+        if os.environ.get("ONE_TIME_CLOSE_ON_STARTUP", "0") != "1":
+            return
+        if self.portfolio_context_fn is None:
+            logger.warning("[one-time-close] portfolio_context_fn not loaded, skip")
+            return
+        trigger = os.environ.get("ONE_TIME_CLOSE_TRIGGER_TIME", "09:15")
+        try:
+            hh, mm = (int(x) for x in trigger.split(":"))
+        except Exception:
+            logger.warning("[one-time-close] bad ONE_TIME_CLOSE_TRIGGER_TIME=%r, using 09:15", trigger)
+            hh, mm = 9, 15
+        flag = f"/data/factors/{self.trading_day}_close_done.flag"
+        if os.path.exists(flag):
+            logger.info("[one-time-close] already done today (flag=%s), skip", flag)
+            return
+
+        def _run() -> None:
+            # Sleep until trigger time today
+            now = datetime.now()
+            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            wait_secs = (target - now).total_seconds()
+            if wait_secs > 0:
+                logger.info("[one-time-close] scheduled at %02d:%02d, waiting %.0fs",
+                            hh, mm, wait_secs)
+                time.sleep(wait_secs)
+            elif wait_secs < -600:
+                # Already past trigger by >10 min — likely late pod boot.
+                # Still attempt; broker may still be open.
+                logger.info("[one-time-close] trigger %02d:%02d already passed by %.0fs, running now",
+                            hh, mm, -wait_secs)
+            try:
+                ctx = self.portfolio_context_fn(self.trading_day, f"{hh:02d}{mm:02d}00")
+            except Exception as exc:
+                logger.error("[one-time-close] portfolio_context failed: %s", exc)
+                return
+            positions = getattr(ctx, "positions", None)
+            if positions is None or positions.empty:
+                logger.info("[one-time-close] no holdings, nothing to flatten")
+                _write_close_flag(flag)
+                return
+            if "available_volume" not in positions.columns:
+                logger.error("[one-time-close] positions missing available_volume: %s",
+                             list(positions.columns))
+                return
+            sellable = positions[positions["available_volume"].astype(int) > 0]
+            if sellable.empty:
+                logger.info("[one-time-close] %d holdings but 0 available (T+1 lock)",
+                            len(positions))
+                _write_close_flag(flag)
+                return
+            orders = pd.DataFrame({
+                "code": sellable["code"].astype(str).values,
+                "side": "sell",
+                "volume": sellable["available_volume"].astype(int).values,
+                "price_type": "latest",
+                "strategy": "one_time_close",
+                "note": f"one_time_close_{self.trading_day}_{hh:02d}{mm:02d}00",
+            })
+            csv_path = f"/data/factors/{self.trading_day}_{hh:02d}{mm:02d}00_close_orders.csv"
+            orders.to_csv(csv_path, index=False)
+            logger.info("[one-time-close] sellable=%d/%d, total_shares=%d, csv=%s",
+                        len(orders), len(positions), int(orders["volume"].sum()), csv_path)
+            try:
+                _push_to_order_gateway(orders, self.trading_day, f"{hh:02d}{mm:02d}00")
+                _write_close_flag(flag)
+                logger.info("[one-time-close] flatten pushed, flag written")
+            except Exception as exc:
+                logger.error("[one-time-close] push failed: %s", exc)
+
+        t = threading.Thread(target=_run, name="one-time-close", daemon=True)
+        t.start()
+        logger.info("[one-time-close] daemon thread started, trigger=%02d:%02d", hh, mm)
+
     def _load_prev_day_factors(self) -> None:
         """Load previous trading day's factor output for inference.
         Priority: OSS daily result > local CSV fallback.
@@ -1786,6 +1869,9 @@ class NativeEngine:
         self._schedules = build_schedules_from_env(self.factor_info)
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
+        # One-shot flatten at startup (sim reset; guarded by env + date flag)
+        self._one_time_close_on_startup()
+
         if self._raw_archive_enabled:
             self._archive_thread = threading.Thread(
                 target=self._archive_loop,
@@ -1964,6 +2050,16 @@ def _order_worker_loop(order_queue) -> None:
                 logger.error("[order-gateway] worker task failed: %s", exc, exc_info=True)
     finally:
         logger.info("[order-gateway] worker loop stopped")
+
+
+def _write_close_flag(path: str) -> None:
+    """Write the one-time-close completion flag (date-stamped)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"done at {datetime.now().isoformat()}\n")
+    except Exception as exc:
+        logger.warning("[one-time-close] flag write failed: %s", exc)
 
 
 def _push_to_order_gateway(orders_df: pd.DataFrame, date_str: str, end_time: str) -> None:

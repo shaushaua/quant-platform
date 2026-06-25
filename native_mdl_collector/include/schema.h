@@ -102,20 +102,6 @@ inline double mdl_double_to_f64(std::int64_t raw, std::uint32_t dec) {
     return static_cast<double>(raw) / std::pow(10.0, static_cast<double>(dec));
 }
 
-// ── Helper: stock filter ──
-inline bool is_stock_sh(const char* code, std::size_t len) {
-    if (len == 0) return false;
-    // Trim leading whitespace
-    while (len > 0 && (*code == ' ' || *code == '\0')) { ++code; --len; }
-    return len > 0 && (*code == '6' || *code == '9');
-}
-
-inline bool is_stock_sz(const char* code, std::size_t len) {
-    if (len == 0) return false;
-    while (len > 0 && (*code == ' ' || *code == '\0')) { ++code; --len; }
-    return len > 0 && (*code == '0' || *code == '3');
-}
-
 // ── Helper: format code to "600000.XSHG" style ──
 inline std::string format_code(const std::string& raw, const char* market) {
     std::string code = raw;

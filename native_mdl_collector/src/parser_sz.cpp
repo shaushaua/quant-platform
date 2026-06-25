@@ -36,12 +36,9 @@ ParseResult parse_sz_tick(const void* msg_data, std::size_t msg_len, std::int64_
 
     const auto* msg = reinterpret_cast<const mdl_szl2_msg::Snapshot300111_v2*>(msg_data);
 
-    // Filter: only stocks
+    // Accept all securities (stocks + ETF + convertible bonds, etc.)
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
-    if (!is_stock_sz(code_raw, code_len)) {
-        return result;
-    }
     result.code = format_code(std::string(code_raw, code_len), "XSHE");
 
     // Time
@@ -113,12 +110,9 @@ ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len, double rec
 
     const auto* msg = reinterpret_cast<const mdl_szl2_msg::Order300192_v2*>(msg_data);
 
-    // Filter: only stocks
+    // Accept all securities
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
-    if (!is_stock_sz(code_raw, code_len)) {
-        return result;
-    }
     result.code = format_code(std::string(code_raw, code_len), "XSHE");
 
     double time_sec = mdl_time_to_seconds(msg->TransactTime.m_Value);
@@ -174,12 +168,9 @@ ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len, double recv
 
     const auto* msg = reinterpret_cast<const mdl_szl2_msg::Transaction300191_v2*>(msg_data);
 
-    // Filter: only stocks
+    // Accept all securities
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
-    if (!is_stock_sz(code_raw, code_len)) {
-        return result;
-    }
     result.code = format_code(std::string(code_raw, code_len), "XSHE");
 
     double time_sec = mdl_time_to_seconds(msg->TransactTime.m_Value);

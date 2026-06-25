@@ -49,12 +49,9 @@ ParseResult parse_sh_tick(const void* msg_data, std::size_t msg_len, std::int64_
 
     const auto* msg = reinterpret_cast<const mdl_shl2_msg::SHL2MarketData*>(msg_data);
 
-    // Filter: only stocks
+    // Accept all securities (stocks + ETF + convertible bonds, etc.)
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
-    if (!is_stock_sh(code_raw, code_len)) {
-        return result;
-    }
 
     // Format code
     result.code = format_code(std::string(code_raw, code_len), "XSHG");
@@ -127,12 +124,9 @@ NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len, double recv_
 
     const auto* msg = reinterpret_cast<const mdl_shl2_msg::NGTSTick*>(msg_data);
 
-    // Filter
+    // Accept all securities
     const char* code_raw = msg->SecurityID.c_str();
     auto code_len = msg->SecurityID.Length;
-    if (!is_stock_sh(code_raw, code_len)) {
-        return result;
-    }
     result.code = format_code(std::string(code_raw, code_len), "XSHG");
 
     double time_sec = mdl_time_to_seconds(msg->TickTime.m_Value);

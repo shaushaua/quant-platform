@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
@@ -324,7 +325,9 @@ def positions_to_orders(
         1. portfolio_context.meta['latest_prices']  (engine realtime tick,
            injected by NativeEngine._snapshot_latest_prices at fork time)
         2. portfolio_context.positions.last_price (broker)
-        3. rows with no price dropped — NO yesterday-close fallback
+        3. (opt-in) daily_basic_df.close — only when env
+           OPEN_POSITION_FALLBACK_CLOSE=1; for pre-open dry-run only
+        4. rows with no price dropped
 
     Total capital resolution order:
         1. total_capital_override (caller-supplied, takes full responsibility)
@@ -434,7 +437,32 @@ def positions_to_orders(
                 pos["last_price"].astype(float).values, index=pos_c6
             ).dropna()
             prices = prices.where(prices > 0, code6.map(broker_map).fillna(0.0))
-    # No yesterday-close fallback — at 9:30 realtime tick must be available
+    # Source 3 (fallback, opt-in): daily_basic_df yesterday close.
+    # Enabled via OPEN_POSITION_FALLBACK_CLOSE=1 — for dry-run testing before
+    # market open. Production should NOT enable (9:30 tick must be used).
+    if (prices <= 0).any() and daily_basic_df is not None \
+            and os.environ.get("OPEN_POSITION_FALLBACK_CLOSE", "0") == "1":
+        db = daily_basic_df
+        code_col = next((c for c in ("ID_QI", "code", "symbol", "SECURITY_CODE")
+                         if c in db.columns), None)
+        close_col = next((c for c in ("close", "CLOSE", "pre_close", "PRE_CLOSE")
+                          if c in db.columns), None)
+        if code_col is not None and close_col is not None:
+            db_c6 = db[code_col].astype(str).map(_norm_code6)
+            close_map = pd.Series(
+                pd.to_numeric(db[close_col], errors="coerce").values,
+                index=db_c6,
+            ).dropna()
+            close_map = close_map[close_map > 0]
+            filled = code6.map(close_map).fillna(0.0)
+            n_filled = ((prices <= 0) & (filled > 0)).sum()
+            if n_filled > 0:
+                logger.warning(
+                    "positions_to_orders: FALLBACK close used for %d rows "
+                    "(OPEN_POSITION_FALLBACK_CLOSE=1, not for production)",
+                    n_filled,
+                )
+                prices = prices.where(prices > 0, filled)
     df["_price"] = prices.astype(float)
     dropped = (df["_price"] <= 0).sum()
     if dropped > 0:
