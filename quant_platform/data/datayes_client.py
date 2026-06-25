@@ -10,7 +10,6 @@
 API 文档: /api/equity/getRMExposureDaySW21.json
 响应格式: {"retCode":1, "data":[{"ticker":"000001", "tradeDate":"20260305", "BETA":..., ...}]}
 """
-import gzip
 import json
 import logging
 from typing import Dict, Optional
@@ -56,7 +55,7 @@ class DatayesClient:
         """
         url = (f"{DATAYES_BASE_URL}{DATAYES_PATH}"
                f"?field=&ticker=&secID=&tradeDate={trade_date}&beginDate=&endDate=")
-        headers = {"Authorization": f"Bearer {self.token}", "Accept-Encoding": "gzip"}
+        headers = {"Authorization": f"Bearer {self.token}"}
 
         try:
             resp = requests.get(url, headers=headers, timeout=self.timeout)
@@ -68,13 +67,10 @@ class DatayesClient:
                 f"通联 API 返回 HTTP {resp.status_code}: {resp.text[:512]}"
             )
 
-        # gzip 解压
+        # requests 自动处理 gzip 解压 (基于 Content-Encoding 响应头);
+        # 不要再手动 gzip.decompress resp.content,否则会对已解压的 JSON
+        # 二次解压导致 "Not a gzipped file" 错误。
         content = resp.content
-        if resp.headers.get("Content-Encoding") == "gzip":
-            try:
-                content = gzip.decompress(content)
-            except OSError as e:
-                raise RuntimeError(f"gzip 解压失败: {e}") from e
 
         try:
             result = json.loads(content)

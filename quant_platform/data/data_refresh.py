@@ -200,6 +200,37 @@ def _query_daily_basic(
     # ID_QI 补零
     if "ID_QI" in df.columns:
         df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
+    # MySQL Decimal → float64。否则 object dtype 列(如 mkt_cap, amount, volume)
+    # 进 polars/pyarrow 时会 ArrowInvalid,tree model .so 也会因列偏移读到错位数据。
+    # 文本列 (SEC_SHORT_NAME 等) 保留 object,只转 numeric-like 列。
+    # datetime 列(idx_UPDATE_TIME)也转 string 避免 polars large_utf8 期望与
+    # Timestamp 对象冲突。
+    _DECIMAL_CAST_EXCLUDE = {"TS", "ID_QI", "SEC_SHORT_NAME", "SEC_FULL_NAME",
+                             "ticker", "symbol", "code"}
+    for col in df.columns:
+        if col in _DECIMAL_CAST_EXCLUDE:
+            continue
+        # datetime → string
+        if df[col].dtype.kind == "M":
+            df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+            continue
+        if df[col].dtype == object:
+            sample = df[col].dropna()
+            if len(sample) == 0:
+                # all-NaN object col → cast to float64 (all NaN) so polars
+                # and downstream don't choke on object dtype
+                import numpy as _np
+                df[col] = pd.Series(_np.full(len(df), _np.nan), dtype="float64")
+            else:
+                first = sample.iloc[0]
+                if hasattr(first, "as_tuple") or isinstance(first, (int, float)):
+                    # Decimal or numeric stored as object
+                    df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+                # else: leave genuine string cols (UPDATE_TIME, idx_EXCHANGE_CD) as-is
+        elif df[col].dtype.kind in "iu":
+            # int → float64。tree model 内部用 pandas 除法,int/0 会
+            # ZeroDivisionError,转 float 后变 inf 不阻塞。
+            df[col] = df[col].astype("float64")
     logger.info(
         f"daily_basic MySQL 查询完成: trade_date={trade_date}, "
         f"{len(df)} rows, {len(df.columns)} cols"

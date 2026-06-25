@@ -594,9 +594,14 @@ class NativeEngine:
                 logger.warning("[native] failed to load prev day factors: %s", exc)
 
     def _load_prev_day_from_oss(self) -> Optional[pd.DataFrame]:
-        """Load previous trading day's daily factor result from OSS."""
+        """Load previous trading day's daily factor result from OSS.
+
+        Looks for daily-feature/daily.parquet (produced by the live engine's
+        daily schedule and the deeptrade pipeline). Falls back to legacy
+        daily.json for older deploys.
+        """
         try:
-            import json as _json
+            import io as _io
             import oss2
             endpoint = os.environ.get("OSS_ENDPOINT", "")
             ak_id = os.environ.get("OSS_ACCESS_KEY_ID", "")
@@ -612,19 +617,31 @@ class NativeEngine:
             from datetime import timedelta
             for i in range(1, 6):
                 candidate = (today - timedelta(days=i)).strftime("%Y%m%d")
-                key = f"{prefix}/{candidate[:4]}/{candidate[:6]}/{candidate}/daily.json"
-                try:
-                    payload = bucket.get_object(key)
-                    data = _json.loads(payload.read())
-                    if data:
-                        df = pd.DataFrame(data)
-                        logger.info("[native] loaded prev day daily factors from OSS: %s (%d rows)",
-                                    key, len(df))
-                        return df
-                except oss2.exceptions.NoSuchKey:
-                    continue
-                except Exception:
-                    continue
+                base = f"{prefix}/{candidate[:4]}/{candidate[:6]}/{candidate}"
+                # Try parquet first (current format), then legacy json
+                candidates = [
+                    f"{base}/daily-feature/daily.parquet",
+                    f"{base}/daily.parquet",
+                    f"{base}/daily.json",
+                ]
+                for key in candidates:
+                    try:
+                        payload = bucket.get_object(key)
+                        buf = payload.read()
+                        if key.endswith(".parquet"):
+                            df = pd.read_parquet(_io.BytesIO(buf))
+                        else:
+                            import json as _json
+                            df = pd.DataFrame(_json.loads(buf))
+                        if df is not None and not df.empty:
+                            logger.info(
+                                "[native] loaded prev day daily factors from OSS: %s (%d rows)",
+                                key, len(df))
+                            return df
+                    except oss2.exceptions.NoSuchKey:
+                        continue
+                    except Exception:
+                        continue
             logger.info("[native] no daily factor result found on OSS for previous 5 days")
         except Exception as exc:
             logger.warning("[native] OSS prev day load failed: %s", exc)

@@ -63,6 +63,17 @@ def inference(
 
     positions = positions.copy()
 
+    # tree model .so 是按 96 列 schema 编译的,实盘 daily_basic 多了
+    # SEC_SHORT_NAME / SEC_FULL_NAME 两列会让内部列选择错位 →
+    # ZeroDivisionError / 列读取错乱。在喂给 .so 前丢弃这两列。
+    if daily_basic_df is not None and not daily_basic_df.empty:
+        drop_cols = [c for c in ("SEC_SHORT_NAME", "SEC_FULL_NAME")
+                     if c in daily_basic_df.columns]
+        if drop_cols:
+            daily_basic_df = daily_basic_df.drop(columns=drop_cols)
+            logger.info("[tree-orders] dropped %s from daily_basic for .so compat",
+                        drop_cols)
+
     # Normalize code column: _code6 (6-digit) → gateway-compatible format.
     # _order_symbol in native_engine.py auto-routes 6-digit codes by leading
     # digit (6→SH, 0/3→SZ), so plain 6-digit is accepted as-is.
