@@ -50,7 +50,12 @@ COPY quant_platform/ ./quant_platform/
 
 # Inference dependencies (for trader-provided inference modules)
 # paramiko: optional SFTP utilities
-RUN pip install --no-cache-dir "joblib>=1.3,<2" "cloudpickle>=2.2,<4" "scikit-learn>=1.3,<2" "paramiko>=3.0,<4"
+# lightgbm/xgboost: model artifacts deserialization (tree_model_inference)
+# cvxpy: position optimizer inside calc_predict_tree_model.so (USE_OPTIMIZER=True)
+# polars: required by .so for lazy frame operations
+RUN pip install --no-cache-dir \
+    "joblib>=1.3,<2" "cloudpickle>=2.2,<4" "scikit-learn>=1.3,<2" "paramiko>=3.0,<4" \
+    "lightgbm>=4.0,<5" "xgboost>=1.7,<3" "cvxpy>=1.4,<2" "polars>=1.0,<2"
 
 ENV LD_LIBRARY_PATH=/opt/native-mdl-collector/lib:/opt/mdl-client
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2

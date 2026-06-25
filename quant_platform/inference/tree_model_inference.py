@@ -314,7 +314,24 @@ def load_daily_basic_from_oss(start_date: str, end_date: str) -> pd.DataFrame:
 
     if not frames:
         raise RuntimeError(f"No daily_basic parquet found on OSS between {start_date} and {end_date}")
-    return pd.concat(frames, ignore_index=True, copy=False)
+    combined = pd.concat(frames, ignore_index=True, copy=False)
+    # Coerce numeric columns that concat may have promoted to object (different
+    # daily parquets have inconsistent dtypes) back to float64. The compiled
+    # .so (value_weight) does Python-level true division on object Series which
+    # raises ZeroDivisionError; same op on float64 returns inf.
+    _STRING_COLS = {"TS", "ID_QI", "SEC_SHORT_NAME", "SEC_FULL_NAME",
+                    "trade_date", "date", "idx_EXCHANGE_CD", "idx_UPDATE_TIME",
+                    "UPDATE_TIME"}
+    for col in combined.columns:
+        if col in _STRING_COLS:
+            # Force string dtype — some rows may be pd.Timestamp objects from
+            # parquet decode (idx_UPDATE_TIME etc.); pollers/pyarrow choke on
+            # mixed str/Timestamp in object columns.
+            combined[col] = combined[col].astype(str).replace({"NaT": "", "nan": "", "None": ""})
+            continue
+        if combined[col].dtype == object:
+            combined[col] = pd.to_numeric(combined[col], errors="ignore")
+    return combined
 
 
 def load_index_composition_from_oss(start_date: str, end_date: str) -> pd.DataFrame:
@@ -431,7 +448,11 @@ def load_production_daily_basic(date_str: str, current_daily_basic: Optional[pd.
         current = normalize_daily_basic(current_daily_basic, date_str=date_str)
         current = current.loc[current["trade_date"].astype(str) <= date_str].copy()
         current_dates = pd.Index(current["trade_date"].dropna().astype(str).unique())
-        if (current_dates < date_str).any():
+        # Need BOTH multi-day history AND the Barra columns the .so expects.
+        # The live engine passes a single-day 22-col market df (no BETA/MOMENTUM)
+        # which isn't sufficient for inference — fall through to OSS load.
+        has_barra = "BETA" in current.columns
+        if (current_dates < date_str).any() and has_barra and len(current_dates) >= 5:
             return current
 
     start = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=DAILY_BASIC_LOOKBACK_DAYS)).strftime("%Y%m%d")
@@ -463,6 +484,8 @@ def normalize_daily_basic(df: pd.DataFrame, date_str: Optional[str] = None) -> p
     if "trade_date" not in df.columns:
         if "date" in df.columns:
             df["trade_date"] = df["date"]
+        elif "_date" in df.columns:
+            df["trade_date"] = df["_date"]
         elif "TS" in df.columns:
             df["trade_date"] = pd.to_datetime(
                 df["TS"].astype(str).str.replace(" CST", "", regex=False),
@@ -495,6 +518,7 @@ def append_current_daily_basic(history: pd.DataFrame, current: Optional[pd.DataF
     combined = pd.concat([history, current], ignore_index=True, copy=False)
     return combined.drop_duplicates(["trade_date", "ID_QI"], keep="last")
 
+
 def inference(
     date_str: str,
     end_time: str,
@@ -510,17 +534,33 @@ def inference(
     if universe is not None:
         daily_basic = daily_basic[daily_basic["ID_QI"].isin(universe)]
         prev_day_factors_df = prev_day_factors_df[prev_day_factors_df["ID_QI"].isin(universe)]
+    # prev_day_factors_df is the live T-1 daily parquet (ID_QI + F_* cols).
+    # The .so's normalize_daily_feature_czhou1_keys expects a trade_date key
+    # column; inject it from the previous trading day derived from daily_basic.
+    if prev_day_factors_df is not None and not prev_day_factors_df.empty:
+        if "trade_date" not in prev_day_factors_df.columns and "date" not in prev_day_factors_df.columns:
+            prev_dates = sorted(daily_basic["trade_date"].dropna().astype(str).unique())
+            prev_date = prev_dates[-2] if len(prev_dates) >= 2 else (prev_dates[0] if prev_dates else date_str)
+            prev_day_factors_df = prev_day_factors_df.copy()
+            prev_day_factors_df["trade_date"] = prev_date
 
     last_index_csi_all = None
     if index_composition_df is not None and not index_composition_df.empty:
         index_csi_all = index_composition_df
-        if "INDEX_CODE" in index_csi_all.columns:
+        # Long format (INDEX_CODE + weight columns): filter to 000985 directly
+        if "INDEX_CODE" in index_csi_all.columns and "weight" in index_csi_all.columns:
             index_csi_all = index_csi_all[index_csi_all["INDEX_CODE"].astype(str) == "000985"]
-        if not index_csi_all.empty:
-            date_col = "trade_date" if "trade_date" in index_csi_all.columns else "date" if "date" in index_csi_all.columns else None
-            if date_col is not None:
-                index_csi_all = index_csi_all[index_csi_all[date_col].astype(str) == index_csi_all[date_col].astype(str).max()]
-            last_index_csi_all = index_csi_all[["ID_QI", "weight"]].set_index("ID_QI")["weight"]
+            if not index_csi_all.empty:
+                date_col = "trade_date" if "trade_date" in index_csi_all.columns else "date" if "date" in index_csi_all.columns else None
+                if date_col is not None:
+                    index_csi_all = index_csi_all[index_csi_all[date_col].astype(str) == index_csi_all[date_col].astype(str).max()]
+                last_index_csi_all = index_csi_all[["ID_QI", "weight"]].set_index("ID_QI")["weight"]
+        # Wide format (weight_000985 column from compute_index_composition)
+        elif "weight_000985" in index_csi_all.columns:
+            sub = index_csi_all[["ID_QI", "weight_000985"]].dropna(subset=["weight_000985"])
+            sub = sub[sub["weight_000985"] > 0]
+            if not sub.empty:
+                last_index_csi_all = sub.set_index("ID_QI")["weight_000985"]
     signal_date = resolve_signal_date(
         daily_basic=daily_basic,
         trade_date=date_str,
@@ -544,6 +584,9 @@ def inference(
         start_date=signal_date,
         end_date=signal_date,
         output_date=date_str,
+        composition_df=(index_composition_df if (index_composition_df is not None
+                                                and "INDEX_CODE" in (index_composition_df.columns if hasattr(index_composition_df, "columns") else []))
+                        else None),
         talib_dropna_thresh=TALIB_DROPNA_THRESH,
         apply_trade_mask=APPLY_TRADE_MASK,
         min_adv=MIN_ADV,
@@ -569,7 +612,6 @@ def inference(
         optimizer_style_exposure_tol=OPTIMIZER_STYLE_EXPOSURE_TOL,
         optimizer_industry_exposure_tol=OPTIMIZER_INDUSTRY_EXPOSURE_TOL,
         optimizer_min_benchmark_constituent_weight=OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT,
-        composition_df=index_composition_df
     )
 
     if universe is not None:

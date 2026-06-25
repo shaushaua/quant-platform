@@ -72,7 +72,11 @@ spec:
             - name: FACTOR_MODULE
               value: "quant_platform.strategies.protected_eillen_intraday_strategy"
             - name: DAILY_FACTOR_MODULE
-              value: "quant_platform.strategies.protected_eillen_strategy"
+              value: "quant_platform.strategies.protected_eillen_strategy_v2"
+            # V2 策略只暴露多票 batch 入口，daily 也要走多票协议
+            # (native_engine.py:324 由本开关选择 multi-code 路径)
+            - name: DAILY_USE_MULTI_CODE
+              value: "true"
             - name: INFERENCE_MODULE
               value: "quant_platform.inference.tree_model_orders"
             # --- 模拟盘资金（tree_model_orders 走 positions_to_orders helper） ---

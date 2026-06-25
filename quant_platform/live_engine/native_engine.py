@@ -321,7 +321,12 @@ def _compute_code_batch_shm(args):
             _normalize_multi_code_batch_results,
         )
 
-        if is_daily:
+        # DAILY_USE_MULTI_CODE: when true, daily schedule uses the multi-code
+        # batch protocol (factor_fn(data_map, codes, date, [end_time])) instead
+        # of the legacy single-code loop. Required for strategies like V2 that
+        # only expose the batch entry point.
+        daily_multicode = _env_bool("DAILY_USE_MULTI_CODE", False)
+        if is_daily and not daily_multicode:
             returned_codes = set()
             for code, stock_data in data_map.items():
                 try:
