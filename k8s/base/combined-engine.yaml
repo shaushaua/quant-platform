@@ -85,6 +85,10 @@ spec:
               value: "1"
             - name: OPEN_POSITION_TOTAL_CAPITAL
               value: "10000000"
+            # --- 9:30 推理前置：pod 起来异步跑树模型,9:30 只跑 positions_to_orders ---
+            # 关闭则 9:30 当场同步推理(慢,行为同改造前)
+            - name: OPEN_POSITION_PRECOMPUTE
+              value: "1"
             # --- 一次性清仓：模拟盘启动时把 broker 持仓全平 ---
             # 启用后 pod 起来 spawn daemon thread,等到 09:15 拉持仓并全推 sell。
             # 幂等：/data/factors/{trading_day}_close_done.flag 写后不再重试。
@@ -136,6 +140,11 @@ spec:
               value: "quant_platform"
             - name: ORDER_DEFAULT_PRICE_TYPE
               value: "latest"
+            # 执行算法：gateway resolveAlgoStrategy() 解析。
+            # 取值: vwap / vwap_plus / vwap_core / twap / twap_plus / twap_core / pov / passthru
+            # 留空则用 gateway ATX_DEFAULT_ORD_TYPE 兜底（默认 passthru=201）
+            - name: ORDER_ALGO_STRATEGY
+              value: "vwap"
             - name: DATA_FLUSH_INTERVAL
               value: "0.01"
             - name: SHM_STORE_BACKEND
