@@ -114,4 +114,37 @@ inline std::string format_code(const std::string& raw, const char* market) {
     return code + "." + market;
 }
 
+// ── Helper: stock + index filter ──
+// Accept A-share stocks and indices; reject ETF / funds / bonds / convertible bonds.
+// Rationale: 接收全证券会把 ETF/可转债/国债等灌进来,导致磁盘和 shm 写爆。
+// 指数数据(用于 IDX_CONS_CODES 000300/000905/000852/000985/932000)需要保留。
+inline bool is_stock_or_index_sh(const char* code, std::size_t len) {
+    if (len == 0) return false;
+    // Trim leading whitespace / null
+    while (len > 0 && (*code == ' ' || *code == '\0')) { ++code; --len; }
+    if (len < 3) return false;
+    char c0 = code[0], c1 = code[1], c2 = code[2];
+    // 6: 600/601/603/605/688/689 stocks
+    if (c0 == '6') return true;
+    // 9: 900 B股 / 999 old indices
+    if (c0 == '9') return true;
+    // 000: indices (上证综指 000001 / 沪深300 000300 / 中证500 000905 / 中证1000 000852 / 中证全指 000985 / 中证2000 932000 not here)
+    if (c0 == '0' && c1 == '0' && c2 == '0') return true;
+    // 880: 行业指数
+    if (c0 == '8' && c1 == '8' && c2 == '0') return true;
+    // REJECT: 5xx (ETF 510-529/588/基金 500-550/LOF 560-569), 1xx (bonds 110-127), 019 (国债)
+    return false;
+}
+
+inline bool is_stock_or_index_sz(const char* code, std::size_t len) {
+    if (len == 0) return false;
+    while (len > 0 && (*code == ' ' || *code == '\0')) { ++code; --len; }
+    if (len == 0) return false;
+    char c0 = *code;
+    // 0: 000/001/002/003 stocks
+    // 3: 300/301 stocks + 399 indices
+    // REJECT: 1xx (ETF 159 / 可转债 123 / 分级 150 / LOF 16x/184), 2xx (国债逆回购 204)
+    return c0 == '0' || c0 == '3';
+}
+
 } // namespace quant::native_mdl::schema

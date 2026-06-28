@@ -531,6 +531,17 @@ def inference(
 ) -> pd.DataFrame:
     daily_basic = load_production_daily_basic(date_str, current_daily_basic=daily_basic_df)
     universe = normalize_universe_codes(trading_universe_df)
+    # Tolerate backtest-format daily factors that carry `code` (6-digit) instead
+    # of `ID_QI` (e.g. merged protected-eillen-strategy-v2 shards). Bridge both
+    # formats before any universe filter or .so ingestion. Use normalize_code6
+    # so int-typed code columns ("000001" -> 1) still map to "000001".
+    if (prev_day_factors_df is not None and not prev_day_factors_df.empty
+            and "ID_QI" not in prev_day_factors_df.columns
+            and "code" in prev_day_factors_df.columns):
+        prev_day_factors_df = prev_day_factors_df.copy()
+        prev_day_factors_df["ID_QI"] = (
+            prev_day_factors_df["code"].map(normalize_code6)
+        )
     if universe is not None:
         daily_basic = daily_basic[daily_basic["ID_QI"].isin(universe)]
         prev_day_factors_df = prev_day_factors_df[prev_day_factors_df["ID_QI"].isin(universe)]

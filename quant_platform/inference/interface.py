@@ -319,7 +319,8 @@ def positions_to_orders(
 
     volume formula (target → shares):
 
-        volume = floor(total_capital * |weight| / price / 100) * 100
+        主板/创业板/北交所: floor(total_capital * |weight| / price / 100) * 100
+        科创板(688/689): buy: raw_vol (≥200 才下单),sell: 零股可全卖
 
     Price resolution order:
         1. portfolio_context.meta['latest_prices']  (engine realtime tick,
@@ -556,10 +557,31 @@ def positions_to_orders(
     df["_delta_weight"] = df["_weight"] - df["_current_weight"]
 
     # ── target volume ───────────────────────────────────────────────
-    # Size off |delta_weight|; round_down to 100 shares.
+    # Size off |delta_weight|; round_down to lot size.
+    # A-share lot rules:
+    #   主板/创业板/北交所(0xxxxx / 3xxxxx / 6xxxxx / 8xxxxx / 4xxxxx): 100 股
+    #   科创板(688xxx / 689xxx,SH): 200 股起买,之后 1 股递增
+    # Buy: 主板 round_down 到 100;科创板 ≥200 才下单,否则丢
+    # Sell: 主板 round_down 到 100;科创板可零股全卖(T+1 解锁后)
+    def _lot_size(code6: str) -> int:
+        c = str(code6).zfill(6)
+        return 200 if c.startswith(("688", "689")) else 100
+
     df["target_value"] = total_capital * df["_delta_weight"].abs()
     df["_raw_vol"] = df["target_value"] / df["_price"]
+    lot_sizes = df["_code6"].map(_lot_size)
+    is_kcb = lot_sizes == 200
+    is_buy = df["_delta_weight"] >= 0
+
+    # 主板/创业板: round_down 到 100
     df["volume"] = (df["_raw_vol"] // 100).astype(int) * 100
+    # 科创板买入: 不取整 100,但 < 200 的丢
+    kcb_buy_mask = is_kcb & is_buy
+    df.loc[kcb_buy_mask, "volume"] = df.loc[kcb_buy_mask, "_raw_vol"].astype(int)
+    df.loc[kcb_buy_mask & (df["volume"] < 200), "volume"] = 0
+    # 科创板卖出: 零股可全卖(T+1 解锁份额)
+    kcb_sell_mask = is_kcb & ~is_buy
+    df.loc[kcb_sell_mask, "volume"] = df.loc[kcb_sell_mask, "_raw_vol"].astype(int)
 
     # Cap sell volume at held volume (delta_mode only). A-share T+1 + no
     # shorting means a sell exceeding holdings is invalid; clamp to held
@@ -568,10 +590,12 @@ def positions_to_orders(
         held_shares = (
             df["_current_weight"] * total_capital / df["_price"]
         ).fillna(0.0)
-        held_vol = (held_shares // 100).astype(int) * 100
+        held_lot = (held_shares // 100).astype(int) * 100
+        # 科创板持仓可卖零股
+        held_lot = held_lot.where(~is_kcb, held_shares.astype(int))
         sell_mask = df["_delta_weight"] < 0
         df.loc[sell_mask, "volume"] = df.loc[sell_mask, "volume"].clip(
-            upper=held_vol.loc[sell_mask]
+            upper=held_lot.loc[sell_mask]
         )
 
     df = df[df["volume"] > 0]

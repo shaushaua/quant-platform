@@ -682,15 +682,20 @@ class NativeEngine:
                 logger.warning("[native] failed to load prev day factors: %s", exc)
 
     def _load_prev_day_from_oss(self) -> Optional[pd.DataFrame]:
-        """Load previous trading day's daily factor result from OSS.
+        """Load the latest available daily factor result from OSS live-factors.
 
-        Looks for daily-feature/daily.parquet (produced by the live engine's
-        daily schedule and the deeptrade pipeline). Falls back to legacy
-        daily.json for older deploys.
+        Strategy: list ``{prefix}/{YYYY}/{YYYYMM}/`` (current month first, up
+        to 4 months back), enumerate date folders, and pick the newest date
+        strictly before today that has ``daily-feature/daily.parquet``.
+
+        Robust to weekends/holidays and OOM gaps: takes the most recent
+        successful daily run instead of guessing T-1..T-5 calendar dates.
+        Falls back to legacy ``daily.json`` if no parquet exists.
         """
         try:
             import io as _io
             import oss2
+            import re as _re
             endpoint = os.environ.get("OSS_ENDPOINT", "")
             ak_id = os.environ.get("OSS_ACCESS_KEY_ID", "")
             ak_secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
@@ -701,38 +706,70 @@ class NativeEngine:
             auth = oss2.Auth(ak_id, ak_secret)
             ep = endpoint.replace("https://", "").replace("http://", "")
             bucket = oss2.Bucket(auth, ep, bucket_name)
+
             today = datetime.strptime(self.trading_day, "%Y%m%d")
-            from datetime import timedelta
-            for i in range(1, 6):
-                candidate = (today - timedelta(days=i)).strftime("%Y%m%d")
-                base = f"{prefix}/{candidate[:4]}/{candidate[:6]}/{candidate}"
-                # Try parquet first (current format), then legacy json
-                candidates = [
-                    f"{base}/daily-feature/daily.parquet",
-                    f"{base}/daily.parquet",
-                    f"{base}/daily.json",
-                ]
-                for key in candidates:
-                    try:
-                        payload = bucket.get_object(key)
-                        buf = payload.read()
-                        if key.endswith(".parquet"):
-                            df = pd.read_parquet(_io.BytesIO(buf))
-                        else:
-                            import json as _json
-                            df = pd.DataFrame(_json.loads(buf))
-                        if df is not None and not df.empty:
-                            logger.info(
-                                "[native] loaded prev day daily factors from OSS: %s (%d rows)",
-                                key, len(df))
-                            return df
-                    except oss2.exceptions.NoSuchKey:
-                        continue
-                    except Exception:
-                        continue
-            logger.info("[native] no daily factor result found on OSS for previous 5 days")
+            # Walk year-month prefixes from current month backwards (up to 4 months)
+            ym_candidates: list[str] = []
+            cur = today.replace(day=1)
+            for _ in range(4):
+                ym_candidates.append(cur.strftime("%Y%m"))
+                if cur.month == 1:
+                    cur = cur.replace(year=cur.year - 1, month=12)
+                else:
+                    cur = cur.replace(month=cur.month - 1)
+
+            date_re = _re.compile(r"^(\d{8})/?$")
+            tried_dates: list[str] = []
+            for ym in ym_candidates:
+                year = ym[:4]
+                list_prefix = f"{prefix}/{year}/{ym}/"
+                try:
+                    it = oss2.ObjectIterator(bucket, prefix=list_prefix, delimiter="/")
+                    dates_found: list[str] = []
+                    for obj in it:
+                        name = obj.key[len(list_prefix):]
+                        m = date_re.match(name)
+                        if m:
+                            dates_found.append(m.group(1))
+                except Exception as exc:
+                    logger.warning("[native] OSS list %s failed: %s", list_prefix, exc)
+                    continue
+                # Only consider dates strictly before today (don't reuse today's run)
+                dates_found = [d for d in dates_found if d < self.trading_day]
+                dates_found.sort(reverse=True)
+                for date_str in dates_found:
+                    tried_dates.append(date_str)
+                    base = f"{prefix}/{date_str[:4]}/{date_str[:6]}/{date_str}"
+                    candidates = [
+                        f"{base}/daily-feature/daily.parquet",
+                        f"{base}/daily.parquet",
+                        f"{base}/daily.json",
+                    ]
+                    for key in candidates:
+                        try:
+                            payload = bucket.get_object(key)
+                            buf = payload.read()
+                            if key.endswith(".parquet"):
+                                df = pd.read_parquet(_io.BytesIO(buf))
+                            else:
+                                import json as _json
+                                df = pd.DataFrame(_json.loads(buf))
+                            if df is not None and not df.empty:
+                                logger.info(
+                                    "[native] loaded latest daily factors from OSS: "
+                                    "%s (date=%s, %d rows, tried=%s)",
+                                    key, date_str, len(df), tried_dates[:5])
+                                return df
+                        except oss2.exceptions.NoSuchKey:
+                            continue
+                        except Exception:
+                            continue
+            logger.info(
+                "[native] no daily factor result found on OSS "
+                "(searched months=%s, dates_seen=%s)", ym_candidates, tried_dates[:10])
         except Exception as exc:
             logger.warning("[native] OSS prev day load failed: %s", exc)
+        return None
         return None
 
     def _load_idx_cons(self) -> None:

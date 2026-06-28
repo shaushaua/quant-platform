@@ -90,7 +90,7 @@ spec:
             # 幂等：/data/factors/{trading_day}_close_done.flag 写后不再重试。
             # 用完务必改回 "0"，否则每个交易日 09:15 都会清仓。
             - name: ONE_TIME_CLOSE_ON_STARTUP
-              value: "1"
+              value: "0"
             - name: ONE_TIME_CLOSE_TRIGGER_TIME
               value: "09:15"
             - name: TREE_MODEL_STRATEGY_NAME

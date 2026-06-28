@@ -1,0 +1,211 @@
+# One-off factor merge job — fully self-contained, not part of base kustomization.
+#
+# The ConfigMap below embeds the merge script body directly so `kubectl apply -f`
+# works without any pre-step. Edit SOURCE_DATE / SOURCE_PREFIX / SOURCE_END_TIME
+# in the Pod env below before applying.
+#
+# Usage:
+#   kubectl apply -f scripts/oneoff/factor-merge-job.yaml
+#   kubectl logs factor-merge-tmp -n quant -f
+#   kubectl delete -f scripts/oneoff/factor-merge-job.yaml
+#
+# To regenerate after editing scripts/merge_recomputed_factors.py:
+#   kubectl create configmap factor-merge-script -n quant \
+#     --from-file=merge_recomputed_factors.py=scripts/merge_recomputed_factors.py \
+#     --dry-run=client -o yaml | sed '1d' >> scripts/oneoff/factor-merge-job.yaml
+#   (then manually splice into the ConfigMap block below)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: factor-merge-script
+  namespace: quant
+data:
+  merge_recomputed_factors.py: |
+    #!/usr/bin/env python3
+    """Merge recomputed factor shards into one daily.parquet for live-factors."""
+    from __future__ import annotations
+
+    import io
+    import os
+    import sys
+    import time
+    from typing import List
+
+    import oss2
+    import pandas as pd
+
+
+    def _env(name: str, default: str = "") -> str:
+        return os.environ.get(name, default).strip()
+
+
+    def _die(msg: str, code: int = 1) -> None:
+        print(f"[FATAL] {msg}", file=sys.stderr)
+        sys.exit(code)
+
+
+    def _bucket() -> oss2.Bucket:
+        endpoint = _env("OSS_ENDPOINT")
+        ak_id = _env("OSS_ACCESS_KEY_ID")
+        ak_secret = _env("OSS_ACCESS_KEY_SECRET")
+        if not all([endpoint, ak_id, ak_secret]):
+            _die("OSS_ENDPOINT / OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET must be set")
+        bucket_name = _env("RESULT_BUCKET", "stock-mdl-data-result")
+        auth = oss2.Auth(ak_id, ak_secret)
+        ep = endpoint.replace("https://", "").replace("http://", "")
+        return oss2.Bucket(auth, ep, bucket_name)
+
+
+    def list_shards(bucket: oss2.Bucket, source_dir: str) -> List[str]:
+        keys: List[str] = []
+        for obj in oss2.ObjectIterator(bucket, prefix=source_dir):
+            if obj.key.endswith(".parquet"):
+                keys.append(obj.key)
+        keys.sort()
+        return keys
+
+
+    def download_shard(bucket: oss2.Bucket, key: str) -> pd.DataFrame:
+        buf = bucket.get_object(key).read()
+        return pd.read_parquet(io.BytesIO(buf))
+
+
+    def convert_schema(df: pd.DataFrame) -> pd.DataFrame:
+        """Keep schema consistent with recomputed historical factors.
+
+        Shards carry `_<end_time>` suffix on F_* cols + TS_RECORDED, plus `code`
+        and `date`. Preserve format verbatim; dedup by code (keep last).
+        """
+        if "code" in df.columns:
+            before = len(df)
+            df = df.drop_duplicates(subset=["code"], keep="last").reset_index(drop=True)
+            if len(df) != before:
+                print(f"[step] dedup by code {before} -> {len(df)}")
+        return df
+
+
+    def main() -> None:
+        source_date = _env("SOURCE_DATE")
+        if len(source_date) != 8 or not source_date.isdigit():
+            _die("SOURCE_DATE must be YYYYMMDD")
+        source_prefix = _env("SOURCE_PREFIX", "protected-eillen-strategy-v2")
+        live_prefix = _env("LIVE_PREFIX", "live-factors")
+
+        year = source_date[:4]
+        month = source_date[:6]
+        source_dir = f"{source_prefix}/{year}/{month}/{source_date}/"
+        target_key = (
+            f"{live_prefix}/{year}/{month}/{source_date}/daily-feature/daily.parquet"
+        )
+
+        bucket = _bucket()
+        print(f"[step] listing {source_dir}")
+        shards = list_shards(bucket, source_dir)
+        if not shards:
+            _die(f"no parquet shards under {source_dir}")
+        print(f"[step] found {len(shards)} shards")
+
+        frames: List[pd.DataFrame] = []
+        for i, key in enumerate(shards):
+            t0 = time.time()
+            df = download_shard(bucket, key)
+            print(f"  [{i+1}/{len(shards)}] {key} rows={len(df)} ms={int((time.time()-t0)*1000)}")
+            frames.append(df)
+
+        combined = pd.concat(frames, ignore_index=True, copy=False)
+        print(f"[step] concat rows={len(combined)} cols={len(combined.columns)}")
+
+        converted = convert_schema(combined)
+        print(f"[step] final shape={converted.shape}")
+        f_cols = [c for c in converted.columns if c.startswith("F_")]
+        print(f"[step] F_ cols: {len(f_cols)}")
+        if "code" in converted.columns:
+            print(f"[step] code head: {converted['code'].head(3).tolist()}")
+
+        if len(converted) < 4000:
+            _die(f"row count {len(converted)} < 4000, refusing to upload")
+        if len(f_cols) < 100:
+            _die(f"F_ col count {len(f_cols)} < 100, schema looks wrong")
+
+        buf = io.BytesIO()
+        converted.to_parquet(buf, index=False)
+        payload = buf.getvalue()
+        print(f"[step] uploading {len(payload)} bytes -> oss://{bucket.bucket_name}/{target_key}")
+        bucket.put_object(target_key, payload)
+        print(f"[done] uploaded date={source_date} rows={len(converted)} cols={len(converted.columns)}")
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: factor-merge-tmp
+  namespace: quant
+  labels:
+    app: factor-merge-tmp
+spec:
+  restartPolicy: Never
+  nodeName: cn-hangzhou.172.24.103.22
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: quant
+      effect: NoSchedule
+  containers:
+    - name: merger
+      image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "[pod] installing pyarrow if missing..."
+          python -c "import pyarrow" 2>/dev/null || pip install --no-cache-dir pyarrow
+          echo "[pod] running merge..."
+          python /work/merge_recomputed_factors.py
+          echo "[pod] done"
+          sleep 5
+      env:
+        - name: OSS_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: quant-secrets
+              key: OSS_ENDPOINT
+        - name: OSS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: quant-secrets
+              key: OSS_ACCESS_KEY_ID
+        - name: OSS_ACCESS_KEY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: quant-secrets
+              key: OSS_ACCESS_KEY_SECRET
+        - name: RESULT_BUCKET
+          value: stock-mdl-data-result
+        - name: LIVE_PREFIX
+          value: live-factors
+        - name: SOURCE_PREFIX
+          value: protected-eillen-strategy-v2
+        - name: SOURCE_DATE
+          value: "20260626"
+        - name: SOURCE_END_TIME
+          value: "150000"
+      volumeMounts:
+        - name: work
+          mountPath: /work
+          readOnly: true
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+  volumes:
+    - name: work
+      configMap:
+        name: factor-merge-script
