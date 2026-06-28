@@ -1463,7 +1463,9 @@ class NativeEngine:
             p = self.output_path / f"{self.trading_day}_open_position_targets.csv"
             if p.exists():
                 try:
-                    df = pd.read_csv(p)
+                    # dtype=str 防止 "000338" 被 pandas 推断成 int → 丢失前导零 →
+                    # positions_to_orders 匹配 broker 持仓失败、_order_symbol 路由失败
+                    df = pd.read_csv(p, dtype={"code": str, "_code6": str})
                     # 原子标记已消费：rename 防止重复消费导致双单
                     self._mark_targets_consumed_locked()
                     logger.info("[open_position] loaded targets from disk cache: %s (%d rows)",
