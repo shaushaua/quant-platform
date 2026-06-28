@@ -38,6 +38,10 @@ from . import tree_model_inference as _tree
 logger = logging.getLogger(__name__)
 
 STRATEGY_NAME = os.environ.get("TREE_MODEL_STRATEGY_NAME", "tree_model")
+# 可选：执行算法（per-order 注入 algo_strategy 列，由 gateway resolveAlgoStrategy 解析）
+# 取值: vwap / vwap_plus / twap / twap_plus / vwap_core / twap_core / pov / passthru ...
+# 不设则用 gateway 的 ATX_DEFAULT_ORD_TYPE 兜底（默认 passthru=201）
+ALGO_STRATEGY = os.environ.get("TREE_MODEL_ALGO_STRATEGY", "").strip().lower()
 
 
 def _normalize_tree_positions(
@@ -177,9 +181,16 @@ def targets_to_orders(
         note=f"{STRATEGY_NAME}_{date_str}_{end_time}",
     )
 
+    # 注入 algo_strategy 让 gateway 路由到对应算法实例（如 VWAP / TWAP）。
+    # native_engine._push_to_order_gateway 会把这个字段原样传给 gateway。
+    if ALGO_STRATEGY and not orders.empty:
+        orders = orders.copy()
+        orders["algo_strategy"] = ALGO_STRATEGY
+
     logger.info(
-        "[tree-orders] stage 2 date=%s end_time=%s positions=%d orders=%d",
+        "[tree-orders] stage 2 date=%s end_time=%s positions=%d orders=%d algo=%s",
         date_str, end_time, len(positions), len(orders),
+        ALGO_STRATEGY or "(gateway-default)",
     )
     return orders
 
