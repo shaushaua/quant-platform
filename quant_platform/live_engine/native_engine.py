@@ -437,6 +437,17 @@ class NativeEngine:
         self._order_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._prev_valid_rate: Optional[float] = None
+        # open_position 预计算缓存：8:50 启动时异步跑树模型推理，
+        # 把 target positions 缓存到内存 + 磁盘。9:30 schedule 触发时
+        # 优先消费这份缓存，跳过 _tree.inference（重），只跑
+        # positions_to_orders（轻，需要实时 tick 价）。
+        self._open_position_cache: Optional[pd.DataFrame] = None
+        self._open_position_cache_lock = threading.Lock()
+        # Generation counter：fallback 路径失效 cache 时 +1。预计算线程在写入
+        # 内存/磁盘前必须重新检查 generation 是否变化 —— 变化说明它中途被
+        # 失效了（fallback 已经走了 inline 推理），不能落盘否则下次重触发
+        # 会读到陈旧 target 重复下单。
+        self._open_position_cache_generation: int = 0
         self._schedules: list = []  # List[ComputationSchedule]
         self._last_codes: List[str] = []
         self._last_compute: float = 0.0
@@ -1407,6 +1418,253 @@ class NativeEngine:
                 logger.error("[native-archive] loop error: %s", exc, exc_info=True)
                 time.sleep(60)
 
+    def _mark_targets_consumed_locked(self) -> None:
+        """Caller holds _open_position_cache_lock or accepts the race.
+        Rename the disk cache to .consumed.csv (or unlink on rename failure)
+        so subsequent pop() cannot replay the same targets.
+        """
+        if self.output_path is None or not self.trading_day:
+            return
+        p = self.output_path / f"{self.trading_day}_open_position_targets.csv"
+        if not p.exists():
+            return
+        consumed = p.with_suffix(".consumed.csv")
+        try:
+            p.replace(consumed)
+        except Exception as ren_exc:
+            logger.warning("[open_position] rename-to-consumed failed %s: %s", p, ren_exc)
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    def _pop_open_position_targets(self) -> Optional[pd.DataFrame]:
+        """One-shot consume of the precomputed open_position targets.
+
+        Returns the cached DataFrame and clears BOTH the in-memory slot and
+        the on-disk cache file (rename to .consumed.csv). If memory is empty
+        (e.g. pod restart mid-day), tries the on-disk cache; on successful
+        read the disk file is also atomically renamed so a repeat pop() or
+        a second schedule fire cannot replay the same targets and
+        double-dispatch orders.
+
+        Returns None when both caches are empty — caller should fall back to
+        inline inference.
+        """
+        with self._open_position_cache_lock:
+            if self._open_position_cache is not None:
+                cached = self._open_position_cache
+                self._open_position_cache = None
+                # 内存命中也要清盘，否则 pod 重启/重触发会再读一次
+                self._mark_targets_consumed_locked()
+                return cached
+        # 内存没命中：尝试磁盘（pod 长跑后内存被清 / pod 重启场景）
+        if self.output_path is not None and self.trading_day:
+            p = self.output_path / f"{self.trading_day}_open_position_targets.csv"
+            if p.exists():
+                try:
+                    df = pd.read_csv(p)
+                    # 原子标记已消费：rename 防止重复消费导致双单
+                    self._mark_targets_consumed_locked()
+                    logger.info("[open_position] loaded targets from disk cache: %s (%d rows)",
+                                p, len(df))
+                    return df
+                except Exception as exc:
+                    logger.warning("[open_position] disk cache read failed %s: %s", p, exc)
+        return None
+
+    def _precompute_open_position_targets(self) -> None:
+        """启动时异步跑树模型推理，把 target positions 缓存到内存 + 文件。
+
+        9:30 schedule 会优先消费这份缓存，跳过 _tree.inference（重），只跑
+        positions_to_orders（轻，需要实时 tick 价）。
+
+        设计要点：
+        - 树模型推理的输入只有 T-1 daily_basic / T-1 factors / 静态指数成分 /
+          broker T-1 持仓，**完全不依赖实时 tick 价格**，所以 8:50 跑出的
+          target weights 与 9:30 现场跑的等价。
+        - portfolio_context 在 8:50 拿到的是 T-1 收市持仓，与 9:30 现场再查
+          broker 的差异极小（隔夜无变化），可接受。
+        - 任何失败都打告警日志后 return；9:30 会自动 fallback 到 inline
+          inference，行为同改造前。
+        """
+        t0 = time.time()
+        # 捕获启动时的 generation。fallback 路径会 bump 这个值；写入前必须
+        # 重新检查，若变化则放弃写入 —— 防止晚到的预计算结果在被失效后又把
+        # 陈旧 target 写回，下次重触发时被读到重复下单。
+        with self._open_position_cache_lock:
+            my_generation = self._open_position_cache_generation
+
+        def _invalidated() -> bool:
+            with self._open_position_cache_lock:
+                return self._open_position_cache_generation != my_generation
+
+        try:
+            date_str = self.trading_day
+            if not date_str:
+                logger.warning("[precompute] trading_day empty, skip")
+                return
+
+            # 仅当 inference 模块暴露了拆分接口时才走快路径
+            inference_module = os.environ.get(
+                "INFERENCE_MODULE", "quant_platform.inference.tree_model_orders")
+            try:
+                import importlib
+                tm = importlib.import_module(inference_module)
+                targets_fn = getattr(tm, "inference_targets", None)
+            except Exception as exc:
+                logger.warning("[precompute] cannot import %s: %s", inference_module, exc)
+                targets_fn = None
+            if targets_fn is None:
+                logger.warning(
+                    "[precompute] %s has no inference_targets; precompute disabled",
+                    inference_module)
+                return
+
+            prev = self._prev_day_factors
+            if prev is None or prev.empty:
+                logger.warning("[precompute] prev_day_factors empty, skip")
+                return
+
+            daily_basic_df = self._daily_basic_df
+            tu_df = (self._trading_universe_df
+                     if self._trading_universe_df is not None else None)
+
+            # portfolio_context：8:50 拿到 T-1 收市持仓。失败不阻断 —— 模型
+            # 内部会按"空持仓"处理，9:30 现场再调 portfolio_context_fn 拿最新
+            # 持仓喂给 positions_to_orders 做delta。
+            portfolio_context = None
+            if self.portfolio_context_fn is not None:
+                try:
+                    portfolio_context = self.portfolio_context_fn(date_str, "093000")
+                except Exception as exc:
+                    logger.error("[precompute] portfolio_context failed: %s", exc)
+
+            # 计算 idx_comp（与 _write_results 行 1724-1727 等价）
+            idx_comp_df = None
+            try:
+                universe_extra = {
+                    "date": date_str,
+                    "end_time": "093000",
+                    "codes": _result_codes(prev) if hasattr(prev, "columns") else [],
+                    "factor_result": prev,
+                    "idx_cons_df": self._idx_cons_df,
+                }
+                idx_comp_df = compute_index_composition(
+                    daily_basic_df, universe_extra,
+                    trading_day=date_str,
+                    idx_cons_cache=self._idx_cons_cache,
+                )
+            except Exception as exc:
+                logger.warning("[precompute] idx_comp failed (continue without): %s", exc)
+
+            logger.info("[precompute] starting tree_model inference for date=%s (gen=%d)",
+                        date_str, my_generation)
+            positions = targets_fn(
+                date_str=date_str,
+                end_time="093000",
+                prev_day_factors_df=prev,
+                intraday_factors_df=prev,  # open_position 用 prev_day 当 intraday
+                daily_basic_df=daily_basic_df,
+                trading_universe_df=tu_df,
+                index_composition_df=idx_comp_df,
+                portfolio_context=portfolio_context,
+            )
+
+            if positions is None or positions.empty:
+                logger.error(
+                    "[precompute] targets empty, will fallback at 9:30 (date=%s)", date_str)
+                return
+
+            # 重型推理可能耗时数十秒。完成后再检查 generation —— 期间若 fallback
+            # 已走（invalidate 被 bump），必须放弃写入，否则下次重触发会读到陈旧
+            # target 重复下单。
+            if _invalidated():
+                logger.warning(
+                    "[precompute] cache invalidated during inference (gen moved from %d), "
+                    "dropping %d rows to avoid stale-cache replay",
+                    my_generation, len(positions))
+                return
+
+            # 写盘是慢 I/O，不能放在 cache_lock 里（会阻塞 pop/invalidate）。
+            # 先写 tmp 文件，然后拿锁一次性做：再次确认 generation → replace
+            # 成正式 cache 名 → 写内存。任何中途失效都把 tmp 删掉，确保磁盘上
+            # 不会残留 fallback 之后才落地的陈旧 target。
+            cache_path: Optional[Path] = None
+            tmp_path: Optional[Path] = None
+            if self.output_path is not None:
+                cache_path = self.output_path / f"{date_str}_open_position_targets.csv"
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                # 用 pid+threadid+ts 命名避免多个 precompute 实例撞名
+                tmp_path = cache_path.with_name(
+                    f"{cache_path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{int(time.time()*1000)}"
+                )
+            try:
+                if tmp_path is not None:
+                    positions.to_csv(tmp_path, index=False)
+            except Exception as exc:
+                logger.warning("[precompute] tmp cache write failed: %s", exc)
+                tmp_path = None  # 写盘失败仍允许写内存（pop 时由 mark-consumed 兜底）
+
+            # 关键段：再次检查 generation → 原子 replace → 写内存。
+            with self._open_position_cache_lock:
+                if self._open_position_cache_generation != my_generation:
+                    logger.warning(
+                        "[precompute] generation changed before publish (gen=%d → %d), "
+                        "dropping disk and memory write",
+                        my_generation, self._open_position_cache_generation)
+                    if tmp_path is not None and tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+                    return
+                # 原子 rename tmp → 正式 cache。rename 后才对消费端可见。
+                if tmp_path is not None and tmp_path.exists():
+                    try:
+                        tmp_path.replace(cache_path)
+                        logger.info("[precompute] published disk cache: %s", cache_path)
+                    except Exception as exc:
+                        logger.warning("[precompute] rename tmp→cache failed: %s", exc)
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+                self._open_position_cache = positions
+
+            logger.info(
+                "[precompute] open_position targets ready: %d rows in %.1fs",
+                len(positions), time.time() - t0,
+            )
+        except Exception as exc:
+            logger.error("[precompute] failed: %s", exc, exc_info=True)
+
+    def _invalidate_open_position_targets(self) -> None:
+        """Drop in-memory + on-disk precompute cache and bump generation.
+
+        Called from the fallback path once we decide to do inline inference.
+        Bumps a generation counter so any in-flight precompute thread, which
+        captured the generation at start, can detect invalidation and refuse
+        to write its result back — otherwise a late-finishing precompute
+        could resurrect a stale target that the next schedule fire would
+        consume, causing duplicate orders.
+
+        Safe to call multiple times.
+        """
+        with self._open_position_cache_lock:
+            self._open_position_cache = None
+            self._open_position_cache_generation += 1
+            gen = self._open_position_cache_generation
+        if self.output_path is not None and self.trading_day:
+            p = self.output_path / f"{self.trading_day}_open_position_targets.csv"
+            if p.exists():
+                try:
+                    p.unlink()
+                    logger.info("[open_position] removed stale precompute cache (gen=%d): %s",
+                                gen, p)
+                except Exception as exc:
+                    logger.warning("[open_position] cache unlink failed %s: %s", p, exc)
+
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         lock = (self._daily_position_lock
                 if (schedule is not None and schedule.name in ("daily_position", "open_position"))
@@ -1432,13 +1690,80 @@ class NativeEngine:
         # open_position: skip factor compute entirely, use prev_day_factors directly
         if schedule is not None and getattr(schedule, 'skip_factor_compute', False):
             date_str = self.trading_day
+            end_time_label = schedule.result_label or "093000"
+
+            # 快路径：消费启动时预计算好的 target weights，只跑 positions_to_orders
+            # （轻量，需要 9:30 实时 tick 价）。预计算 miss 则走下方 fallback。
+            cached_targets = self._pop_open_position_targets()
+            if cached_targets is not None and not cached_targets.empty:
+                logger.info("[open_position] %s using precomputed targets: %d rows",
+                            schedule.name, len(cached_targets))
+                positions_df = None
+                try:
+                    portfolio_context = None
+                    if self.portfolio_context_fn is not None:
+                        portfolio_context = self.portfolio_context_fn(date_str, end_time_label)
+                    if portfolio_context is not None:
+                        lp = self._snapshot_latest_prices()
+                        if lp:
+                            portfolio_context.meta["latest_prices"] = lp
+                    import importlib as _il
+                    tm = _il.import_module(
+                        os.environ.get("INFERENCE_MODULE",
+                                       "quant_platform.inference.tree_model_orders"))
+                    targets_to_orders = getattr(tm, "targets_to_orders", None)
+                    if targets_to_orders is None:
+                        # 老版本 inference 模块没有拆分接口 → 用 inference_fn 全跑
+                        logger.warning(
+                            "[open_position] inference module lacks targets_to_orders, "
+                            "precompute cache unusable; falling back")
+                    else:
+                        positions_df = targets_to_orders(
+                            cached_targets, date_str, end_time_label,
+                            daily_basic_df=self._daily_basic_df,
+                            portfolio_context=portfolio_context,
+                        )
+                except Exception as exc:
+                    logger.error("[open_position] targets_to_orders failed: %s",
+                                 exc, exc_info=True)
+                    positions_df = None
+
+                if positions_df is not None and not positions_df.empty:
+                    # 写一份 _positions.csv 保持兼容（监控/对账依赖）
+                    try:
+                        if self.output_path is not None:
+                            pos_file = self.output_path / f"{date_str}_{end_time_label}_positions.csv"
+                            _compact_output_copy(positions_df).to_csv(pos_file, index=False)
+                            logger.info("[open_position] wrote %s", pos_file)
+                    except Exception:
+                        pass
+                    if self._order_queue is not None:
+                        try:
+                            self._order_queue.put_nowait(
+                                (positions_df, date_str, end_time_label))
+                            logger.info("[order-gateway] enqueued %d rows date=%s end_time=%s",
+                                        len(positions_df), date_str, end_time_label)
+                        except queue.Full:
+                            logger.error("[order-gateway] queue full, drop %d rows",
+                                         len(positions_df))
+                    else:
+                        _push_to_order_gateway(positions_df, date_str, end_time_label)
+                    return
+                # targets_to_orders 失败 → 继续走 fallback
+                logger.warning("[open_position] targets_to_orders returned empty, falling back")
+
+            # fallback: 预计算 miss 或失败 → 退回原同步推理路径
             prev = self._prev_day_factors
             if prev is None or prev.empty:
                 logger.error("[open_position] prev_day_factors empty, skip %s",
                              schedule.name)
                 return
-            logger.info("[open_position] %s using prev_day_factors: %d rows",
+            logger.info("[open_position] %s cache miss, inline inference with prev_day_factors: %d rows",
                         schedule.name, len(prev))
+            # 清理可能晚到的预计算结果：fallback 一旦走了，磁盘 + 内存 cache
+            # 都不能再被消费（否则下次 open_position 重复触发时会读到陈旧
+            # target 重复下单；mark_run 已防重复，但再加一层主动清理更安全）。
+            self._invalidate_open_position_targets()
             results = prev.to_dict("records")
             self._write_results(results, date_str, "", schedule=schedule)
             return
@@ -1908,6 +2233,39 @@ class NativeEngine:
         # Build computation schedules from config
         self._schedules = build_schedules_from_env(self.factor_info)
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
+
+        # open_position 推理前置：pod 启动后异步跑树模型，把 target weights
+        # 缓存到内存 + 磁盘。9:30 schedule 触发时优先消费缓存，跳过重的
+        # 树模型推理，只跑轻量的 positions_to_orders（需要实时 tick）。
+        # daily_position (14:50) 不受影响 —— 走的是 use_daily_factor_module
+        # 主路径，不读这份 cache。
+        #
+        # ⚠️ 安全前提：tree_model_inference 默认 USE_OPTIMIZER=True，target
+        # positions 会受 portfolio_context.positions（current_weight）影响。
+        # 启用预计算前必须确认：从 pod 启动到 9:30 之间 broker 持仓不变。
+        # 适用场景：隔夜 rebalance 策略、ONE_TIME_CLOSE_ON_STARTUP=0、无其他
+        # schedule 在窗口内发单。否则 8:50 算出的 target 与 9:30 实际状态不符。
+        # 默认 OFF，需要显式设 OPEN_POSITION_PRECOMPUTE=1 开启。
+        precompute_enabled = _env_bool("OPEN_POSITION_PRECOMPUTE", False)
+        if (precompute_enabled
+                and self.inference_fn is not None
+                and self._prev_day_factors is not None
+                and not self._prev_day_factors.empty):
+            logger.info("[native] launching open_position precompute (OPEN_POSITION_PRECOMPUTE=1)")
+            threading.Thread(
+                target=self._precompute_open_position_targets,
+                name="open-position-precompute",
+                daemon=True,
+            ).start()
+        else:
+            logger.info(
+                "[native] precompute disabled (OPEN_POSITION_PRECOMPUTE=%s, "
+                "inference_fn=%s prev_day_factors=%s)",
+                "1" if precompute_enabled else "0",
+                bool(self.inference_fn),
+                bool(self._prev_day_factors is not None
+                     and not self._prev_day_factors.empty),
+            )
 
         # One-shot flatten at startup (sim reset; guarded by env + date flag)
         self._one_time_close_on_startup()
