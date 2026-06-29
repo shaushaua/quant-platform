@@ -227,10 +227,12 @@ spec:
               mountPath: /data/collector_output
             - name: shm-buffers
               mountPath: /data/quant/shm
+            - name: mdl-backup
+              mountPath: /data/quant/mdl_msg_backup
           resources:
             requests:
-              cpu: "4"
-              memory: 16Gi
+              cpu: "20"
+              memory: 48Gi
             limits:
               cpu: "32"
               memory: 90Gi
@@ -255,4 +257,8 @@ spec:
         - name: shm-buffers
           hostPath:
             path: /data/quant/shm
+            type: DirectoryOrCreate
+        - name: mdl-backup
+          hostPath:
+            path: /data/quant/mdl_msg_backup
             type: DirectoryOrCreate

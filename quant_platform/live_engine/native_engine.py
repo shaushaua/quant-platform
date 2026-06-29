@@ -34,7 +34,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime
+import zipfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -150,6 +151,15 @@ _deal_time_idx = _deal_buf_cols.index('Time')       # 0
 _deal_updtime_idx = _deal_buf_cols.index('UpdateTime')  # 1
 _order_time_idx = _order_buf_cols.index('Time')       # 0
 _order_updtime_idx = _order_buf_cols.index('UpdateTime')  # 1
+
+# Volume 列在 buf_cols 中的下标（用于实盘 ×100 对齐回测）。
+# 历史回测 _restore_oss_precision OSS 还原分支错误地把 Volume ×100
+# （Go converter 实际不缩放 Volume，存原始 Int64）。历史因子已基于
+# ×100 Volume 训练完毕，实盘必须同比放大，否则 Volume² 类因子差 10000 倍。
+# 实盘路径不经过 _restore_oss_precision，所以在这里直接放大。
+_tick_volume_idx = [i for i, c in enumerate(_tick_buf_cols) if "Volume" in c]
+_order_volume_idx = [i for i, c in enumerate(_order_buf_cols) if "Volume" in c]
+_deal_volume_idx = [i for i, c in enumerate(_deal_buf_cols) if "Volume" in c]
 _columns_by_kind = {
     KIND_TICK: TICK_COLUMNS,
     KIND_ORDER: ORDER_COLUMNS,
@@ -186,7 +196,8 @@ def _minute_end_time(now_dt: datetime) -> str:
 
 def _build_df_from_native(reader: NativeShmReader, columns: list,
                           buf_cols: list, time_idx: int, updtime_idx: int,
-                          trading_day: str, code: str) -> pd.DataFrame:
+                          trading_day: str, code: str,
+                          volume_idx: Optional[list] = None) -> pd.DataFrame:
     """Build DataFrame from native SHM reader.
 
     The C++ writer stores 79/9/10 numeric columns (skip TradingDay and Code).
@@ -194,6 +205,10 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
 
     Reads the full current-day buffer so factor code receives all data
     accumulated up to this round.
+
+    volume_idx: buf_cols 中名字含 'Volume' 的列下标。这些列会被 ×100
+    对齐回测（_restore_oss_precision OSS 还原分支对历史 Volume 错误 ×100，
+    历史因子已基于该量级训练，实盘必须同比）。None 表示不放大。
     """
     arr = reader.view_rows()
     if arr.shape[0] == 0:
@@ -213,6 +228,11 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
         _ns = np.full(len(_col_secs), _nat_int, dtype=np.int64)
         _ns[_valid] = base_ns + (_col_secs[_valid] * 1_000_000_000).astype(np.int64)
         df.iloc[:, _tc_idx] = _ns.astype('datetime64[ns]')
+
+    # Volume ×100 对齐回测（见函数 docstring 和模块级 _tick_volume_idx 注释）
+    if volume_idx:
+        for _vi in volume_idx:
+            df.iloc[:, _vi] = df.iloc[:, _vi].astype("float64") * 100.0
 
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
@@ -285,17 +305,17 @@ def _compute_code_batch_shm(args):
                 deal_path = deal_paths.get(code, "")
                 order_path = order_paths.get(code, "")
                 tick_df = (
-                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code)
+                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code, _tick_volume_idx)
                     if tick_path and need_tick
                     else pd.DataFrame()
                 )
                 deal_df = (
-                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code)
+                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code, _deal_volume_idx)
                     if deal_path and need_deal
                     else pd.DataFrame()
                 )
                 order_df = (
-                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code)
+                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code, _order_volume_idx)
                     if order_path and need_order
                     else pd.DataFrame()
                 )
@@ -430,6 +450,12 @@ class NativeEngine:
         self.factor_calculation: Optional[Callable] = None
         self.factor_info: Dict[str, Any] = {}
         self._daily_factor_info: Dict[str, Any] = {}
+        # Capture strategy.end_times so live passes the same end_time as backtest
+        # (worker_entrypoint.py reads getattr(strategy, "end_times", None)).
+        # Without this, daily output columns diverge: backtest emits F_<hash>_150000
+        # while live emits F_<hash> (no suffix).
+        self._factor_end_times: list = []
+        self._daily_end_times: list = []
         self.outfun: Optional[Callable] = None
         self.inference_fn: Optional[Callable] = None
         self.portfolio_context_fn: Optional[Callable] = None
@@ -859,6 +885,298 @@ class NativeEngine:
             by_code[code][kind] = path
         return by_code
 
+    # ───────────────────────────────────────────────────────────────
+    # 数据单位诊断 (单位 bug 定位用)
+    #
+    # 设计原则:
+    #   1. 每日只跑一次, 首次 cycle 触发 (trading_day 去重)
+    #   2. 纯只读, 所有异常吞掉, 不影响主链路
+    #   3. 利用原始数据自洽恒等式定位单位 bug:
+    #        TotalMoney / TotalVolume == CurrentPrice   (元÷股 = 元/股)
+    #        CurrentPrice ≈ PreClosePrice × (1 ± 10%)   (日内涨跌幅)
+    #        AskPrice1 / CurrentPrice ∈ [1.0, 1.1]      (卖一价 ≥ 现价)
+    #        BidPrice1 / CurrentPrice ∈ [0.9, 1.0]      (买一价 ≤ 现价)
+    #   4. SH/SZ 分别采样, 暴露 parser_sh.cpp vs parser_sz.cpp 解码差异
+    # ───────────────────────────────────────────────────────────────
+
+    # Tick 列下标 (与 native_mdl_collector/include/schema.h 一一对应)
+    _T_TIME            = 0
+    _T_CURRENT_PRICE   = 2
+    _T_TOTAL_VOLUME    = 3
+    _T_TOTAL_MONEY     = 4
+    _T_PRE_CLOSE       = 5
+    _T_OPEN            = 6
+    _T_HIGH            = 7
+    _T_LOW             = 8
+    _T_HIGH_LIMIT      = 9
+    _T_LOW_LIMIT       = 10
+    _T_TOTAL_BID_VOL   = 13
+    _T_TOTAL_ASK_VOL   = 14
+    _T_ASK_PRICE_1     = 17
+    _T_ASK_VOLUME_1    = 27
+    _T_BID_PRICE_1     = 47
+    _T_BID_VOLUME_1    = 57
+
+    _SANITY_PROBES = [
+        ("600519", "XSHG"),  # 贵州茅台 (SH 大盘, 高价股)
+        ("601318", "XSHG"),  # 中国平安 (SH 大盘)
+        ("000001", "XSHE"),  # 平安银行 (SZ 大盘)
+        ("000016", "XSHE"),  # *ST康佳 (SZ)
+        ("300750", "XSHE"),  # 宁德时代 (SZ 创业板)
+    ]
+
+    def _log_shm_sanity(self, files_by_code: Dict[str, Dict[int, str]]) -> None:
+        """记录 SHM 原始字段值, 用于事后与历史 parquet 比对, 定位单位 bug。
+
+        输出:
+          1. logger.warning 命中异常的恒等式
+          2. JSON 快照落盘到 /tmp/shm_sanity_<trading_day>.json
+        """
+        today = getattr(self, "trading_day", "")
+        if not today:
+            return
+        sentinel = f"sanity_done_{today}"
+        if getattr(self, "_sanity_flag", "") == sentinel:
+            return
+        self._sanity_flag = sentinel
+
+        import json as _json
+        snapshot = {
+            "trading_day": today,
+            "captured_at": datetime.now().isoformat(),
+            "samples": [],
+        }
+
+        for ticker, exch in self._SANITY_PROBES:
+            sym = f"{ticker}.{exch}"
+            kinds = files_by_code.get(sym)
+            if not kinds:
+                continue
+            tick_path = kinds.get(KIND_TICK)
+            if not tick_path:
+                continue
+
+            sample: Dict[str, Any] = {"code": sym}
+            try:
+                reader = self._get_cached_reader(tick_path)
+                if reader is None:
+                    sample["error"] = "no reader"
+                    snapshot["samples"].append(sample)
+                    continue
+                n = reader.refresh()
+                if n < 2:
+                    sample["error"] = f"too few rows: {n}"
+                    snapshot["samples"].append(sample)
+                    continue
+
+                arr = reader.view_rows()
+                first = arr[0]
+                last = arr[-1]
+
+                def _g(row, idx):
+                    v = float(row[idx])
+                    return v if np.isfinite(v) else None
+
+                sample.update({
+                    "row_count": int(n),
+                    "first_time_sec":   _g(first, self._T_TIME),
+                    "last_time_sec":    _g(last,  self._T_TIME),
+                    "first_price":      _g(first, self._T_CURRENT_PRICE),
+                    "first_volume":     _g(first, self._T_TOTAL_VOLUME),
+                    "first_money":      _g(first, self._T_TOTAL_MONEY),
+                    "last_price":       _g(last,  self._T_CURRENT_PRICE),
+                    "last_volume":      _g(last,  self._T_TOTAL_VOLUME),
+                    "last_money":       _g(last,  self._T_TOTAL_MONEY),
+                    "pre_close":        _g(last,  self._T_PRE_CLOSE),
+                    "open":             _g(last,  self._T_OPEN),
+                    "high":             _g(last,  self._T_HIGH),
+                    "low":              _g(last,  self._T_LOW),
+                    "high_limit":       _g(last,  self._T_HIGH_LIMIT),
+                    "low_limit":        _g(last,  self._T_LOW_LIMIT),
+                    "total_bid_vol":    _g(last,  self._T_TOTAL_BID_VOL),
+                    "total_ask_vol":    _g(last,  self._T_TOTAL_ASK_VOL),
+                    "ask_price_1":      _g(last,  self._T_ASK_PRICE_1),
+                    "ask_volume_1":     _g(last,  self._T_ASK_VOLUME_1),
+                    "bid_price_1":      _g(last,  self._T_BID_PRICE_1),
+                    "bid_volume_1":     _g(last,  self._T_BID_VOLUME_1),
+                })
+
+                # ── 恒等式 1: TotalMoney / TotalVolume ≈ CurrentPrice ──
+                # 单位自洽时 ratio ≈ 1.0; = 1000 → vol 单位差 1e3; = 1e-4 → money 差 1e4
+                lp = sample["last_price"]; lv = sample["last_volume"]; lm = sample["last_money"]
+                if lp and lv and lm and lp > 0 and lv > 0:
+                    implied_price = lm / lv
+                    ratio = implied_price / lp
+                    sample["implied_price"] = implied_price
+                    sample["implied_vs_actual"] = ratio
+                    if not (0.95 <= ratio <= 1.05):
+                        sample["UNIT_BUG_AMOUNT_VOL"] = (
+                            f"money/volume={implied_price:.6g} vs price={lp:.6g} "
+                            f"ratio={ratio:.4g} (1.0=ok; 1000=SH vol÷1e3; "
+                            f"1e-4=money÷1e4; 1e-3=SH price÷1e3)"
+                        )
+
+                # ── 恒等式 2: CurrentPrice ≈ PreClosePrice (±10%) ──
+                pc = sample["pre_close"]
+                if lp and pc and pc > 0:
+                    ret = lp / pc - 1.0
+                    sample["intraday_return"] = ret
+                    if abs(ret) > 0.15:
+                        sample["PRICE_DRIFT"] = (
+                            f"last_price/pre_close - 1 = {ret:.4%} "
+                            f"(异常, 检查 price 单位)"
+                        )
+                else:
+                    sample["PRECLOSE_MISSING"] = (
+                        f"pre_close={pc} (SH 端可能为 0)"
+                    )
+
+                # ── 恒等式 3: AskPrice1 >= CurrentPrice >= BidPrice1 ──
+                ap = sample["ask_price_1"]; bp = sample["bid_price_1"]
+                if lp and ap and ap > 0:
+                    r = ap / lp
+                    sample["ask_vs_price"] = r
+                    if not (0.99 <= r <= 1.10):
+                        sample["ASK_PRICE_BUG"] = (
+                            f"ask1/price={r:.4g} (异常)"
+                        )
+                if lp and bp and bp > 0:
+                    r = bp / lp
+                    sample["bid_vs_price"] = r
+                    if not (0.90 <= r <= 1.01):
+                        sample["BID_PRICE_BUG"] = (
+                            f"bid1/price={r:.4g} (异常)"
+                        )
+
+                # ── 涨跌停: SH 端协议不提供此字段, parser 写 0 (非 bug, 仅作信息) ──
+                if exch == "XSHG":
+                    hl = sample["high_limit"]; ll = sample["low_limit"]
+                    if (hl == 0.0 or ll == 0.0):
+                        sample["SH_LIMIT_ZERO"] = (
+                            "SH tick high_limit/low_limit=0 (SHL2 协议未提供, 非解码 bug)"
+                        )
+
+                # ── AskVolume/BidVolume 比值 ──
+                av = sample["ask_volume_1"]; bv = sample["bid_volume_1"]
+                if av and bv and bv > 0:
+                    r = av / bv
+                    sample["ask_vol_bid_vol"] = r
+                    # SH ask_vol÷1e3, SZ raw; 比值应在合理区间
+                    if r > 1000 or r < 0.001:
+                        sample["LVL_VOL_BUG"] = (
+                            f"ask_vol1/bid_vol1={r:.4g} (异常, 检查 10 档量单位)"
+                        )
+
+                # ── deal/order 行数 + 末笔字段 (用于明天与 OSS parquet 直接 diff) ──
+                # Deal 列下标 (schema.h)
+                #   0=Time 4=Side 5=Price 6=Volume 7=Money
+                # Order 列下标
+                #   0=Time 3=Side 4=Price 5=Volume
+                sample["deal_rows"] = None
+                sample["order_rows"] = None
+                deal_path = kinds.get(KIND_DEAL)
+                order_path = kinds.get(KIND_ORDER)
+
+                for kind_name, k_path, k_idx in [
+                    ("deal",  deal_path,  KIND_DEAL),
+                    ("order", order_path, KIND_ORDER),
+                ]:
+                    if not k_path:
+                        continue
+                    try:
+                        kr = self._get_cached_reader(k_path)
+                        if kr is None:
+                            continue
+                        kn = kr.refresh()
+                        if kn == 0:
+                            sample[f"{kind_name}_rows"] = 0
+                            continue
+                        karr = kr.view_rows()
+                        first_r = karr[0]; last_r = karr[-1]
+                        if kind_name == "deal":
+                            sample[f"{kind_name}_rows"] = int(kn)
+                            sample[f"{kind_name}_first"] = {
+                                "time": float(first_r[0]) if np.isfinite(first_r[0]) else None,
+                                "side": int(first_r[4]) if np.isfinite(first_r[4]) else None,
+                                "price": float(first_r[5]) if np.isfinite(first_r[5]) else None,
+                                "volume": float(first_r[6]) if np.isfinite(first_r[6]) else None,
+                                "money": float(first_r[7]) if np.isfinite(first_r[7]) else None,
+                            }
+                            sample[f"{kind_name}_last"] = {
+                                "time": float(last_r[0]) if np.isfinite(last_r[0]) else None,
+                                "side": int(last_r[4]) if np.isfinite(last_r[4]) else None,
+                                "price": float(last_r[5]) if np.isfinite(last_r[5]) else None,
+                                "volume": float(last_r[6]) if np.isfinite(last_r[6]) else None,
+                                "money": float(last_r[7]) if np.isfinite(last_r[7]) else None,
+                            }
+                            # 总成交金额 = 末笔 Money (cumulative), 验证与 tick.last_money 一致
+                            sample[f"{kind_name}_total_money"] = (
+                                float(last_r[7]) if np.isfinite(last_r[7]) else None
+                            )
+                        else:  # order
+                            sample[f"{kind_name}_rows"] = int(kn)
+                            sample[f"{kind_name}_first"] = {
+                                "time": float(first_r[0]) if np.isfinite(first_r[0]) else None,
+                                "side": int(first_r[3]) if np.isfinite(first_r[3]) else None,
+                                "price": float(first_r[4]) if np.isfinite(first_r[4]) else None,
+                                "volume": float(first_r[5]) if np.isfinite(first_r[5]) else None,
+                            }
+                            sample[f"{kind_name}_last"] = {
+                                "time": float(last_r[0]) if np.isfinite(last_r[0]) else None,
+                                "side": int(last_r[3]) if np.isfinite(last_r[3]) else None,
+                                "price": float(last_r[4]) if np.isfinite(last_r[4]) else None,
+                                "volume": float(last_r[5]) if np.isfinite(last_r[5]) else None,
+                            }
+                    except Exception as _e:
+                        sample[f"{kind_name}_error"] = f"{type(_e).__name__}: {_e}"
+
+                # ── 关键 diff 指标: tick 行数 + deal 行数 + 时间跨度 ──
+                # 这些是明天与 parquet 对比的一锤定音字段
+                sample["summary"] = {
+                    "tick_rows": sample.get("row_count"),
+                    "deal_rows": sample.get("deal_rows"),
+                    "order_rows": sample.get("order_rows"),
+                    "tick_time_span_sec": (
+                        sample["last_time_sec"] - sample["first_time_sec"]
+                        if sample.get("first_time_sec") is not None
+                            and sample.get("last_time_sec") is not None
+                        else None
+                    ),
+                    "last_price": sample.get("last_price"),
+                    "last_volume": sample.get("last_volume"),
+                    "last_money": sample.get("last_money"),
+                }
+
+            except Exception as exc:
+                sample["error"] = f"{type(exc).__name__}: {exc}"
+
+            snapshot["samples"].append(sample)
+
+        # 落盘
+        try:
+            out_path = f"/tmp/shm_sanity_{today}.json"
+            with open(out_path, "w") as f:
+                _json.dump(snapshot, f, indent=2, ensure_ascii=False, default=str)
+        except Exception:
+            out_path = "(write failed)"
+
+        # 告警汇总
+        flag_keys = [
+            "UNIT_BUG_AMOUNT_VOL", "PRICE_DRIFT", "PRECLOSE_MISSING",
+            "ASK_PRICE_BUG", "BID_PRICE_BUG", "SH_LIMIT_ZERO",
+            "LVL_VOL_BUG",
+        ]
+        n_alerts = 0
+        for s in snapshot["samples"]:
+            for k in flag_keys:
+                if k in s:
+                    n_alerts += 1
+                    logger.warning("[shm-sanity] %s | %s: %s",
+                                  s.get("code", "?"), k, s[k])
+
+        logger.info("[shm-sanity] captured %d samples, %d alerts, snapshot=%s",
+                    len(snapshot["samples"]), n_alerts, out_path)
+
     @staticmethod
     def _raw_time_from_seconds(seconds: float) -> str:
         # np.isfinite rejects NaN and inf; combined with `> 0` this covers NaN,
@@ -1165,6 +1483,8 @@ class NativeEngine:
         self._release_pool()
         if self._upload_raw_day_to_oss():
             self._uploaded_today = True
+        # 上传 feeder_client 原始 CSV 备份到 raw_msgs/{date}/（和 ftp 同名）
+        self._upload_mdl_backup_to_oss()
 
     def _upload_raw_day_to_oss(self) -> bool:
         date_str = self.trading_day
@@ -1276,6 +1596,104 @@ class NativeEngine:
         map_tmp_path.unlink(missing_ok=True)
         logger.info("[native-archive] %s upload finished", date_str)
         return uploaded_any and not had_error
+
+    def _upload_mdl_backup_to_oss(self) -> None:
+        """上传 feeder_client mdl_msg_backup 当日 CSV 到 OSS raw_msgs/{date}/。
+
+        每个 csv 单独 zip 压缩，上传到：
+            oss://{bucket}/raw_msgs/{date}/{csv文件名}.zip
+
+        命名和 ftp-to-oss 拉来的完全对齐（如 20260629_mdl_6_50_0.csv.zip），
+        下游无需区分数据来源。OSS 已存在同名的跳过。
+        """
+        backup_dir = Path(os.environ.get("MDL_BACKUP_DIR", "/data/quant/mdl_msg_backup"))
+        if not backup_dir.exists():
+            logger.warning("[mdl-backup] %s missing, skip", backup_dir)
+            return
+
+        date_str = self.trading_day
+        oss_prefix = os.environ.get("MDL_MSG_OSS_PREFIX", "raw_msgs").strip("/")
+
+        # 按 mtime 过滤当日文件（CST 时区）
+        day = datetime.strptime(date_str, "%Y%m%d")
+        day_start = day - timedelta(hours=8)
+        day_end = day_start + timedelta(days=1)
+        ts_start = day_start.timestamp()
+        ts_end = day_end.timestamp()
+
+        csvs = []
+        for p in sorted(backup_dir.glob("*.csv")):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if ts_start <= st.st_mtime < ts_end:
+                csvs.append((p, st.st_size))
+
+        if not csvs:
+            logger.warning("[mdl-backup] no csv files for %s under %s", date_str, backup_dir)
+            return
+
+        total = sum(s for _, s in csvs)
+        logger.info("[mdl-backup] %d csv files (%.2f GB) for %s",
+                    len(csvs), total / 1024**3, date_str)
+
+        try:
+            import oss2
+            bucket = self._get_oss_bucket()
+        except Exception as exc:
+            logger.error("[mdl-backup] OSS init failed: %s", exc)
+            return
+
+        tmp_root = Path("/tmp/mdl_backup_zip")
+        tmp_root.mkdir(parents=True, exist_ok=True)
+
+        done = 0
+        failed = []
+        for csv_path, csv_size in csvs:
+            oss_key = f"{oss_prefix}/{date_str}/{csv_path.name}.zip"
+
+            # OSS 已有同名则跳过（ftp 已传过）
+            try:
+                meta = bucket.head_object(oss_key)
+                if meta.content_length > 0:
+                    logger.info("[mdl-backup] skip (exists): %s", oss_key)
+                    done += 1
+                    continue
+            except oss2.exceptions.NoSuchKey:
+                pass
+            except Exception as exc:
+                logger.warning("[mdl-backup] head %s failed: %s", oss_key, exc)
+
+            tmp_zip = tmp_root / f"{csv_path.name}.zip"
+            try:
+                with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
+                    zf.write(csv_path, csv_path.name)
+                zip_size = tmp_zip.stat().st_size
+
+                if zip_size >= 100 * 1024 * 1024:
+                    oss2.resumable_upload(
+                        bucket, oss_key, str(tmp_zip),
+                        multipart_threshold=100 * 1024 * 1024,
+                        part_size=20 * 1024 * 1024,
+                        num_threads=4,
+                    )
+                else:
+                    bucket.put_object_from_file(oss_key, str(tmp_zip))
+                done += 1
+                logger.info("[mdl-backup] uploaded %s (%.1f MB → %.1f MB)",
+                            oss_key, csv_size / 1024**2, zip_size / 1024**2)
+            except Exception as exc:
+                logger.error("[mdl-backup] upload %s failed: %s", csv_path.name, exc,
+                             exc_info=True)
+                failed.append(csv_path.name)
+            finally:
+                try:
+                    tmp_zip.unlink()
+                except OSError:
+                    pass
+
+        logger.info("[mdl-backup] done %d/%d, %d failed", done, len(csvs), len(failed))
 
     def _archive_select_clause(self, kind: str) -> str:
         if kind == "order":
@@ -1777,14 +2195,29 @@ class NativeEngine:
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        # Keep daily strategy compatible with historical daily factor runs:
-        # daily strategies receive end_time="" for full-day calculation.
-        end_time = "" if use_daily_module else _minute_end_time(now_dt)
+        # Honor strategy.end_times for daily schedules, mirroring backtest
+        # worker_entrypoint.py:297 (getattr(strategy, "end_times", None)).
+        # If neither strategy nor daily factor module declares end_times,
+        # fall back to "" — same as worker_entrypoint.py:316's `end_times = [""]`
+        # when compute_interval=0. Daily strategies suffix output columns
+        # with end_time (F_<hash>_150000 vs F_<hash>), so any drift here
+        # breaks column-name parity between backtest and live.
+        if use_daily_module:
+            ets = self._daily_end_times or self._factor_end_times
+            end_time = ets[0] if ets else ""
+        else:
+            end_time = _minute_end_time(now_dt)
         self._round_count += 1
 
         files_by_code = self._scan_shm_files()
         if not files_by_code:
             return
+
+        # 每日首次 cycle: 记录 SHM 原始字段值, 用于事后与历史 parquet 比对定位单位 bug
+        try:
+            self._log_shm_sanity(files_by_code)
+        except Exception as _e:
+            logger.debug("[shm-sanity] skipped: %s", _e)
 
         snap_t0 = time.perf_counter()
         wall_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
@@ -2004,6 +2437,31 @@ class NativeEngine:
         prev_day_factors = self._prev_day_factors
         idx_cons_df = self._idx_cons_df
         trading_universe_df = self._trading_universe_df
+        # Snapshot latest_prices BEFORE fork so the child inherits a fresh view.
+        # Originally this ran inside the forked child, but tick sync happens in a
+        # sibling thread of the PARENT (not copied into the child after fork).
+        # When pod init finished late (e.g. 09:33 today but _states only got
+        # populated at 09:35), the child snapshotted an empty dict and kept it
+        # forever → positions_to_orders dropped everything for "no realtime price".
+        # For open_position we additionally wait briefly until _states is non-empty.
+        is_open_position = (schedule is not None
+                            and getattr(schedule, 'skip_factor_compute', False))
+        pre_fork_latest_prices = self._snapshot_latest_prices()
+        if is_open_position and not pre_fork_latest_prices:
+            deadline_lp = time.time() + 60
+            while time.time() < deadline_lp:
+                pre_fork_latest_prices = self._snapshot_latest_prices()
+                if pre_fork_latest_prices:
+                    logger.info("[open_position] latest_prices populated after "
+                                "%.0fs wait (%d codes)",
+                                time.time() - (deadline_lp - 60),
+                                len(pre_fork_latest_prices))
+                    break
+                time.sleep(2)
+            if not pre_fork_latest_prices:
+                logger.warning("[open_position] latest_prices still empty after "
+                               "60s wait; positions_to_orders may drop all rows")
+
         try:
             read_fd, write_fd = os.pipe()
             pid = os.fork()
@@ -2030,11 +2488,12 @@ class NativeEngine:
                                 portfolio_context = portfolio_context_fn(date_str, rt_end_time)
                             # Augment with engine realtime tick prices (latest_price
                             # from shm sync). Used by open_position at 9:30 to size
-                            # orders off live tick instead of daily_basic.close.
-                            if portfolio_context is not None:
-                                lp = self._snapshot_latest_prices()
-                                if lp:
-                                    portfolio_context.meta["latest_prices"] = lp
+                            # orders off live tick instead of daily_basic.close).
+                            # Snapshot is taken in the parent before fork (see
+                            # pre_fork_latest_prices) so we don't race against the
+                            # parent's tick thread from inside the child.
+                            if portfolio_context is not None and pre_fork_latest_prices:
+                                portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
                             universe_extra = {
                                 "date": date_str,
                                 "end_time": rt_end_time,
@@ -2141,6 +2600,7 @@ class NativeEngine:
             _factor_fn = mod.factor_calculation
             self.factor_info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {})) or {}
             _factor_info = self.factor_info
+            self._factor_end_times = list(getattr(mod, "end_times", []) or [])
             self.factor_calculation = mod.factor_calculation
             self.outfun = getattr(mod, "outfun", None)
             logger.info("[native] loaded factor: %s factor_info=%s", self.factor_module, self.factor_info)
@@ -2154,8 +2614,9 @@ class NativeEngine:
                 dmod = importlib.import_module(self.daily_factor_module)
                 self._daily_factor_fn = dmod.factor_calculation
                 self._daily_factor_info = getattr(dmod, "FACTOR_INFO", getattr(dmod, "factor_info", {})) or {}
-                logger.info("[native] loaded daily factor: %s factor_info=%s",
-                            self.daily_factor_module, self._daily_factor_info)
+                self._daily_end_times = list(getattr(dmod, "end_times", []) or [])
+                logger.info("[native] loaded daily factor: %s factor_info=%s end_times=%s",
+                            self.daily_factor_module, self._daily_factor_info, self._daily_end_times)
             except Exception as exc:
                 logger.error("[native] failed to load daily factor module %s: %s",
                              self.daily_factor_module, exc)

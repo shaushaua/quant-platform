@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -211,9 +212,17 @@ def read_oss_object_cached(
         raise last_exc
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    # 唯一化 tmp 文件名：precompute 线程和 fallback inline fork 可能并发下载
+    # 同一 OSS key，共用 ".tmp" 后缀会出现一个 rename 走、另一个 FileNotFoundError。
+    tmp_path = local_path.with_name(
+        f"{local_path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    )
     tmp_path.write_bytes(payload)
     tmp_path.replace(local_path)
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
     return payload
 
 

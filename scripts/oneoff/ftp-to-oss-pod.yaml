@@ -1,0 +1,72 @@
+---
+# 一次性 pod：从 ftp.datayes.com 拉当日 zip 上传 OSS raw_msgs/{date}/
+# 调度到专用节点池 np148f9c70e5424c10a90e96c957dff390（无 combined-engine 标签）
+# 镜像复用 combined-engine（节点已 cache，含 python3 + oss2）
+#
+# 部署步骤：
+#   1. 先创建 ConfigMap（Pod 通过 volumeMount 把脚本挂进 /app/ftp_to_oss.py）：
+#        kubectl -n quant create configmap ftp-to-oss-script \
+#          --from-file=ftp_to_oss.py=scripts/ftp_to_oss.py
+#   2. kubectl -n quant apply -f scripts/oneoff/ftp-to-oss-pod.yaml
+#   3. 跑完手动清理：
+#        kubectl -n quant delete pod ftp-to-oss
+#        kubectl -n quant delete configmap ftp-to-oss-script
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ftp-to-oss
+  namespace: quant
+  labels:
+    app: ftp-to-oss
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    alibabacloud.com/nodepool-id: np148f9c70e5424c10a90e96c957dff390
+  containers:
+    - name: runner
+      image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+      imagePullPolicy: IfNotPresent
+      workingDir: /app
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          python3 /app/ftp_to_oss.py || { echo "=== script failed, sleeping for debug ==="; sleep 3600; }
+      env:
+        - name: TARGET_DATE
+          value: "20260629"
+        - name: OSS_PREFIX
+          value: "raw_msgs"
+        - name: FTP_REMOTE_DIR
+          value: "/L2_services"
+        # 第一次先 LIST_ONLY=1 探 FTP 目录结构，确认后再改成 0 全量拉
+        - name: LIST_ONLY
+          value: "0"
+        # FTP_HOST / FTP_USER / FTP_PASS 从下面 envFrom 的 quant-secrets 注入
+        # 不要在这里写明文 env，会覆盖 secret 且随 git 泄露
+      envFrom:
+        - secretRef:
+            name: quant-secrets
+      volumeMounts:
+        - name: script
+          mountPath: /app/ftp_to_oss.py
+          subPath: ftp_to_oss.py
+        - name: workdir
+          mountPath: /tmp/ftp_to_oss
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 512Mi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+  volumes:
+    - name: script
+      configMap:
+        name: ftp-to-oss-script
+        items:
+          - key: ftp_to_oss.py
+            path: ftp_to_oss.py
+    - name: workdir
+      emptyDir: {}

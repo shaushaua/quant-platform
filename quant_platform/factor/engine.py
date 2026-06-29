@@ -759,10 +759,15 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     Go data-converter (deeptrade) 对数据做了压缩：
       - Code 列存为 SECURITY_ID 整数 (int32)
       - 价格列 ×100 存为 int32
-      - 成交量列 ÷100 存为 int32
+      - 成交量列：Go 不缩放，直接存 Int64 原始值（opt_parquet_writer.go 注释"原始值"）
 
-    通过检测列类型（int32 vs float64/string）自动判断是否需要还原，
-    不影响实时 collector 数据（float64 价格 + string code）。
+    ⚠️ 已知问题：下方 OSS 还原分支对 Volume ×100（注释曾写"成交量÷100存"，
+    但 Go 从未压缩 Volume）。历史回测因子已基于 ×100 的 Volume 算完，
+    无法重算。为保持实盘与回测一致，实盘路径在 `_build_df_from_native`
+    (native_engine.py) 里同比放大 Volume ×100。
+
+    本函数只在回测路径被调用（engine.py batch loader + api.load_stock_data）。
+    通过检测列类型（int32 vs float64/string）自动判断是否需要还原。
     """
     if df.empty:
         return df
@@ -777,7 +782,9 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
         return df
 
     if not pd.api.types.is_integer_dtype(df[code_col]):
-        return df  # 实时数据，无需还原
+        # 实时 collector 数据直接返回。实盘 Volume ×100 对齐在
+        # `_build_df_from_native` 里做（本函数不在实盘路径上）。
+        return df
 
     # --- 需要还原 ---
     restored_prices = []
