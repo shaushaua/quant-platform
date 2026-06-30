@@ -46,6 +46,10 @@ private:
     std::atomic<std::uint64_t> push_sample_count_{0};
 
     void _sample_push_delay(const char* kind, const std::string& code, double exch_sec, double recv_sec);
+    // Captures wall time NOW (just after writer_.append_*) and aggregates the
+    // delta from recv_sec into internal_buckets_. Called immediately after the
+    // SHM write so the measurement reflects parse+write cost for this row.
+    void _sample_internal_latency(const char* kind, double recv_sec);
 
     // ── Per-minute push-delay aggregation ──────────────────────────────
     // Accumulates delay samples bucketed by the integer minute of recv_sec.
@@ -64,11 +68,14 @@ private:
     };
     // One bucket per kind: index 0=tick, 1=order, 2=deal (see _kind_index).
     DelayBucket delay_buckets_[3];
+    // Parallel buckets for internal C++ parse+SHM-write latency (post_shm-recv).
+    DelayBucket internal_buckets_[3];
     std::mutex delay_mutex_;
     static int _kind_index(const char* kind);
     // Emit one bucket to stderr and reset it. NOT thread-safe — caller must
-    // hold delay_mutex_. kind_name is the label printed in the log line.
-    void _emit_bucket_(DelayBucket& b, const char* kind_name);
+    // hold delay_mutex_. kind_name is the label printed in the log line;
+    // prefix selects [push-latency] vs [internal-proc].
+    void _emit_bucket_(DelayBucket& b, const char* kind_name, const char* prefix);
 
     // Per (serviceID, messageID) expected sequence tracking
     struct SeqKey {

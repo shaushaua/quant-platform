@@ -203,4 +203,21 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             skip_factor_compute=True,
         ))
 
+    if "daily_basic_refresh" in enabled:
+        # Post-close trigger to upload T-0 daily_basic + composition to OSS.
+        # MySQL mkt_equd is written at ~15:07 (A-share close + clearing),
+        # so 15:30 is the earliest safe fire time. Without this, OSS path
+        # returns no T-0 rows and DailyBasicCache falls back to MySQL /
+        # T-1 latest_date (see _load_daily_basic).
+        t = _parse_trigger_time(
+            os.environ.get("DAILY_BASIC_REFRESH_TRIGGER_TIME", "15:30"),
+            (15, 30), "DAILY_BASIC_REFRESH_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="daily_basic_refresh",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            run_inference=False,
+            is_daily_result=False,
+        ))
+
     return schedules

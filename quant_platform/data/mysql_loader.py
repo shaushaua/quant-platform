@@ -810,10 +810,11 @@ class DailyBasicCache:
         # 1. 优先 OSS
         if self._oss_loader is not None:
             try:
-                df = self._oss_loader.read_daily_basic(td)
+                df = self._oss_loader.read_daily_basic(td, self.market_count)
                 if df is not None and not df.empty:
                     logger.info(
                         f"daily_basic OSS hit: trading_day={td}, "
+                        f"market_count={self.market_count}, "
                         f"{len(df)} rows, {len(df.columns)} cols"
                     )
                     self._put(td, df)

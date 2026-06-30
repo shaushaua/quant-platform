@@ -195,27 +195,71 @@ class OSSDataLoader:
             df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
         return df
 
-    def read_daily_basic(self, date_str: str) -> pd.DataFrame:
+    def read_daily_basic(self, date_str: str, market_count: int = 1) -> pd.DataFrame:
         """
         读取日线基础数据 (daily_basic_data.parquet)。
 
-        与 deeptrade 流水线 GenerateDailyBasicData 生成的 96 列 schema 对齐
+        与 MySQLLoader.get_daily_basic 行为对齐：market_count>1 时从 date_str
+        （含当天）往前回溯 market_count 个交易日，concat 后每行带 `_date` 列
+        （YYYYMMDD）。这保证了实盘 OSS path 与回测/MySQL path 取数口径一致，
+        下游 native_engine._load_daily_basic 的 `_date` 切片逻辑才能生效。
+
+        单 parquet schema 与 deeptrade 流水线 GenerateDailyBasicData 对齐
         (equity + barra48 + index24)。路径:
             {year}/{year}{month}/{year}{month}{day}/{year}{month}{day}_daily_basic_data.parquet
 
         Args:
-            date_str: 交易日 YYYYMMDD
+            date_str:     交易日 YYYYMMDD
+            market_count: 需要的历史天数（含 date_str 当天），默认 1
 
         Returns:
             pd.DataFrame,失败返回空 DataFrame(由调用方决定是否 fallback MySQL)
         """
-        key = self._object_key(date_str, "daily_basic")
-        df = self._read_small_file(key)
-        if df.empty:
+        td = date_str.replace("-", "")[:8]
+
+        if market_count <= 1:
+            df = self._read_daily_basic_one(td)
+            if df.empty:
+                return df
+            df["_date"] = td
+            if "ID_QI" in df.columns:
+                df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
             return df
-        if "ID_QI" in df.columns:
-            df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
-        return df
+
+        days = self._get_prev_trading_days(td, market_count)
+        if not days:
+            df = self._read_daily_basic_one(td)
+            if df.empty:
+                return df
+            df["_date"] = td
+            if "ID_QI" in df.columns:
+                df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
+            return df
+
+        dfs = []
+        for day in days:
+            df = self._read_daily_basic_one(day)
+            if df.empty:
+                logger.warning(f"read_daily_basic: OSS miss for day={day} in market_count={market_count}")
+                continue
+            df["_date"] = day
+            dfs.append(df)
+        if not dfs:
+            return pd.DataFrame()
+        out = pd.concat(dfs, ignore_index=True)
+        if "ID_QI" in out.columns:
+            out["ID_QI"] = out["ID_QI"].astype(str).str.zfill(6)
+        logger.info(
+            f"read_daily_basic multi-day: trading_day={td}, "
+            f"market_count={market_count}, got={len(days)} days, "
+            f"{len(out)} rows"
+        )
+        return out
+
+    def _read_daily_basic_one(self, date_str: str) -> pd.DataFrame:
+        """读取单日 daily_basic parquet (无 _date 列)。"""
+        key = self._object_key(date_str, "daily_basic")
+        return self._read_small_file(key)
 
     def upload_daily_basic(self, date_str: str, df: pd.DataFrame) -> bool:
         """将 daily_basic DataFrame 写成 parquet 上传 OSS (供 data_refresh 调用)。"""

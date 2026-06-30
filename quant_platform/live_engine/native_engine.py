@@ -197,7 +197,8 @@ def _minute_end_time(now_dt: datetime) -> str:
 def _build_df_from_native(reader: NativeShmReader, columns: list,
                           buf_cols: list, time_idx: int, updtime_idx: int,
                           trading_day: str, code: str,
-                          volume_idx: Optional[list] = None) -> pd.DataFrame:
+                          volume_idx: Optional[list] = None,
+                          historical_compat: bool = False) -> pd.DataFrame:
     """Build DataFrame from native SHM reader.
 
     The C++ writer stores 79/9/10 numeric columns (skip TradingDay and Code).
@@ -227,12 +228,41 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
         _valid = np.isfinite(_col_secs) & (_col_secs >= 0)
         _ns = np.full(len(_col_secs), _nat_int, dtype=np.int64)
         _ns[_valid] = base_ns + (_col_secs[_valid] * 1_000_000_000).astype(np.int64)
-        df.iloc[:, _tc_idx] = _ns.astype('datetime64[ns]')
+        df[buf_cols[_tc_idx]] = _ns.astype('datetime64[ns]')
 
     # Volume ×100 对齐回测（见函数 docstring 和模块级 _tick_volume_idx 注释）
     if volume_idx:
         for _vi in volume_idx:
             df.iloc[:, _vi] = df.iloc[:, _vi].astype("float64") * 100.0
+
+    # Historical archive upload sorts merged parquet by SECURITY_ID, SeqNum.
+    # Live factors must see the same per-code row order, otherwise
+    # rolling/diff/tail/iloc based factors can diverge on identical rows.
+    if historical_compat and "SeqNum" in df.columns:
+        df = df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
+
+    # Match historical _restore_oss_precision exactly for model compatibility.
+    # Archive parquet stores UpdateTime as full epoch_us, but the historical
+    # restore path treats it as an offset from Time. Keep the same quirk in
+    # live factors because models were trained on that historical output.
+    if historical_compat and "Time" in df.columns and "UpdateTime" in df.columns:
+        upd_ns = pd.to_datetime(df["UpdateTime"], errors="coerce").astype("int64")
+        valid = upd_ns != _nat_int
+        compat_update = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+        if valid.any():
+            compat_update.loc[valid] = (
+                pd.to_datetime(df.loc[valid, "Time"], errors="coerce")
+                + pd.to_timedelta((upd_ns[valid] // 1000).astype("int64"), unit="us")
+            )
+        df["UpdateTime"] = compat_update
+
+    if historical_compat:
+        for _col in (
+            "OrderID", "SaleOrderID", "BuyOrderID", "Side", "OrderType",
+            "TradeNum", "Channel", "SeqNum",
+        ):
+            if _col in df.columns:
+                df[_col] = pd.to_numeric(df[_col], errors="coerce").fillna(0).astype("int64")
 
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
@@ -305,17 +335,17 @@ def _compute_code_batch_shm(args):
                 deal_path = deal_paths.get(code, "")
                 order_path = order_paths.get(code, "")
                 tick_df = (
-                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code, _tick_volume_idx)
+                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code, _tick_volume_idx, True)
                     if tick_path and need_tick
                     else pd.DataFrame()
                 )
                 deal_df = (
-                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code, _deal_volume_idx)
+                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code, _deal_volume_idx, True)
                     if deal_path and need_deal
                     else pd.DataFrame()
                 )
                 order_df = (
-                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code, _order_volume_idx)
+                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code, _order_volume_idx, True)
                     if order_path and need_order
                     else pd.DataFrame()
                 )
@@ -550,18 +580,38 @@ class NativeEngine:
             gc.collect()
 
     def _load_daily_basic(self) -> None:
-        """Load daily basic data from MySQL."""
-        if "DAILY_BASIC_MARKET_COUNT" in os.environ:
-            market_count = int(os.environ["DAILY_BASIC_MARKET_COUNT"])
-        else:
-            market_count = 1
-            if self.factor_module:
-                try:
-                    mod = importlib.import_module(self.factor_module)
-                    factor_info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {}))
-                    market_count = int(factor_info.get("market_count", 1))
-                except Exception as exc:
-                    logger.warning("[native] failed to resolve factor market_count, fallback to 1: %s", exc)
+        """Load daily basic data, market_count 跟随策略 FACTOR_INFO.market_count.
+
+        策略 .so 改 market_count 时引擎自动跟随，无需同步改 k8s env。
+        优先级：
+          1. 扫描 FACTOR_MODULE + DAILY_FACTOR_MODULE 的 FACTOR_INFO.market_count，取 max
+          2. 策略没声明或读取失败 → DAILY_BASIC_MARKET_COUNT env 兜底
+          3. 都没 → 1 天
+        """
+        market_count = 1
+        # 1. 从策略 factor_info 读
+        strategy_modules = [m for m in (self.factor_module, self.daily_factor_module) if m]
+        resolved_from_strategy = False
+        for mod_path in strategy_modules:
+            try:
+                mod = importlib.import_module(mod_path)
+                fi = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {})) or {}
+                mc = int(fi.get("market_count", 1))
+                if mc > market_count:
+                    market_count = mc
+                resolved_from_strategy = True
+            except Exception as exc:
+                logger.warning("[native] failed to read market_count from %s: %s", mod_path, exc)
+        # 2. 策略没读到 → env 兜底
+        if not resolved_from_strategy and "DAILY_BASIC_MARKET_COUNT" in os.environ:
+            try:
+                market_count = int(os.environ["DAILY_BASIC_MARKET_COUNT"])
+            except Exception:
+                pass
+        logger.info("[native] daily_basic market_count=%d (from=%s)",
+                    market_count,
+                    "strategy" if resolved_from_strategy else
+                    ("env" if "DAILY_BASIC_MARKET_COUNT" in os.environ else "default"))
 
         self._daily_cache = DailyBasicCache(market_count=market_count)
         # 初始化 OSS loader 并传给 cache (优先 OSS,fallback MySQL)
@@ -2085,6 +2135,46 @@ class NativeEngine:
                 except Exception as exc:
                     logger.warning("[open_position] cache unlink failed %s: %s", p, exc)
 
+    def _refresh_daily_basic_upload(self) -> None:
+        """盘后 15:30 trigger: 重新生成并上传 T-0 daily_basic + composition 到 OSS。
+
+        MySQL mkt_equd 在 15:07 左右写入当日行情，pod 启动 8:50 拉时 T-0 还空。
+        此 trigger 在收盘后补刷 T-0，让次日 pod 启动 OSS path 能直接命中
+        完整 market_count 天数据（无需 MySQL fallback / T-1 latest_date 降级）。
+        """
+        td = self.trading_day
+        if not td:
+            logger.warning("[daily_basic_refresh] trading_day empty, skip")
+            return
+        t0 = time.time()
+        try:
+            from quant_platform.data.data_refresh import refresh_daily_data
+            from quant_platform.data.mysql_loader import MySQLLoader
+            from quant_platform.data.datayes_client import DatayesClient
+
+            oss = OSSDataLoader()
+            mysql = MySQLLoader()
+            mysql.connect()
+            datayes = None
+            token = os.environ.get("DATAYES_TOKEN", "").strip()
+            if token:
+                try:
+                    datayes = DatayesClient(token=token)
+                except Exception as exc:
+                    logger.warning("[daily_basic_refresh] DatayesClient init failed: %s", exc)
+            try:
+                ok = refresh_daily_data(td, oss, mysql, datayes, force=False)
+                logger.info("[daily_basic_refresh] trading_day=%s ok=%s elapsed=%.1fs",
+                            td, ok, time.time() - t0)
+            finally:
+                try:
+                    mysql.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.error("[daily_basic_refresh] trading_day=%s failed: %s",
+                         td, exc, exc_info=True)
+
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         lock = (self._daily_position_lock
                 if (schedule is not None and schedule.name in ("daily_position", "open_position"))
@@ -2195,15 +2285,14 @@ class NativeEngine:
         pipe_log = get_streaming_logger()
         now_dt = datetime.now()
         date_str = self.trading_day
-        # Honor strategy.end_times for daily schedules, mirroring backtest
-        # worker_entrypoint.py:297 (getattr(strategy, "end_times", None)).
-        # If neither strategy nor daily factor module declares end_times,
-        # fall back to "" — same as worker_entrypoint.py:316's `end_times = [""]`
-        # when compute_interval=0. Daily strategies suffix output columns
-        # with end_time (F_<hash>_150000 vs F_<hash>), so any drift here
-        # breaks column-name parity between backtest and live.
+        # Honor END_TIMES / strategy.end_times for daily schedules, mirroring
+        # backtest worker_entrypoint.py. END_TIMES takes precedence so live can
+        # force the same historical schema even when a protected strategy bundle
+        # does not expose `end_times` (e.g. F_<hash>_150000).
         if use_daily_module:
-            ets = self._daily_end_times or self._factor_end_times
+            env_end_times = os.environ.get("END_TIMES", "").strip()
+            ets = ([x.strip() for x in env_end_times.split(",") if x.strip()]
+                   if env_end_times else (self._daily_end_times or self._factor_end_times))
             end_time = ets[0] if ets else ""
         else:
             end_time = _minute_end_time(now_dt)
@@ -2494,6 +2583,21 @@ class NativeEngine:
                             # parent's tick thread from inside the child.
                             if portfolio_context is not None and pre_fork_latest_prices:
                                 portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
+                                # Intraday ATX DBF lacks market_value/last_price
+                                # (only populated after EOD settlement). Backfill
+                                # from SHM latest_prices so inference paths that
+                                # need current weights (e.g. daily_position at
+                                # 14:50) don't crash or produce NaN weights.
+                                try:
+                                    from quant_platform.broker.order_context import (
+                                        enrich_portfolio_context_with_latest_prices,
+                                    )
+                                    enrich_portfolio_context_with_latest_prices(
+                                        portfolio_context, pre_fork_latest_prices)
+                                except Exception as exc_enrich:
+                                    logger.warning(
+                                        "[native] enrich_portfolio_context failed: %s",
+                                        exc_enrich)
                             universe_extra = {
                                 "date": date_str,
                                 "end_time": rt_end_time,
@@ -2755,11 +2859,18 @@ class NativeEngine:
                             self._compute_running = True
                         schedule.mark_run(now, self.trading_day)
                         logger.info("[native] dispatching schedule=%s", schedule.name)
-                        t = threading.Thread(
-                            target=self._compute_and_output,
-                            args=(schedule,),
-                            daemon=True,
-                        )
+                        # daily_basic_refresh 不走 factor 计算，独立线程上传 T-0 OSS
+                        if schedule.name == "daily_basic_refresh":
+                            t = threading.Thread(
+                                target=self._refresh_daily_basic_upload,
+                                daemon=True,
+                            )
+                        else:
+                            t = threading.Thread(
+                                target=self._compute_and_output,
+                                args=(schedule,),
+                                daemon=True,
+                            )
                         try:
                             t.start()
                         except Exception:

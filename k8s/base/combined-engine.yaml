@@ -77,6 +77,10 @@ spec:
             # (native_engine.py:324 由本开关选择 multi-code 路径)
             - name: DAILY_USE_MULTI_CODE
               value: "true"
+            # daily 因子列名兼容历史回测：backtest worker 用 END_TIMES=150000
+            # 产出 F_<hash>_150000；live 也显式传同一 end_time，避免产出 F_<hash>。
+            - name: END_TIMES
+              value: "150000"
             - name: INFERENCE_MODULE
               value: "quant_platform.inference.tree_model_orders"
             # --- 模拟盘资金（tree_model_orders 走 positions_to_orders helper） ---
@@ -108,7 +112,7 @@ spec:
             - name: COMPUTE_INTERVAL
               value: "60"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position,open_position"
+              value: "minute,daily,daily_position,open_position,daily_basic_refresh"
             # 临时关闭分钟级下单：minute 继续算因子+同步 tick，但不推单
             # 想恢复分钟下单把这个改成 true 即可
             - name: MINUTE_RUN_INFERENCE
@@ -153,8 +157,11 @@ spec:
               value: ""
             - name: FACTOR_OUTPUT_PATH
               value: /data/factors
-            - name: DAILY_BASIC_MARKET_COUNT
-              value: "5"
+            # DAILY_BASIC_MARKET_COUNT 已不需要 —— 引擎自动从策略 FACTOR_INFO.market_count 读取
+            # (native_engine._load_daily_basic 扫描 FACTOR_MODULE + DAILY_FACTOR_MODULE 取 max)
+            # 仅在策略读不到时作为兜底，平时建议不设。
+            # - name: DAILY_BASIC_MARKET_COUNT
+            #   value: "60"
             # --- 指数成分股(优先 OSS composition.parquet,fallback MySQL idx_cons)---
             # TICKER 代码格式;若 mkt_idxd_csi 中出现重复 TICKER 可改用 TICKER.EXCHANGE 消歧
             # 未配置时自动兼容旧的 IDX_CONS_IDS(SECURITY_ID)

@@ -84,6 +84,7 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
         auto result = parse_sh_tick(body, body_size, static_cast<std::int64_t>(seq), recv_sec);
         if (result.valid) {
             writer_.append_tick(result.code, result.row);
+            _sample_internal_latency("tick", recv_sec);
             tick_count_.fetch_add(1, std::memory_order_relaxed);
             _sample_push_delay("tick", result.code, result.row[tick::Time], recv_sec);
         }
@@ -93,11 +94,13 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
         if (!result.code.empty()) {
             if (result.has_order) {
                 writer_.append_order(result.code, result.order.row);
+                _sample_internal_latency("order", recv_sec);
                 order_count_.fetch_add(1, std::memory_order_relaxed);
                 _sample_push_delay("order", result.code, result.order.row[order::Time], recv_sec);
             }
             if (result.has_deal) {
                 writer_.append_deal(result.code, result.deal.row);
+                _sample_internal_latency("deal", recv_sec);
                 deal_count_.fetch_add(1, std::memory_order_relaxed);
                 _sample_push_delay("deal", result.code, result.deal.row[deal::Time], recv_sec);
             }
@@ -128,6 +131,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         auto result = parse_sz_tick(body, body_size, static_cast<std::int64_t>(seq), recv_sec);
         if (result.valid) {
             writer_.append_tick(result.code, result.row);
+            _sample_internal_latency("tick", recv_sec);
             tick_count_.fetch_add(1, std::memory_order_relaxed);
             _sample_push_delay("tick", result.code, result.row[tick::Time], recv_sec);
         }
@@ -136,6 +140,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         auto result = parse_sz_order(body, body_size, recv_sec);
         if (result.valid) {
             writer_.append_order(result.code, result.row);
+            _sample_internal_latency("order", recv_sec);
             order_count_.fetch_add(1, std::memory_order_relaxed);
             _sample_push_delay("order", result.code, result.row[order::Time], recv_sec);
         }
@@ -144,6 +149,7 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
         auto result = parse_sz_deal(body, body_size, recv_sec);
         if (result.valid) {
             writer_.append_deal(result.code, result.row);
+            _sample_internal_latency("deal", recv_sec);
             deal_count_.fetch_add(1, std::memory_order_relaxed);
             _sample_push_delay("deal", result.code, result.row[deal::Time], recv_sec);
         }
@@ -162,15 +168,15 @@ int MdlHandler::_kind_index(const char* kind) {
 
 static const char* const _kind_names_[3] = {"tick", "order", "deal"};
 
-void MdlHandler::_emit_bucket_(DelayBucket& b, const char* kind_name) {
+void MdlHandler::_emit_bucket_(DelayBucket& b, const char* kind_name, const char* prefix) {
     // Emit a completed bucket and reset it. Caller holds delay_mutex_.
     if (b.count <= 0 || b.minute < 0) return;
     long hh = b.minute / 60;
     long mm = b.minute % 60;
     double avg_ms = b.sum_ms / static_cast<double>(b.count);
     fprintf(stderr,
-            "[push-latency] %02ld:%02ld %s n=%lld min=%.0fms avg=%.0fms max=%.0fms\n",
-            hh, mm, kind_name, b.count, b.min_ms, avg_ms, b.max_ms);
+            "[%s] %02ld:%02ld %s n=%lld min=%.0fms avg=%.0fms max=%.0fms\n",
+            prefix, hh, mm, kind_name, b.count, b.min_ms, avg_ms, b.max_ms);
     b.reset(-1);
 }
 
@@ -194,7 +200,7 @@ void MdlHandler::_sample_push_delay(const char* kind, const std::string& code, d
         // Minute rolled over. Emit the previous minute now so its stats are not
         // lost — the metrics thread polls every 10s and is not aligned to the
         // minute boundary, so relying on it alone would drop the last minute.
-        _emit_bucket_(b, _kind_names_[ki]);
+        _emit_bucket_(b, _kind_names_[ki], "push-latency");
         b.reset(recv_minute);
     }
     if (b.count == 0) {
@@ -205,6 +211,44 @@ void MdlHandler::_sample_push_delay(const char* kind, const std::string& code, d
     }
     b.count++;
     b.sum_ms += delay_ms;
+}
+
+void MdlHandler::_sample_internal_latency(const char* kind, double recv_sec) {
+    // C++ internal processing time = parse + SHM write, measured from callback
+    // entry (recv_sec) to just after writer_.append_* (now). This is
+    // independent of Tonglian source delay and shows our own overhead.
+    struct timespec rts;
+    clock_gettime(CLOCK_REALTIME, &rts);
+    struct tm rtm;
+    localtime_r(&rts.tv_sec, &rtm);
+    double post_shm_sec = rtm.tm_hour * 3600.0 + rtm.tm_min * 60.0 + rtm.tm_sec + rts.tv_nsec / 1e9;
+
+    double internal_ms = (post_shm_sec - recv_sec) * 1000.0;
+    // Negative means clock skew (shouldn't happen, same clock); huge values are
+    // impossible for a single callback — filter them out defensively.
+    if (internal_ms < 0.0 || internal_ms > 60000.0) {
+        return;
+    }
+
+    int ki = _kind_index(kind);
+    if (ki < 0) return;
+
+    long recv_minute = static_cast<long>(recv_sec) / 60;
+
+    std::lock_guard<std::mutex> lock(delay_mutex_);
+    DelayBucket& b = internal_buckets_[ki];
+    if (b.minute != recv_minute) {
+        _emit_bucket_(b, _kind_names_[ki], "internal-proc");
+        b.reset(recv_minute);
+    }
+    if (b.count == 0) {
+        b.min_ms = b.max_ms = internal_ms;
+    } else {
+        if (internal_ms < b.min_ms) b.min_ms = internal_ms;
+        if (internal_ms > b.max_ms) b.max_ms = internal_ms;
+    }
+    b.count++;
+    b.sum_ms += internal_ms;
 }
 
 void MdlHandler::flush_push_delay(bool force) {
@@ -226,7 +270,13 @@ void MdlHandler::flush_push_delay(bool force) {
         DelayBucket& b = delay_buckets_[ki];
         if (b.count == 0 || b.minute < 0) continue;
         if (!force && b.minute >= now_minute) continue;  // minute still in progress
-        _emit_bucket_(b, _kind_names_[ki]);
+        _emit_bucket_(b, _kind_names_[ki], "push-latency");
+    }
+    for (int ki = 0; ki < 3; ++ki) {
+        DelayBucket& b = internal_buckets_[ki];
+        if (b.count == 0 || b.minute < 0) continue;
+        if (!force && b.minute >= now_minute) continue;
+        _emit_bucket_(b, _kind_names_[ki], "internal-proc");
     }
 }
 
