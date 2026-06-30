@@ -40,6 +40,24 @@ logger = logging.getLogger(__name__)
 STRATEGY_NAME = os.environ.get("TREE_MODEL_STRATEGY_NAME", "tree_model")
 
 
+def _prepare_daily_basic_for_tree(
+    daily_basic_df: Optional[pd.DataFrame],
+    stage: str,
+) -> Optional[pd.DataFrame]:
+    """Drop live-only string columns before feeding the compiled tree model."""
+    if daily_basic_df is None or daily_basic_df.empty:
+        return daily_basic_df
+
+    drop_cols = [c for c in ("SEC_SHORT_NAME", "SEC_FULL_NAME")
+                 if c in daily_basic_df.columns]
+    if not drop_cols:
+        return daily_basic_df
+
+    logger.info("[tree-orders] dropped %s from daily_basic for %s .so compat",
+                drop_cols, stage)
+    return daily_basic_df.drop(columns=drop_cols)
+
+
 def _normalize_tree_positions(
     positions: pd.DataFrame,
     daily_basic_df: Optional[pd.DataFrame],
@@ -59,14 +77,6 @@ def _normalize_tree_positions(
       instead of `position`. positions_to_orders expects `position`.
     """
     positions = positions.copy()
-
-    if daily_basic_df is not None and not daily_basic_df.empty:
-        drop_cols = [c for c in ("SEC_SHORT_NAME", "SEC_FULL_NAME")
-                     if c in daily_basic_df.columns]
-        if drop_cols:
-            daily_basic_df = daily_basic_df.drop(columns=drop_cols)
-            logger.info("[tree-orders] dropped %s from daily_basic for .so compat",
-                        drop_cols)
 
     if "code" not in positions.columns:
         if "_code6" in positions.columns:
@@ -114,6 +124,8 @@ def inference_targets(
     Returns a normalized positions DataFrame with `code` and `position` columns
     suitable for ``targets_to_orders``. Returns empty DataFrame on failure.
     """
+    daily_basic_df = _prepare_daily_basic_for_tree(daily_basic_df, "stage 1")
+
     positions = _tree.inference(
         date_str=date_str,
         end_time=end_time,
@@ -160,13 +172,7 @@ def targets_to_orders(
     if positions is None or positions.empty:
         return pd.DataFrame()
 
-    if daily_basic_df is not None and not daily_basic_df.empty:
-        drop_cols = [c for c in ("SEC_SHORT_NAME", "SEC_FULL_NAME")
-                     if c in daily_basic_df.columns]
-        if drop_cols:
-            daily_basic_df = daily_basic_df.drop(columns=drop_cols)
-            logger.info("[tree-orders] dropped %s from daily_basic for stage 2",
-                        drop_cols)
+    daily_basic_df = _prepare_daily_basic_for_tree(daily_basic_df, "stage 2")
 
     orders = positions_to_orders(
         positions,

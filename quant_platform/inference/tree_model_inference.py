@@ -309,6 +309,34 @@ def oss_object_exists(bucket_name: str, key: str, use_cache: bool = True) -> boo
         raise
 
 
+_DAILY_BASIC_STRING_COLS = {
+    "TS", "ID_QI", "SEC_SHORT_NAME", "SEC_FULL_NAME",
+    "trade_date", "date", "_date", "_ID_QI_PAD",
+    "idx_EXCHANGE_CD", "idx_UPDATE_TIME", "UPDATE_TIME",
+}
+
+
+def coerce_daily_basic_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    # Coerce numeric columns that concat may have promoted to object (different
+    # daily parquets have inconsistent dtypes) back to float64. The compiled
+    # .so (value_weight) does Python-level true division on object Series which
+    # raises ZeroDivisionError; same op on float64 returns inf.
+    df = df.copy()
+    for col in df.columns:
+        if col in _DAILY_BASIC_STRING_COLS:
+            # Force string dtype — some rows may be pd.Timestamp objects from
+            # parquet decode (idx_UPDATE_TIME etc.); pollers/pyarrow choke on
+            # mixed str/Timestamp in object columns.
+            df[col] = df[col].astype(str).replace({"NaT": "", "nan": "", "None": ""})
+            continue
+        if df[col].dtype == object:
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            non_null = df[col].notna()
+            if not non_null.any() or numeric[non_null].notna().mean() >= 0.99:
+                df[col] = numeric
+    return df
+
+
 def load_daily_basic_from_oss(start_date: str, end_date: str) -> pd.DataFrame:
     frames = []
     for date_item in iter_calendar_dates(start_date, end_date):
@@ -324,23 +352,7 @@ def load_daily_basic_from_oss(start_date: str, end_date: str) -> pd.DataFrame:
     if not frames:
         raise RuntimeError(f"No daily_basic parquet found on OSS between {start_date} and {end_date}")
     combined = pd.concat(frames, ignore_index=True, copy=False)
-    # Coerce numeric columns that concat may have promoted to object (different
-    # daily parquets have inconsistent dtypes) back to float64. The compiled
-    # .so (value_weight) does Python-level true division on object Series which
-    # raises ZeroDivisionError; same op on float64 returns inf.
-    _STRING_COLS = {"TS", "ID_QI", "SEC_SHORT_NAME", "SEC_FULL_NAME",
-                    "trade_date", "date", "idx_EXCHANGE_CD", "idx_UPDATE_TIME",
-                    "UPDATE_TIME"}
-    for col in combined.columns:
-        if col in _STRING_COLS:
-            # Force string dtype — some rows may be pd.Timestamp objects from
-            # parquet decode (idx_UPDATE_TIME etc.); pollers/pyarrow choke on
-            # mixed str/Timestamp in object columns.
-            combined[col] = combined[col].astype(str).replace({"NaT": "", "nan": "", "None": ""})
-            continue
-        if combined[col].dtype == object:
-            combined[col] = pd.to_numeric(combined[col], errors="ignore")
-    return combined
+    return coerce_daily_basic_dtypes(combined)
 
 
 def load_index_composition_from_oss(start_date: str, end_date: str) -> pd.DataFrame:
@@ -522,10 +534,11 @@ def normalize_daily_basic(df: pd.DataFrame, date_str: Optional[str] = None) -> p
 
 def append_current_daily_basic(history: pd.DataFrame, current: Optional[pd.DataFrame], date_str: str) -> pd.DataFrame:
     if current is None or current.empty:
-        return history
+        return coerce_daily_basic_dtypes(history)
     current = normalize_daily_basic(current, date_str=date_str)
     combined = pd.concat([history, current], ignore_index=True, copy=False)
-    return combined.drop_duplicates(["trade_date", "ID_QI"], keep="last")
+    combined = combined.drop_duplicates(["trade_date", "ID_QI"], keep="last")
+    return coerce_daily_basic_dtypes(combined)
 
 
 def inference(

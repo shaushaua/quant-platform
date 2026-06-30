@@ -77,6 +77,8 @@ _daily_basic_df: pd.DataFrame = pd.DataFrame()
 _reader_cache: Dict[str, NativeShmReader] = {}
 _strategy_cache: Dict[str, tuple[Callable, Dict[str, Any]]] = {}
 _base_ns: int = 0  # pd.Timestamp(trading_day).value, set once per day
+_hist_compat_log_count = 0
+_hist_compat_log_lock = threading.Lock()
 
 
 def _compact_output_copy(df: pd.DataFrame, decimal_places: int = 6) -> pd.DataFrame:
@@ -113,6 +115,64 @@ def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
         logger.warning("[native] invalid %s=%r < %d, fallback to %d", name, raw, minimum, default)
         return default
     return value
+
+
+def _seqnum_stats(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if df.empty or "SeqNum" not in df.columns:
+        return None
+    seq = pd.to_numeric(df["SeqNum"], errors="coerce")
+    valid = seq.dropna()
+    if valid.empty:
+        return {
+            "rows": int(len(df)),
+            "valid": 0,
+            "monotonic": False,
+            "head": [],
+            "tail": [],
+        }
+    return {
+        "rows": int(len(df)),
+        "valid": int(valid.size),
+        "monotonic": bool(seq.is_monotonic_increasing),
+        "head": [int(x) for x in valid.head(3).tolist()],
+        "tail": [int(x) for x in valid.tail(3).tolist()],
+    }
+
+
+def _log_historical_compat_order(
+    code: str,
+    kind: str,
+    before: Optional[Dict[str, Any]],
+    after: Optional[Dict[str, Any]],
+) -> None:
+    if not _env_bool("HIST_COMPAT_ORDER_LOG", True):
+        return
+    if before is None or after is None:
+        return
+
+    limit = _env_int("HIST_COMPAT_ORDER_LOG_LIMIT", 200, minimum=0)
+    was_unsorted = not before["monotonic"]
+    global _hist_compat_log_count
+    with _hist_compat_log_lock:
+        if not was_unsorted and _hist_compat_log_count >= limit:
+            return
+        _hist_compat_log_count += 1
+
+    logger.info(
+        "[hist-compat] code=%s kind=%s rows=%d valid_seq=%d "
+        "seq_before_monotonic=%s seq_after_monotonic=%s "
+        "before_head=%s before_tail=%s after_head=%s after_tail=%s",
+        code,
+        kind,
+        before["rows"],
+        before["valid"],
+        before["monotonic"],
+        after["monotonic"],
+        before["head"],
+        before["tail"],
+        after["head"],
+        after["tail"],
+    )
 
 
 def _get_worker_strategy(module_path: str, fallback_info: Optional[Dict[str, Any]] = None) -> tuple[Callable, Dict[str, Any]]:
@@ -198,7 +258,8 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
                           buf_cols: list, time_idx: int, updtime_idx: int,
                           trading_day: str, code: str,
                           volume_idx: Optional[list] = None,
-                          historical_compat: bool = False) -> pd.DataFrame:
+                          historical_compat: bool = False,
+                          kind_name: str = "") -> pd.DataFrame:
     """Build DataFrame from native SHM reader.
 
     The C++ writer stores 79/9/10 numeric columns (skip TradingDay and Code).
@@ -238,8 +299,15 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
     # Historical archive upload sorts merged parquet by SECURITY_ID, SeqNum.
     # Live factors must see the same per-code row order, otherwise
     # rolling/diff/tail/iloc based factors can diverge on identical rows.
+    seq_before = _seqnum_stats(df) if historical_compat else None
     if historical_compat and "SeqNum" in df.columns:
         df = df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
+        _log_historical_compat_order(
+            code,
+            kind_name or "unknown",
+            seq_before,
+            _seqnum_stats(df),
+        )
 
     # Match historical _restore_oss_precision exactly for model compatibility.
     # Archive parquet stores UpdateTime as full epoch_us, but the historical
@@ -335,17 +403,17 @@ def _compute_code_batch_shm(args):
                 deal_path = deal_paths.get(code, "")
                 order_path = order_paths.get(code, "")
                 tick_df = (
-                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code, _tick_volume_idx, True)
+                    _build_df_from_native(_cached_reader(tick_path), _tick_columns, _tick_buf_cols, _tick_time_idx, _tick_updtime_idx, trading_day, code, _tick_volume_idx, True, "tick")
                     if tick_path and need_tick
                     else pd.DataFrame()
                 )
                 deal_df = (
-                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code, _deal_volume_idx, True)
+                    _build_df_from_native(_cached_reader(deal_path), _deal_columns, _deal_buf_cols, _deal_time_idx, _deal_updtime_idx, trading_day, code, _deal_volume_idx, True, "deal")
                     if deal_path and need_deal
                     else pd.DataFrame()
                 )
                 order_df = (
-                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code, _order_volume_idx, True)
+                    _build_df_from_native(_cached_reader(order_path), _order_columns, _order_buf_cols, _order_time_idx, _order_updtime_idx, trading_day, code, _order_volume_idx, True, "order")
                     if order_path and need_order
                     else pd.DataFrame()
                 )
@@ -1831,10 +1899,12 @@ class NativeEngine:
 
     def _archive_loop(self) -> None:
         from datetime import timedelta
-        logger.info("[native-archive] background archive loop started (smart-sleep: 11:35/15:05)")
+        logger.info("[native-archive] background archive loop started (smart-sleep: 11:35/15:05/15:30)")
         last_archive_date = ""
         archived_lunch = False
-        archived_close = False
+        archived_snapshot = False  # 15:05 SHM -> 本地 chunks
+        archived_upload = False    # 15:30 本地 chunks -> OSS
+        pending_files_by_code: Optional[Dict[str, Dict[int, str]]] = None
         while not self._stopped:
             try:
                 today = date.today().isoformat()
@@ -1842,7 +1912,9 @@ class NativeEngine:
                     last_archive_date = today
                     now_init = datetime.now()
                     archived_lunch = now_init.hour > 11 or (now_init.hour == 11 and now_init.minute >= 35)
-                    archived_close = False
+                    archived_snapshot = False
+                    archived_upload = False
+                    pending_files_by_code = None
 
                 now = datetime.now()
                 h, m = now.hour, now.minute
@@ -1855,19 +1927,60 @@ class NativeEngine:
                         archived_lunch = True
                         logger.info("[native-archive] lunch break snapshot done")
 
-                if h >= 15 and m >= 5 and not archived_close:
+                # 15:05 post-close SHM snapshot — 只落盘 chunks，不传 OSS
+                if h >= 15 and m >= 5 and not archived_snapshot:
                     files_by_code = self._scan_shm_files()
                     if files_by_code:
                         logger.info("[native-archive] post-close snapshot starting...")
                         self._archive_native_incremental(files_by_code)
-                        self._check_raw_upload_time(files_by_code)
-                        archived_close = True
+                        pending_files_by_code = files_by_code
+                        archived_snapshot = True
                         logger.info("[native-archive] post-close snapshot done")
+
+                # 15:30 OSS upload — 独立于 snapshot。
+                # 之前 _check_raw_upload_time 在 15:05 调用时 now<15:30 直接 return，
+                # archived_close=True 后 smart-sleep 睡到明天，导致 RAW_DATA_UPLOAD_TIME
+                # 永远不命中。这里拆开两阶段，确保 upload 真正触发。
+                # 失败重试 ARCHIVE_UPLOAD_MAX_RETRIES 次，间隔 5 分钟。
+                if (archived_snapshot and not archived_upload
+                        and not self._uploaded_today
+                        and (h, m) >= (15, 30)):
+                    files_for_upload = pending_files_by_code or {}
+                    max_attempts = max(1, _env_int("ARCHIVE_UPLOAD_MAX_RETRIES", 3, minimum=1))
+                    for attempt in range(1, max_attempts + 1):
+                        if self._stopped or self._uploaded_today:
+                            break
+                        logger.info("[native-archive] post-close OSS upload attempt %d/%d starting...",
+                                    attempt, max_attempts)
+                        try:
+                            self._check_raw_upload_time(files_for_upload)
+                        except Exception as exc:
+                            logger.error("[native-archive] OSS upload attempt %d failed: %s",
+                                         attempt, exc, exc_info=True)
+                        if self._uploaded_today:
+                            archived_upload = True
+                            logger.info("[native-archive] post-close OSS upload done (attempt %d)",
+                                        attempt)
+                            break
+                        if attempt < max_attempts:
+                            logger.warning("[native-archive] OSS upload attempt %d did not succeed, "
+                                           "sleeping 300s before retry", attempt)
+                            for _ in range(300):
+                                if self._stopped:
+                                    break
+                                time.sleep(1)
+                    if not archived_upload:
+                        logger.error("[native-archive] OSS upload gave up after %d attempts",
+                                     max_attempts)
+                        # 标记避免明天之前无限重试；日志已 ERROR 告警，人工介入。
+                        archived_upload = True
 
                 if not archived_lunch:
                     target_h, target_m = 11, 35
-                elif not archived_close:
+                elif not archived_snapshot:
                     target_h, target_m = 15, 5
+                elif not archived_upload:
+                    target_h, target_m = 15, 30
                 else:
                     target_h, target_m = 0, 0
 

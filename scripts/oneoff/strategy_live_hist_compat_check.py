@@ -57,18 +57,20 @@ def _live_df(arr: np.ndarray, date: str, code: str, historical_compat: bool) -> 
 
 
 def _historical_df(arr: np.ndarray, date: str, code: str) -> pd.DataFrame:
-    raw = _live_df(arr, date, code, historical_compat=False)
+    base_ns = pd.Timestamp(date).value
+    time_ns = base_ns + (arr[:, DEAL_COLUMNS[2:].index("Time")] * 1_000_000_000).astype(np.int64)
+    update_ns = base_ns + (arr[:, DEAL_COLUMNS[2:].index("UpdateTime")] * 1_000_000_000).astype(np.int64)
     archived = pd.DataFrame(
         {
-            "Code": [1] * len(raw),
-            "Time": (pd.to_datetime(raw["Time"]).astype("int64") // 1000).astype("int64"),
-            "UpdateTime": (pd.to_datetime(raw["UpdateTime"]).astype("int64") // 1000).astype("int64"),
-            "SaleOrderID": raw["SaleOrderID"].astype("int64"),
-            "BuyOrderID": raw["BuyOrderID"].astype("int64"),
-            "Side": raw["Side"].astype("int8"),
-            "Price": np.round(raw["Price"] * 100).astype("int32"),
-            "Volume": (raw["Volume"] / 100).astype("int64"),
-            "SeqNum": raw["SeqNum"].astype("int32"),
+            "Code": [1] * len(arr),
+            "Time": (time_ns // 1000).astype("int64"),
+            "UpdateTime": (update_ns // 1000).astype("int64"),
+            "SaleOrderID": arr[:, DEAL_COLUMNS[2:].index("SaleOrderID")].astype("int64"),
+            "BuyOrderID": arr[:, DEAL_COLUMNS[2:].index("BuyOrderID")].astype("int64"),
+            "Side": arr[:, DEAL_COLUMNS[2:].index("Side")].astype("int8"),
+            "Price": np.round(arr[:, DEAL_COLUMNS[2:].index("Price")] * 100).astype("int32"),
+            "Volume": arr[:, DEAL_COLUMNS[2:].index("Volume")].astype("int64"),
+            "SeqNum": arr[:, DEAL_COLUMNS[2:].index("SeqNum")].astype("int32"),
         }
     ).sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
     return _restore_oss_precision(archived, code)
