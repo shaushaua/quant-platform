@@ -1679,10 +1679,6 @@ class NativeEngine:
                 tmp_file.unlink(missing_ok=True)
                 con = duckdb.connect(":memory:")
                 con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '32GB')}'")
-                con.execute(
-                    "CREATE MACRO epoch_us(ts) AS "
-                    "(EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)"
-                )
                 select_clause = self._archive_select_clause(kind)
                 # map_code_col determined before _daily_basic_df was freed below;
                 # map_df carries either "_ID_QI_PAD" (zero-padded str) or "ID_QI".
@@ -1839,27 +1835,33 @@ class NativeEngine:
                 "x.SeqNum::INTEGER AS SeqNum",
             ]
         elif kind == "tick":
+            # 通联对"无涨跌停限制"代码(新股、停牌等)用 sentinel 填:
+            #   HighLimitPrice = 999999999.9999, LowLimitPrice = 0.01
+            # ×100 cast INT32 时溢出(10^11 > 2.1*10^9),导致整个 tick upload 失败。
+            # LEAST(... , 2147483647) 把 sentinel clip 到 INT32_MAX,牺牲"无限制"语义
+            # 但不丢这一行其他有效字段。
+            _clip = "LEAST(ROUND(x.{c} * 100), 2147483647)::INTEGER"
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
                 "epoch_us(x.Time) AS Time",
                 "epoch_us(x.UpdateTime) AS UpdateTime",
-                "ROUND(x.CurrentPrice * 100)::INTEGER AS CurrentPrice",
+                _clip.format(c="CurrentPrice"),
                 "x.TotalVolume::BIGINT AS TotalVolume",
             ]
-            exprs += [f"ROUND(x.{c} * 100)::INTEGER AS {c}" for c in
+            exprs += [_clip.format(c=c) for c in
                       ["PreClosePrice", "OpenPrice", "HighestPrice", "LowestPrice",
                        "HighLimitPrice", "LowLimitPrice", "IOPV"]]
             exprs += [
                 "COALESCE(x.TradeNum, 0)::INTEGER AS TradeNum",
                 "x.TotalBidVolume::BIGINT AS TotalBidVolume",
                 "x.TotalAskVolume::BIGINT AS TotalAskVolume",
-                "ROUND(x.AvgBidPrice * 100)::INTEGER AS AvgBidPrice",
-                "ROUND(x.AvgAskPrice * 100)::INTEGER AS AvgAskPrice",
+                _clip.format(c="AvgBidPrice"),
+                _clip.format(c="AvgAskPrice"),
             ]
-            exprs += [f"ROUND(x.AskPrice{i} * 100)::INTEGER AS AskPrice{i}" for i in range(1, 11)]
+            exprs += [_clip.format(c=f"AskPrice{i}") for i in range(1, 11)]
             exprs += [f"COALESCE(x.AskVolume{i}, 0)::BIGINT AS AskVolume{i}" for i in range(1, 11)]
             exprs += [f"COALESCE(x.AskNum{i}, 0)::INTEGER AS AskNum{i}" for i in range(1, 11)]
-            exprs += [f"ROUND(x.BidPrice{i} * 100)::INTEGER AS BidPrice{i}" for i in range(1, 11)]
+            exprs += [_clip.format(c=f"BidPrice{i}") for i in range(1, 11)]
             exprs += [f"COALESCE(x.BidVolume{i}, 0)::BIGINT AS BidVolume{i}" for i in range(1, 11)]
             exprs += [f"COALESCE(x.BidNum{i}, 0)::INTEGER AS BidNum{i}" for i in range(1, 11)]
             exprs += ["x.SeqNum::INTEGER AS SeqNum"]
