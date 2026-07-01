@@ -188,10 +188,6 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
     con = duckdb.connect(":memory:")
     try:
         con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '32GB')}'")
-        con.execute(
-            "CREATE MACRO epoch_us(ts) AS "
-            "(EXTRACT('epoch' FROM ts)::BIGINT * 1000000 + EXTRACT('microseconds' FROM ts)::BIGINT)"
-        )
         log.info("[%s] merging %d chunks (%.2f GB)...", kind, len(chunks),
                  sum(c.stat().st_size for c in chunks) / 1024**3)
         con.execute(f"""

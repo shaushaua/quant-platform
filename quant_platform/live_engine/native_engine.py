@@ -59,6 +59,7 @@ from ..inference.interface import (
     compute_index_composition,
     compute_trading_universe,
 )
+from ..strategies.protected_loader import import_strategy_module
 from .runtime_utils import (
     _is_trading_hours,
     _time_to_seconds,
@@ -190,7 +191,7 @@ def _get_worker_strategy(module_path: str, fallback_info: Optional[Dict[str, Any
     if cached is not None:
         return cached
 
-    mod = importlib.import_module(module_path)
+    mod = import_strategy_module(module_path)
     fn = mod.factor_calculation
     info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", None)) or fallback_info or {}
     _strategy_cache[module_path] = (fn, info)
@@ -662,7 +663,7 @@ class NativeEngine:
         resolved_from_strategy = False
         for mod_path in strategy_modules:
             try:
-                mod = importlib.import_module(mod_path)
+                mod = import_strategy_module(mod_path)
                 fi = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {})) or {}
                 mc = int(fi.get("market_count", 1))
                 if mc > market_count:
@@ -2815,7 +2816,7 @@ class NativeEngine:
 
         # Load factor module
         if self.factor_module:
-            mod = importlib.import_module(self.factor_module)
+            mod = import_strategy_module(self.factor_module)
             _factor_fn = mod.factor_calculation
             self.factor_info = getattr(mod, "FACTOR_INFO", getattr(mod, "factor_info", {})) or {}
             _factor_info = self.factor_info
@@ -2830,7 +2831,7 @@ class NativeEngine:
         # Load daily factor module (optional, for different strategy at daily schedule)
         if self.daily_factor_module:
             try:
-                dmod = importlib.import_module(self.daily_factor_module)
+                dmod = import_strategy_module(self.daily_factor_module)
                 self._daily_factor_fn = dmod.factor_calculation
                 self._daily_factor_info = getattr(dmod, "FACTOR_INFO", getattr(dmod, "factor_info", {})) or {}
                 self._daily_end_times = list(getattr(dmod, "end_times", []) or [])

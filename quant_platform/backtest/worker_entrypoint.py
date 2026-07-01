@@ -17,7 +17,6 @@ Worker Entrypoint - 基础镜像提供，策略代码无需关心 OSS 写入
   - outfun(date, end_time, test):  可选，不提供则基础镜像默认实现
 """
 
-import importlib.util
 import json
 import logging
 import os
@@ -38,6 +37,7 @@ logging.basicConfig(
 
 from quant_platform.factor.engine import calc_factors_by_date_range
 from quant_platform.factor.time_slices import generate_intraday_end_times
+from quant_platform.strategies.protected_loader import load_strategy_file
 
 
 def _generate_end_times(interval_seconds: int) -> list:
@@ -220,10 +220,7 @@ def _load_strategy():
         print(f"[worker] ERROR: 策略文件不存在: {STRATEGY_PATH}", file=sys.stderr)
         sys.exit(1)
 
-    spec = importlib.util.spec_from_file_location("strategy", STRATEGY_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_strategy_file(STRATEGY_PATH, "strategy")
 
 
 # ---------------------------------------------------------------------------

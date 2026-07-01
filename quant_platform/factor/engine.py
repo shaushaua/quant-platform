@@ -1352,18 +1352,23 @@ def _filter_code_from_bundle(
             return df[df["ID_QI"].astype(str).str.zfill(6) == id_qi].reset_index(drop=True)
         return df
 
+    def _sort_like_live(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "SeqNum" not in df.columns:
+            return df
+        return df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
+
     _t0 = _ptime.time()
     order_filtered = _filter(bundle.l2_order)
     _t1 = _ptime.time()
-    order_restored = _restore_oss_precision(order_filtered, code)
+    order_restored = _sort_like_live(_restore_oss_precision(order_filtered, code))
     _t2 = _ptime.time()
     deal_filtered = _filter(bundle.l2_deal)
     _t3 = _ptime.time()
-    deal_restored = _restore_oss_precision(deal_filtered, code)
+    deal_restored = _sort_like_live(_restore_oss_precision(deal_filtered, code))
     _t4 = _ptime.time()
     tick_filtered = _filter(bundle.l1_tick)
     _t5 = _ptime.time()
-    tick_restored = _restore_oss_precision(tick_filtered, code)
+    tick_restored = _sort_like_live(_restore_oss_precision(tick_filtered, code))
     _t6 = _ptime.time()
     market = _filter(bundle.market)
     _t7 = _ptime.time()
@@ -1465,11 +1470,16 @@ def _filter_codes_from_bundle(
     tick_by_code = _split(bundle.l1_tick)
     market_by_code = _split(bundle.market)
 
+    def _sort_like_live(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "SeqNum" not in df.columns:
+            return df
+        return df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
+
     filtered: List[_FilteredCode] = []
     for code in codes:
-        order = _restore_oss_precision(order_by_code.get(code, pd.DataFrame()), code)
-        deal = _restore_oss_precision(deal_by_code.get(code, pd.DataFrame()), code)
-        tick = _restore_oss_precision(tick_by_code.get(code, pd.DataFrame()), code)
+        order = _sort_like_live(_restore_oss_precision(order_by_code.get(code, pd.DataFrame()), code))
+        deal = _sort_like_live(_restore_oss_precision(deal_by_code.get(code, pd.DataFrame()), code))
+        tick = _sort_like_live(_restore_oss_precision(tick_by_code.get(code, pd.DataFrame()), code))
         market = market_by_code.get(code, pd.DataFrame())
         filtered.append(_FilteredCode(
             code,

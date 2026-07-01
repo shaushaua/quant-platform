@@ -67,6 +67,14 @@ void StockMmap::open_or_create() {
                     base_ = reinterpret_cast<std::uint8_t*>(map);
                     file_size_ = fsize;
                     row_count_ = static_cast<std::size_t>(hdr->row_count);
+                    auto gen = atomic_load_u64(&hdr->generation);
+                    if (gen % 2 == 1) {
+                        atomic_store_u64(&hdr->generation, gen + 1);
+                        ::msync(hdr, kShmHeaderBytes, MS_SYNC);
+                        std::cerr << "[shm] recovered odd generation " << gen
+                                  << " -> " << (gen + 1)
+                                  << " for " << path_ << "\n";
+                    }
                     return;
                 }
                 ::munmap(map, fsize);
