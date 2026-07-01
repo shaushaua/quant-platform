@@ -83,12 +83,14 @@ spec:
               value: "150000"
             - name: INFERENCE_MODULE
               value: "quant_platform.inference.tree_model_orders"
-            # --- 模拟盘资金（tree_model_orders 走 positions_to_orders helper） ---
-            # 实盘注释掉这两行，靠 portfolio_context.account.total_asset 取真实总资产
-            - name: OPEN_POSITION_SIM_MODE
-              value: "1"
-            - name: OPEN_POSITION_TOTAL_CAPITAL
-              value: "10000000"
+            # --- 实盘资金：通过 order-gateway /v1/balance 接口取真实总资产 ---
+            # portfolio_context_fn 调 _fetch_balance(ORDER_GATEWAY_URL, BROKER_ACCOUNT_ID)
+            # → positions_to_orders 用 account.total_asset 做 position sizing。
+            # 模拟盘才打开下面两行（强制 1000 万虚拟资金），实盘必须注释掉。
+            # - name: OPEN_POSITION_SIM_MODE
+            #   value: "1"
+            # - name: OPEN_POSITION_TOTAL_CAPITAL
+            #   value: "10000000"
             # --- 9:30 推理前置：pod 起来异步跑树模型,9:30 只跑 positions_to_orders ---
             # 关闭则 9:30 当场同步推理(慢,行为同改造前)
             - name: OPEN_POSITION_PRECOMPUTE
