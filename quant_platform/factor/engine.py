@@ -772,6 +772,8 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     if df.empty:
         return df
 
+    df = _normalize_legacy_tick_archive_columns(df)
+
     # 检测 Code 列是否为整数类型（OSS 历史数据的标志）
     code_col = None
     for col in ("Code", "code", "stock_code"):
@@ -828,6 +830,48 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
         df["UpdateTime"] = df["Time"] + pd.to_timedelta(df["UpdateTime"], unit="us")
 
     return df
+
+
+def _normalize_legacy_tick_archive_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize tick parquet columns written without aliases.
+
+    A broken native archive select used expressions such as
+    ``LEAST(ROUND(x.CurrentPrice * 100), 2147483647)::INTEGER`` without
+    ``AS CurrentPrice``. DuckDB persisted the expression text as the column
+    name, so historical strategies could not find tick fields while live SHM
+    still provided normal names. The affected archive shape has 78 columns:
+    Code, Time, UpdateTime, the tick fields below, SeqNum.
+    """
+    if "CurrentPrice" in df.columns or len(df.columns) != 78:
+        return df
+    required = {"Code", "Time", "UpdateTime", "TotalVolume", "TradeNum", "SeqNum"}
+    if not required.issubset(set(df.columns)):
+        return df
+    expression_cols = [c for c in df.columns if "x.CurrentPrice" in str(c)]
+    if not expression_cols:
+        return df
+
+    archive_tick_cols = ["Code", "Time", "UpdateTime", "CurrentPrice", "TotalVolume"]
+    archive_tick_cols += [
+        "PreClosePrice", "OpenPrice", "HighestPrice", "LowestPrice",
+        "HighLimitPrice", "LowLimitPrice", "IOPV",
+    ]
+    archive_tick_cols += [
+        "TradeNum", "TotalBidVolume", "TotalAskVolume",
+        "AvgBidPrice", "AvgAskPrice",
+    ]
+    archive_tick_cols += [f"AskPrice{i}" for i in range(1, 11)]
+    archive_tick_cols += [f"AskVolume{i}" for i in range(1, 11)]
+    archive_tick_cols += [f"AskNum{i}" for i in range(1, 11)]
+    archive_tick_cols += [f"BidPrice{i}" for i in range(1, 11)]
+    archive_tick_cols += [f"BidVolume{i}" for i in range(1, 11)]
+    archive_tick_cols += [f"BidNum{i}" for i in range(1, 11)]
+    archive_tick_cols += ["SeqNum"]
+
+    out = df.copy()
+    out.columns = archive_tick_cols
+    logger.warning("[精度还原] %s detected legacy tick archive columns; normalized aliases", code)
+    return out
 
 
 def _resolve_hist_dates(target_date: str, day_offsets: List[int], api: DataAPI) -> List[Optional[str]]:

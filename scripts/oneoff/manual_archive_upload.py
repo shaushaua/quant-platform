@@ -51,38 +51,80 @@ def select_clause(kind: str) -> str:
             "x.SeqNum::INTEGER AS SeqNum",
         ]
     elif kind == "tick":
-        # 价格列做范围检查：A 股真实价格 ≤ 10000 元 (×100=1e6)，超过的视为 SDK 脏值
-        # (如 001399.XSHE 这类非股票漏过 C++ 过滤，HighLimitPrice=1e9 会溢出 INT32)
-        def _safe_price(col):
-            return (f"CASE WHEN x.{col} BETWEEN 0 AND 10000 "
-                    f"THEN ROUND(x.{col} * 100)::INTEGER ELSE 0 END AS {col}")
+        # Keep this in sync with NativeEngine._archive_select_clause("tick").
+        # 通联对"无涨跌停限制"代码(新股、停牌等)用 sentinel 填:
+        # HighLimitPrice = 999999999.9999。×100 cast INT32 会溢出，
+        # 用 LEAST clip 到 INT32_MAX；必须保留 AS {col}，否则 DuckDB
+        # 会把表达式文本写成列名。
+        def _clip(col):
+            return f"LEAST(ROUND(x.{col} * 100), 2147483647)::INTEGER AS {col}"
         exprs = [
             "m.SECURITY_ID::INTEGER AS Code",
             "epoch_us(x.Time) AS Time",
             "epoch_us(x.UpdateTime) AS UpdateTime",
-            f"{_safe_price('CurrentPrice')}",
+            _clip("CurrentPrice"),
             "x.TotalVolume::BIGINT AS TotalVolume",
         ]
-        exprs += [_safe_price(c) for c in
+        exprs += [_clip(c) for c in
                   ["PreClosePrice", "OpenPrice", "HighestPrice", "LowestPrice",
                    "HighLimitPrice", "LowLimitPrice", "IOPV"]]
         exprs += [
             "COALESCE(x.TradeNum, 0)::INTEGER AS TradeNum",
             "x.TotalBidVolume::BIGINT AS TotalBidVolume",
             "x.TotalAskVolume::BIGINT AS TotalAskVolume",
-            "ROUND(x.AvgBidPrice * 100)::INTEGER AS AvgBidPrice",
-            "ROUND(x.AvgAskPrice * 100)::INTEGER AS AvgAskPrice",
+            _clip("AvgBidPrice"),
+            _clip("AvgAskPrice"),
         ]
-        exprs += [_safe_price(f"AskPrice{i}") for i in range(1, 11)]
+        exprs += [_clip(f"AskPrice{i}") for i in range(1, 11)]
         exprs += [f"COALESCE(x.AskVolume{i}, 0)::BIGINT AS AskVolume{i}" for i in range(1, 11)]
         exprs += [f"COALESCE(x.AskNum{i}, 0)::INTEGER AS AskNum{i}" for i in range(1, 11)]
-        exprs += [_safe_price(f"BidPrice{i}") for i in range(1, 11)]
+        exprs += [_clip(f"BidPrice{i}") for i in range(1, 11)]
         exprs += [f"COALESCE(x.BidVolume{i}, 0)::BIGINT AS BidVolume{i}" for i in range(1, 11)]
         exprs += [f"COALESCE(x.BidNum{i}, 0)::INTEGER AS BidNum{i}" for i in range(1, 11)]
         exprs += ["x.SeqNum::INTEGER AS SeqNum"]
     else:
         raise ValueError(f"unsupported kind: {kind}")
     return ",\n                            ".join(exprs)
+
+
+def validate_archive_times(con, kind: str, chunk_dir: Path, map_tmp: Path, map_code_col: str, tmp_file: Path) -> bool:
+    """Fail fast if merged parquet Time/UpdateTime drift from source chunks.
+
+    20260701 曾经因为自定义 DuckDB epoch_us 宏把秒数重复加了一遍，导致
+    tick/order 归档时间相对 SHM 错位。这里用 DuckDB 内置 epoch_us 重新
+    对源 chunk 计算期望值，并和最终 tmp parquet 比较；不一致就拒绝上传。
+    """
+    stats = con.execute(f"""
+        WITH src AS (
+            SELECT
+                m.SECURITY_ID::INTEGER AS Code,
+                x.SeqNum::INTEGER AS SeqNum,
+                epoch_us(x.Time) AS Time,
+                epoch_us(x.UpdateTime) AS UpdateTime
+            FROM read_parquet('{chunk_dir}/*.parquet') x
+            JOIN read_parquet('{map_tmp}') m
+              ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+        ),
+        dst AS (
+            SELECT Code, SeqNum, Time, UpdateTime
+            FROM read_parquet('{tmp_file}')
+        )
+        SELECT
+            COUNT(*) AS rows_checked,
+            SUM(CASE WHEN dst.Time != src.Time THEN 1 ELSE 0 END) AS time_bad,
+            SUM(CASE WHEN dst.UpdateTime != src.UpdateTime THEN 1 ELSE 0 END) AS update_bad
+        FROM dst
+        JOIN src USING (Code, SeqNum)
+    """).fetchone()
+    rows_checked, time_bad, update_bad = (int(stats[0] or 0), int(stats[1] or 0), int(stats[2] or 0))
+    if rows_checked == 0 or time_bad or update_bad:
+        log.error(
+            "[%s] archive time validation failed: rows=%d time_bad=%d update_bad=%d",
+            kind, rows_checked, time_bad, update_bad,
+        )
+        return False
+    log.info("[%s] archive time validation ok: rows=%d", kind, rows_checked)
+    return True
 
 
 def get_oss_bucket():
@@ -200,6 +242,10 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
                 ORDER BY m.SECURITY_ID, x.SeqNum
             ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
         """)
+        if not validate_archive_times(con, kind, chunk_dir, map_tmp, map_code_col, tmp_file):
+            tmp_file.unlink(missing_ok=True)
+            map_tmp.unlink(missing_ok=True)
+            return False
         con.close()
     except Exception as exc:
         log.error("[%s] duckdb merge failed: %s", kind, exc, exc_info=True)

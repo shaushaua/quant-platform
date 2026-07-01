@@ -1693,6 +1693,13 @@ class NativeEngine:
                         ORDER BY m.SECURITY_ID, x.SeqNum
                     ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
                 """)
+                if not self._validate_archive_times(
+                    con, kind, chunk_dir, map_tmp_path, map_code_col, tmp_file
+                ):
+                    had_error = True
+                    tmp_file.unlink(missing_ok=True)
+                    con.close()
+                    continue
                 con.close()
                 oss_key = f"{prefix}/{date_str}_{kind}.parquet"
                 bucket.put_object_from_file(oss_key, str(tmp_file))
@@ -1841,7 +1848,7 @@ class NativeEngine:
             # ×100 cast INT32 时溢出(10^11 > 2.1*10^9),导致整个 tick upload 失败。
             # LEAST(... , 2147483647) 把 sentinel clip 到 INT32_MAX,牺牲"无限制"语义
             # 但不丢这一行其他有效字段。
-            _clip = "LEAST(ROUND(x.{c} * 100), 2147483647)::INTEGER"
+            _clip = "LEAST(ROUND(x.{c} * 100), 2147483647)::INTEGER AS {c}"
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
                 "epoch_us(x.Time) AS Time",
@@ -1869,6 +1876,50 @@ class NativeEngine:
         else:
             raise ValueError(f"unsupported archive kind: {kind}")
         return ",\n                            ".join(exprs)
+
+    def _validate_archive_times(
+        self,
+        con,
+        kind: str,
+        chunk_dir: Path,
+        map_tmp_path: Path,
+        map_code_col: str,
+        tmp_file: Path,
+    ) -> bool:
+        """Validate merged archive Time/UpdateTime against source chunks."""
+        rows_checked, time_bad, update_bad = con.execute(f"""
+            WITH src AS (
+                SELECT
+                    m.SECURITY_ID::INTEGER AS Code,
+                    x.SeqNum::INTEGER AS SeqNum,
+                    epoch_us(x.Time) AS Time,
+                    epoch_us(x.UpdateTime) AS UpdateTime
+                FROM read_parquet('{chunk_dir}/*.parquet') x
+                JOIN read_parquet('{map_tmp_path}') m
+                  ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+            ),
+            dst AS (
+                SELECT Code, SeqNum, Time, UpdateTime
+                FROM read_parquet('{tmp_file}')
+            )
+            SELECT
+                COUNT(*) AS rows_checked,
+                SUM(CASE WHEN dst.Time != src.Time THEN 1 ELSE 0 END) AS time_bad,
+                SUM(CASE WHEN dst.UpdateTime != src.UpdateTime THEN 1 ELSE 0 END) AS update_bad
+            FROM dst
+            JOIN src USING (Code, SeqNum)
+        """).fetchone()
+        rows_checked = int(rows_checked or 0)
+        time_bad = int(time_bad or 0)
+        update_bad = int(update_bad or 0)
+        if rows_checked == 0 or time_bad or update_bad:
+            logger.error(
+                "[native-archive] %s time validation failed rows=%d time_bad=%d update_bad=%d",
+                kind, rows_checked, time_bad, update_bad,
+            )
+            return False
+        logger.info("[native-archive] %s time validation ok rows=%d", kind, rows_checked)
+        return True
 
     def _archive_native_incremental(self, files_by_code: Dict[str, Dict[int, str]]) -> None:
         if not self._raw_archive_enabled:
@@ -3254,7 +3305,7 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
                 str(row.get("algo_strategy", "") or ""),
                 str(row.get("algo_param", "") or ""),
             ])
-            order_id = "ord_" + hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
+            order_id = f"{strategy}_" + hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
         order = {
             "order_id": order_id,
             "symbol": code,
