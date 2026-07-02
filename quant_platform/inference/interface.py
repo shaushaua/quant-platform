@@ -511,14 +511,14 @@ def positions_to_orders(
         pos = positions_df_pos
         vol_col = next(
             (c for c in (
-                "volume", "total_qty", "qty", "quantity", "position_volume"
+                "current_volume", "volume", "total_qty", "qty", "quantity", "position_volume"
             ) if c in pos.columns),
             None,
         )
         if vol_col is None:
             logger.warning(
                 "positions_to_orders: delta_mode needs positions volume "
-                "column (volume/total_qty/qty/quantity/position_volume); "
+                "column (current_volume/volume/total_qty/qty/quantity/position_volume); "
                 "falling back to absolute"
             )
         else:
