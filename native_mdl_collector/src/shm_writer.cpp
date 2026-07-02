@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <filesystem>
 #include <iostream>
+#include <cstdio>
 
 namespace quant::native_mdl {
 
@@ -175,58 +176,143 @@ ShmWriter::ShmWriter(std::string root, std::size_t tick_capacity,
     std::filesystem::create_directories(root_);
 }
 
-std::string ShmWriter::path_for(DataKind kind, const std::string& code) const {
+const char* ShmWriter::kind_name(DataKind kind) {
+    switch (kind) {
+        case DataKind::Tick:  return "tick";
+        case DataKind::Order: return "order";
+        case DataKind::Deal:  return "deal";
+    }
+    return "unknown";
+}
+
+std::string ShmWriter::path_for(DataKind kind, const std::string& code, std::size_t part) const {
     // code = "600000.XSHG" → "600000_XSHG"
     std::string safe_code = code;
     std::replace(safe_code.begin(), safe_code.end(), '.', '_');
 
-    const char* kind_str = "";
-    switch (kind) {
-        case DataKind::Tick:  kind_str = "tick";  break;
-        case DataKind::Order: kind_str = "order"; break;
-        case DataKind::Deal:  kind_str = "deal";  break;
+    std::string base = root_ + "/quant_" + kind_name(kind) + "_" + safe_code;
+    if (part == 0) {
+        return base + ".mmap";
     }
-    return root_ + "/quant_" + kind_str + "_" + safe_code + ".mmap";
+    char suffix[32];
+    std::snprintf(suffix, sizeof(suffix), "_part%03zu.mmap", part);
+    return base + suffix;
+}
+
+std::size_t ShmWriter::latest_existing_part(DataKind kind, const std::string& code) const {
+    namespace fs = std::filesystem;
+    std::string safe_code = code;
+    std::replace(safe_code.begin(), safe_code.end(), '.', '_');
+
+    const std::string legacy_name = std::string("quant_") + kind_name(kind) + "_" + safe_code + ".mmap";
+    const std::string prefix = std::string("quant_") + kind_name(kind) + "_" + safe_code + "_part";
+    std::size_t latest = 0;
+    bool found = false;
+    fs::path root_path(root_);
+    if (!fs::exists(root_path)) {
+        return 0;
+    }
+    for (const auto& entry : fs::directory_iterator(root_path)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::string name = entry.path().filename().string();
+        if (name == legacy_name) {
+            found = true;
+            latest = std::max<std::size_t>(latest, 0);
+            continue;
+        }
+        if (name.rfind(prefix, 0) == 0 && name.size() == prefix.size() + 8 &&
+            name.substr(name.size() - 5) == ".mmap") {
+            try {
+                std::size_t part = static_cast<std::size_t>(
+                    std::stoul(name.substr(prefix.size(), 3)));
+                found = true;
+                latest = std::max(latest, part);
+            } catch (...) {
+            }
+        }
+    }
+    return found ? latest : 0;
+}
+
+ShmWriter::BufferSlot ShmWriter::create_buffer_slot(
+        DataKind kind, const std::string& code, std::size_t n_cols, std::size_t part) const {
+    BufferSlot slot;
+    slot.part = part;
+    slot.mmap = std::make_unique<StockMmap>(
+        path_for(kind, code, part),
+        kind,
+        kind == DataKind::Tick ? tick_capacity_ : (kind == DataKind::Order ? order_capacity_ : deal_capacity_),
+        n_cols,
+        trading_day_);
+    return slot;
 }
 
 StockMmap& ShmWriter::get_buffer(DataKind kind, const std::string& code, std::size_t n_cols) {
     // Key = kind_code (e.g., "tick_600000_XSHG")
-    const char* kind_str = "";
-    std::size_t capacity = 0;
-    switch (kind) {
-        case DataKind::Tick:  kind_str = "tick";  capacity = tick_capacity_;  break;
-        case DataKind::Order: kind_str = "order"; capacity = order_capacity_; break;
-        case DataKind::Deal:  kind_str = "deal";  capacity = deal_capacity_;  break;
-    }
-
-    std::string key = std::string(kind_str) + "_" + code;
+    std::string key = std::string(kind_name(kind)) + "_" + code;
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = buffers_.find(key);
     if (it != buffers_.end()) {
-        return *it->second;
+        return *it->second.mmap;
     }
 
-    auto path = path_for(kind, code);
-    auto buf = std::make_unique<StockMmap>(path, kind, capacity, n_cols, trading_day_);
-    auto& ref = *buf;
-    buffers_.emplace(std::move(key), std::move(buf));
+    // If the collector process restarts after an overflow file was already
+    // created, resume from the latest part instead of reopening part0.  This
+    // keeps the naming scheme append-only across process restarts.
+    std::size_t part = latest_existing_part(kind, code);
+    auto slot = create_buffer_slot(kind, code, n_cols, part);
+    auto& ref = *slot.mmap;
+    buffers_.emplace(std::move(key), std::move(slot));
     return ref;
 }
 
+bool ShmWriter::append_with_overflow(
+        DataKind kind, const std::string& code,
+        const std::vector<double>& row, std::size_t n_cols) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto& buf = get_buffer(kind, code, n_cols);
+        if (buf.append(row.data())) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string key = std::string(kind_name(kind)) + "_" + code;
+        auto it = buffers_.find(key);
+        if (it == buffers_.end()) {
+            continue;
+        }
+        if (!it->second.mmap->full()) {
+            continue;
+        }
+        // New stocks can hit the fixed per-code mmap capacity before close.
+        // Rolling to quant_<kind>_<code>_partNNN.mmap preserves every row while
+        // keeping the original part0 filename backward-compatible.
+        std::size_t next_part = it->second.part + 1;
+        std::cerr << "[shm] rollover kind=" << kind_name(kind)
+                  << " code=" << code
+                  << " part=" << it->second.part
+                  << " rows=" << it->second.mmap->row_count()
+                  << " capacity=" << it->second.mmap->capacity()
+                  << " next_part=" << next_part << "\n";
+        it->second = create_buffer_slot(kind, code, n_cols, next_part);
+    }
+    total_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
 void ShmWriter::append_tick(const std::string& code, const std::vector<double>& row) {
-    auto& buf = get_buffer(DataKind::Tick, code, schema::kTickCols);
-    if (!buf.append(row.data())) total_dropped_.fetch_add(1, std::memory_order_relaxed);
+    append_with_overflow(DataKind::Tick, code, row, schema::kTickCols);
 }
 
 void ShmWriter::append_order(const std::string& code, const std::vector<double>& row) {
-    auto& buf = get_buffer(DataKind::Order, code, schema::kOrderCols);
-    if (!buf.append(row.data())) total_dropped_.fetch_add(1, std::memory_order_relaxed);
+    append_with_overflow(DataKind::Order, code, row, schema::kOrderCols);
 }
 
 void ShmWriter::append_deal(const std::string& code, const std::vector<double>& row) {
-    auto& buf = get_buffer(DataKind::Deal, code, schema::kDealCols);
-    if (!buf.append(row.data())) total_dropped_.fetch_add(1, std::memory_order_relaxed);
+    append_with_overflow(DataKind::Deal, code, row, schema::kDealCols);
 }
 
 } // namespace quant::native_mdl

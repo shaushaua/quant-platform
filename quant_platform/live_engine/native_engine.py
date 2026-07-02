@@ -37,7 +37,7 @@ import urllib.request
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -289,8 +289,28 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
         _col_secs = arr[:, _tc_idx]
         _valid = np.isfinite(_col_secs) & (_col_secs >= 0)
         _ns = np.full(len(_col_secs), _nat_int, dtype=np.int64)
-        _ns[_valid] = base_ns + (_col_secs[_valid] * 1_000_000_000).astype(np.int64)
+        # C++ stores millisecond-derived seconds in f64.  Direct astype(int64)
+        # truncates values like 09:15:00.020 to ...019999999, which can diverge
+        # from historical parquet on boundary-sensitive factors.  Round to the
+        # nearest ns before converting.
+        _ns[_valid] = base_ns + np.rint(_col_secs[_valid] * 1_000_000_000).astype(np.int64)
         df[buf_cols[_tc_idx]] = _ns.astype('datetime64[ns]')
+
+    if historical_compat:
+        # Historical parquet stores price fields as integer cents and restores
+        # them with /100. Native SHM keeps f64 MDL values; to keep live factors
+        # aligned with the historical cent representation, quantize to the
+        # nearest cent before downstream factor code sees the values.
+        for _col in df.columns:
+            if _col == "Code":
+                continue
+            if "Price" in _col or "IOPV" in _col:
+                _v = pd.to_numeric(df[_col], errors="coerce").to_numpy(dtype="float64", copy=False)
+                _valid = np.isfinite(_v)
+                if _valid.any():
+                    _out = _v.copy()
+                    _out[_valid] = np.rint(_out[_valid] * 100.0) / 100.0
+                    df[_col] = _out
 
     # Volume ×100 对齐回测（见函数 docstring 和模块级 _tick_volume_idx 注释）
     if volume_idx:
@@ -309,21 +329,6 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
             seq_before,
             _seqnum_stats(df),
         )
-
-    # Match historical _restore_oss_precision exactly for model compatibility.
-    # Archive parquet stores UpdateTime as full epoch_us, but the historical
-    # restore path treats it as an offset from Time. Keep the same quirk in
-    # live factors because models were trained on that historical output.
-    if historical_compat and "Time" in df.columns and "UpdateTime" in df.columns:
-        upd_ns = pd.to_datetime(df["UpdateTime"], errors="coerce").astype("int64")
-        valid = upd_ns != _nat_int
-        compat_update = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
-        if valid.any():
-            compat_update.loc[valid] = (
-                pd.to_datetime(df.loc[valid, "Time"], errors="coerce")
-                + pd.to_timedelta((upd_ns[valid] // 1000).astype("int64"), unit="us")
-            )
-        df["UpdateTime"] = compat_update
 
     if historical_compat:
         for _col in (
@@ -359,7 +364,7 @@ def _read_native_df_for_worker(path: str, kind: int, code: str, trading_day: str
             _secs = df[col].to_numpy()
             _valid = np.isfinite(_secs) & (_secs >= 0)
             _ns = np.full(len(_secs), _nat_int, dtype=np.int64)
-            _ns[_valid] = base_ns + (_secs[_valid] * 1_000_000_000).astype(np.int64)
+            _ns[_valid] = base_ns + np.rint(_secs[_valid] * 1_000_000_000).astype(np.int64)
             df[col] = _ns.astype("datetime64[ns]")
     df.insert(0, "TradingDay", trading_day)
     df.insert(1, "Code", code)
@@ -368,11 +373,18 @@ def _read_native_df_for_worker(path: str, kind: int, code: str, trading_day: str
 
 # ── Worker function for parallel factor computation ────────────────
 
-def _cached_reader(path: str) -> NativeShmReader:
-    reader = _reader_cache.get(path)
+def _reader_cache_key(path) -> str:
+    if isinstance(path, (list, tuple)):
+        return "|".join(str(p) for p in path)
+    return str(path)
+
+
+def _cached_reader(path) -> NativeShmReader:
+    key = _reader_cache_key(path)
+    reader = _reader_cache.get(key)
     if reader is None:
         reader = NativeShmReader(path)
-        _reader_cache[path] = reader
+        _reader_cache[key] = reader
     return reader
 
 
@@ -582,8 +594,12 @@ class NativeEngine:
         self._archive_interval = int(os.environ.get("ARCHIVE_INTERVAL", "300"))
         self._disk_output_dir = Path(os.environ.get("COLLECTOR_DISK_OUTPUT", "/data/collector_output"))
         self._archive_offsets: Dict[Tuple[str, int], int] = {}
+        self._archive_offsets_loaded_day: str = ""
+        self._archive_code_map_cache: Optional[Tuple[str, pd.DataFrame]] = None
         self._disk_chunk_idx: Dict[str, int] = {}
         self._uploaded_today = False
+        self._raw_archive_wait_daily_done = False
+        self._post_close_daily_done = threading.Event()
         self._stopped = False
         self._archive_thread: Optional[threading.Thread] = None
         self._compute_lock = threading.Lock()
@@ -593,7 +609,7 @@ class NativeEngine:
         self._main_readers: Dict[str, NativeShmReader] = {}
         # _cached_shm_files was removed — SHM files are created lazily by the
         # collector, so every cycle must re-scan to pick up new stocks.
-        self._sync_warn_ts: Dict[Tuple[str, int], float] = {}  # rate-limited warning log
+        self._sync_warn_ts: Dict[Any, float] = {}  # rate-limited warning log
 
     def _init_pool(self) -> None:
         """Create persistent worker pool."""
@@ -990,14 +1006,29 @@ class NativeEngine:
                 out.append(mapping[s])
         return ",".join(out)
 
-    def _scan_shm_files(self) -> Dict[str, Dict[int, str]]:
+    @staticmethod
+    def _path_key(path) -> str:
+        if isinstance(path, (list, tuple)):
+            return "|".join(str(p) for p in path)
+        return str(path)
+
+    @staticmethod
+    def _offset_path_key(path) -> str:
+        if isinstance(path, (list, tuple)):
+            # Offsets are keyed by part0 only.  When part001 appears later, the
+            # logical stream grows but the offset identity must stay stable;
+            # otherwise state/archive readers would replay part0.
+            return str(path[0]) if path else ""
+        return str(path)
+
+    def _scan_shm_files(self) -> Dict[str, Dict[int, object]]:
         """Scan SHM directory, return {code: {kind: path}}.
         Not cached — collector creates files lazily throughout the
         trading day (only ~1800 at startup, up to ~5200+ at peak),
         so every cycle must re-scan to pick up newly-created files.
         This is fast: Path.iterdir on 15k entries takes 1-2ms."""
         files = scan_shm_dir(self.shm_dir)
-        by_code: Dict[str, Dict[int, str]] = {}
+        by_code: Dict[str, Dict[int, object]] = {}
         for (code, kind), path in files.items():
             if code not in by_code:
                 by_code[code] = {}
@@ -1044,7 +1075,7 @@ class NativeEngine:
         ("300750", "XSHE"),  # 宁德时代 (SZ 创业板)
     ]
 
-    def _log_shm_sanity(self, files_by_code: Dict[str, Dict[int, str]]) -> None:
+    def _log_shm_sanity(self, files_by_code: Dict[str, Dict[int, object]]) -> None:
         """记录 SHM 原始字段值, 用于事后与历史 parquet 比对, 定位单位 bug。
 
         输出:
@@ -1310,19 +1341,20 @@ class NativeEngine:
         s, ms = divmod(rem, 1000)
         return f"{h:02d}{m:02d}{s:02d}{ms:03d}"
 
-    def _get_cached_reader(self, path: str) -> Optional[NativeShmReader]:
+    def _get_cached_reader(self, path) -> Optional[NativeShmReader]:
         """Get or create a cached NativeShmReader for the main process."""
-        reader = self._main_readers.get(path)
+        key = self._path_key(path)
+        reader = self._main_readers.get(key)
         if reader is not None:
             return reader
         try:
             reader = NativeShmReader(path)
-            self._main_readers[path] = reader
+            self._main_readers[key] = reader
             return reader
         except Exception:
             return None
 
-    def _sync_states(self, files_by_code: Dict[str, Dict[int, str]],
+    def _sync_states(self, files_by_code: Dict[str, Dict[int, object]],
                      wall_secs: float) -> Tuple[set, Dict[str, StockState]]:
         """Update main-process StockState from native mmap increments.
 
@@ -1355,7 +1387,7 @@ class NativeEngine:
                 path = kinds.get(kind)
                 if not path:
                     continue
-                offset_key = (path, kind)
+                offset_key = (self._offset_path_key(path), kind)
                 start = self._state_offsets.get(offset_key, 0)
 
                 reader = self._get_cached_reader(path)
@@ -1365,6 +1397,21 @@ class NativeEngine:
                     current = reader.refresh()
                 except Exception:
                     continue
+                try:
+                    capacity = int(reader.capacity)
+                    if capacity > 0 and current >= int(capacity * 0.8):
+                        cap_warn_key = ("capacity", offset_key)
+                        _now_warn = time.monotonic()
+                        if _now_warn - self._sync_warn_ts.get(cap_warn_key, 0.0) > 60.0:
+                            self._sync_warn_ts[cap_warn_key] = _now_warn
+                            log_fn = logger.error if current >= capacity else logger.warning
+                            log_fn(
+                                "[shm-capacity] code=%s kind=%s rows=%d capacity=%d usage=%.1f%%",
+                                code, _kind_names.get(kind, str(kind)),
+                                current, capacity, current * 100.0 / capacity,
+                            )
+                except Exception:
+                    pass
                 if current <= start:
                     continue
 
@@ -1525,7 +1572,7 @@ class NativeEngine:
         state.last_order_time = raw_time
         state._update_market_time_raw(raw_time)
 
-    def _read_native_df(self, path: str, kind: int, code: str,
+    def _read_native_df(self, path, kind: int, code: str,
                         start_row: int = 0, end_row: Optional[int] = None) -> pd.DataFrame:
         columns = _columns_by_kind[kind]
         reader = NativeShmReader(path)
@@ -1547,7 +1594,7 @@ class NativeEngine:
                 _secs = df[col].to_numpy()
                 _valid = np.isfinite(_secs) & (_secs >= 0)
                 _ns = np.full(len(_secs), _nat_int, dtype=np.int64)
-                _ns[_valid] = base_ns + (_secs[_valid] * 1_000_000_000).astype(np.int64)
+                _ns[_valid] = base_ns + np.rint(_secs[_valid] * 1_000_000_000).astype(np.int64)
                 df[col] = _ns.astype("datetime64[ns]")
         df.insert(0, "TradingDay", self.trading_day)
         df.insert(1, "Code", code)
@@ -1573,6 +1620,66 @@ class NativeEngine:
             logger.error("[native-archive] write %s parquet failed: %s", kind_name, exc, exc_info=True)
             return False
 
+    def _archive_offsets_path(self) -> Path:
+        return self._disk_output_dir / self.trading_day / "archive_offsets.json"
+
+    @staticmethod
+    def _encode_archive_offset_key(key: Tuple[str, int]) -> str:
+        return f"{key[0]}\t{key[1]}"
+
+    @staticmethod
+    def _decode_archive_offset_key(raw: str) -> Optional[Tuple[str, int]]:
+        try:
+            path, kind_raw = raw.rsplit("\t", 1)
+            return path, int(kind_raw)
+        except Exception:
+            return None
+
+    def _load_archive_offsets(self) -> None:
+        if not self.trading_day or self._archive_offsets_loaded_day == self.trading_day:
+            return
+        self._archive_offsets_loaded_day = self.trading_day
+        path = self._archive_offsets_path()
+        if not path.exists():
+            self._archive_offsets = {}
+            return
+        try:
+            raw = json.loads(path.read_text())
+            offsets: Dict[Tuple[str, int], int] = {}
+            for key_raw, value in raw.items():
+                key = self._decode_archive_offset_key(str(key_raw))
+                if key is None:
+                    continue
+                offsets[key] = int(value)
+            self._archive_offsets = offsets
+            logger.info("[native-archive] loaded %d archive offsets from %s",
+                        len(offsets), path)
+        except Exception as exc:
+            logger.warning("[native-archive] load archive offsets failed (%s), continue with empty offsets: %s",
+                           path, exc)
+            self._archive_offsets = {}
+
+    def _save_archive_offsets(self) -> None:
+        if not self.trading_day:
+            return
+        path = self._archive_offsets_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".json.tmp")
+            payload = {
+                self._encode_archive_offset_key(key): int(value)
+                for key, value in self._archive_offsets.items()
+            }
+            # Archive offsets used to live only in process memory, so a midday
+            # pod restart made the afternoon snapshot replay rows already
+            # flushed before lunch. Persisting offsets makes chunk generation
+            # restart-safe; final merge de-dup below remains a second guard.
+            tmp_path.write_text(json.dumps(payload, sort_keys=True))
+            tmp_path.replace(path)
+        except Exception as exc:
+            logger.warning("[native-archive] save archive offsets failed (%s): %s",
+                           path, exc)
+
     @staticmethod
     def _parse_upload_time(raw: str) -> Tuple[int, int]:
         if ":" in raw:
@@ -1589,7 +1696,7 @@ class NativeEngine:
         bucket_name = os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data")
         return oss2.Bucket(auth, endpoint, bucket_name)
 
-    def _check_raw_upload_time(self, files_by_code: Dict[str, Dict[int, str]]) -> None:
+    def _check_raw_upload_time(self, files_by_code: Dict[str, Dict[int, object]]) -> None:
         if not self._raw_archive_enabled or self._uploaded_today:
             return
         upload_hour, upload_minute = self._parse_upload_time(
@@ -1604,6 +1711,18 @@ class NativeEngine:
             self._uploaded_today = True
         # 上传 feeder_client 原始 CSV 备份到 raw_msgs/{date}/（和 ftp 同名）
         self._upload_mdl_backup_to_oss()
+
+    def _upload_raw_snapshot_now(self) -> bool:
+        """Upload already-snapshotted raw chunks without a wall-clock gate."""
+        if not self._raw_archive_enabled or self._uploaded_today:
+            return bool(self._uploaded_today)
+        self._release_pool()
+        if self._upload_raw_day_to_oss():
+            self._uploaded_today = True
+            # 上传 feeder_client 原始 CSV 备份到 raw_msgs/{date}/（和 ftp 同名）
+            self._upload_mdl_backup_to_oss()
+            return True
+        return False
 
     def _upload_raw_day_to_oss(self) -> bool:
         date_str = self.trading_day
@@ -1633,12 +1752,18 @@ class NativeEngine:
             # (e.g. "000001"). Using the raw ID_QI column risks losing leading
             # zeros via `::VARCHAR` when ID_QI is integer-typed, which silently
             # drops all XSHE (Shenzhen) codes from the archived parquet.
-            if "_ID_QI_PAD" in self._daily_basic_df.columns:
-                map_code_col = "_ID_QI_PAD"
-                map_df = self._daily_basic_df[["_ID_QI_PAD", "SECURITY_ID"]].drop_duplicates()
+            if self._daily_basic_df is not None:
+                if "_ID_QI_PAD" in self._daily_basic_df.columns:
+                    map_code_col = "_ID_QI_PAD"
+                    map_df = self._daily_basic_df[["_ID_QI_PAD", "SECURITY_ID"]].drop_duplicates()
+                else:
+                    map_code_col = "ID_QI"
+                    map_df = self._daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
+                self._archive_code_map_cache = (map_code_col, map_df.copy())
+            elif self._archive_code_map_cache is not None:
+                map_code_col, map_df = self._archive_code_map_cache
             else:
-                map_code_col = "ID_QI"
-                map_df = self._daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
+                raise RuntimeError("daily_basic_df already released and code map cache is empty")
             map_df.to_parquet(map_tmp_path, index=False)
         except Exception as exc:
             logger.error("[native-archive] code map write failed: %s", exc)
@@ -1683,14 +1808,34 @@ class NativeEngine:
                 select_clause = self._archive_select_clause(kind)
                 # map_code_col determined before _daily_basic_df was freed below;
                 # map_df carries either "_ID_QI_PAD" (zero-padded str) or "ID_QI".
+                output_cols = ", ".join(self._archive_output_columns(kind))
+                self._log_archive_duplicate_stats(
+                    con, kind, chunk_dir, map_tmp_path, map_code_col)
                 con.execute(f"""
                     COPY (
-                        SELECT
-                            {select_clause}
-                        FROM read_parquet('{chunk_dir}/*.parquet') x
-                        JOIN read_parquet('{map_tmp_path}') m
-                          ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
-                        ORDER BY m.SECURITY_ID, x.SeqNum
+                        WITH merged AS (
+                            SELECT
+                                {select_clause}
+                            FROM read_parquet('{chunk_dir}/*.parquet') x
+                            JOIN read_parquet('{map_tmp_path}') m
+                              ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                        ),
+                        ranked AS (
+                            SELECT
+                                *,
+                                -- Restart-safe offsets prevent most duplicate
+                                -- chunks.  Keep this de-dup as a hard guard for
+                                -- manual retries or interrupted deployments.
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY Code, SeqNum
+                                    ORDER BY Time, UpdateTime
+                                ) AS _rn
+                            FROM merged
+                        )
+                        SELECT {output_cols}
+                        FROM ranked
+                        WHERE _rn = 1
+                        ORDER BY Code, SeqNum
                     ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
                 """)
                 if not self._validate_archive_times(
@@ -1877,6 +2022,72 @@ class NativeEngine:
             raise ValueError(f"unsupported archive kind: {kind}")
         return ",\n                            ".join(exprs)
 
+    def _log_archive_duplicate_stats(
+        self,
+        con,
+        kind: str,
+        chunk_dir: Path,
+        map_tmp_path: Path,
+        map_code_col: str,
+    ) -> None:
+        try:
+            raw_rows, distinct_keys, dup_rows = con.execute(f"""
+                WITH mapped AS (
+                    SELECT
+                        m.SECURITY_ID::INTEGER AS Code,
+                        x.SeqNum::INTEGER AS SeqNum
+                    FROM read_parquet('{chunk_dir}/*.parquet') x
+                    JOIN read_parquet('{map_tmp_path}') m
+                      ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                ),
+                grouped AS (
+                    SELECT Code, SeqNum, COUNT(*) AS n
+                    FROM mapped
+                    GROUP BY Code, SeqNum
+                )
+                SELECT
+                    COALESCE(SUM(n), 0)::BIGINT AS raw_rows,
+                    COUNT(*)::BIGINT AS distinct_keys,
+                    COALESCE(SUM(n - 1), 0)::BIGINT AS dup_rows
+                FROM grouped
+            """).fetchone()
+            logger.info(
+                "[native-archive] %s duplicate stats raw_rows=%d distinct_keys=%d dup_rows=%d",
+                kind, int(raw_rows or 0), int(distinct_keys or 0), int(dup_rows or 0),
+            )
+        except Exception as exc:
+            logger.warning("[native-archive] %s duplicate stats failed: %s", kind, exc)
+
+    @staticmethod
+    def _archive_output_columns(kind: str) -> list[str]:
+        if kind == "order":
+            return [
+                "Code", "Time", "UpdateTime", "OrderID", "Side", "Price",
+                "Volume", "OrderType", "SeqNum",
+            ]
+        if kind == "deal":
+            return [
+                "Code", "Time", "UpdateTime", "SaleOrderID", "BuyOrderID",
+                "Side", "Price", "Volume", "SeqNum",
+            ]
+        if kind == "tick":
+            cols = [
+                "Code", "Time", "UpdateTime", "CurrentPrice", "TotalVolume",
+                "PreClosePrice", "OpenPrice", "HighestPrice", "LowestPrice",
+                "HighLimitPrice", "LowLimitPrice", "IOPV", "TradeNum",
+                "TotalBidVolume", "TotalAskVolume", "AvgBidPrice",
+                "AvgAskPrice",
+            ]
+            cols += [f"AskPrice{i}" for i in range(1, 11)]
+            cols += [f"AskVolume{i}" for i in range(1, 11)]
+            cols += [f"AskNum{i}" for i in range(1, 11)]
+            cols += [f"BidPrice{i}" for i in range(1, 11)]
+            cols += [f"BidVolume{i}" for i in range(1, 11)]
+            cols += [f"BidNum{i}" for i in range(1, 11)]
+            cols.append("SeqNum")
+            return cols
+        raise ValueError(f"unsupported archive kind: {kind}")
+
     def _validate_archive_times(
         self,
         con,
@@ -1887,8 +2098,8 @@ class NativeEngine:
         tmp_file: Path,
     ) -> bool:
         """Validate merged archive Time/UpdateTime against source chunks."""
-        rows_checked, time_bad, update_bad = con.execute(f"""
-            WITH src AS (
+        rows_checked, time_bad, update_bad, dst_rows, src_rows = con.execute(f"""
+            WITH src_raw AS (
                 SELECT
                     m.SECURITY_ID::INTEGER AS Code,
                     x.SeqNum::INTEGER AS SeqNum,
@@ -1898,6 +2109,19 @@ class NativeEngine:
                 JOIN read_parquet('{map_tmp_path}') m
                   ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
             ),
+            src AS (
+                SELECT Code, SeqNum, Time, UpdateTime
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY Code, SeqNum
+                            ORDER BY Time, UpdateTime
+                        ) AS _rn
+                    FROM src_raw
+                )
+                WHERE _rn = 1
+            ),
             dst AS (
                 SELECT Code, SeqNum, Time, UpdateTime
                 FROM read_parquet('{tmp_file}')
@@ -1905,25 +2129,30 @@ class NativeEngine:
             SELECT
                 COUNT(*) AS rows_checked,
                 SUM(CASE WHEN dst.Time != src.Time THEN 1 ELSE 0 END) AS time_bad,
-                SUM(CASE WHEN dst.UpdateTime != src.UpdateTime THEN 1 ELSE 0 END) AS update_bad
+                SUM(CASE WHEN dst.UpdateTime != src.UpdateTime THEN 1 ELSE 0 END) AS update_bad,
+                (SELECT COUNT(*) FROM dst) AS dst_rows,
+                (SELECT COUNT(*) FROM src) AS src_rows
             FROM dst
             JOIN src USING (Code, SeqNum)
         """).fetchone()
         rows_checked = int(rows_checked or 0)
         time_bad = int(time_bad or 0)
         update_bad = int(update_bad or 0)
-        if rows_checked == 0 or time_bad or update_bad:
+        dst_rows = int(dst_rows or 0)
+        src_rows = int(src_rows or 0)
+        if rows_checked == 0 or rows_checked != dst_rows or rows_checked != src_rows or time_bad or update_bad:
             logger.error(
-                "[native-archive] %s time validation failed rows=%d time_bad=%d update_bad=%d",
-                kind, rows_checked, time_bad, update_bad,
+                "[native-archive] %s time validation failed checked=%d dst_rows=%d src_rows=%d time_bad=%d update_bad=%d",
+                kind, rows_checked, dst_rows, src_rows, time_bad, update_bad,
             )
             return False
         logger.info("[native-archive] %s time validation ok rows=%d", kind, rows_checked)
         return True
 
-    def _archive_native_incremental(self, files_by_code: Dict[str, Dict[int, str]]) -> None:
+    def _archive_native_incremental(self, files_by_code: Dict[str, Dict[int, object]]) -> None:
         if not self._raw_archive_enabled:
             return
+        self._load_archive_offsets()
         for kind, kind_name in _kind_names.items():
             frames = []
             pending_offsets: Dict[Tuple[str, int], int] = {}
@@ -1931,7 +2160,7 @@ class NativeEngine:
                 path = kinds.get(kind)
                 if not path:
                     continue
-                offset_key = (path, kind)
+                offset_key = (self._offset_path_key(path), kind)
                 start = self._archive_offsets.get(offset_key, 0)
                 try:
                     reader = NativeShmReader(path)
@@ -1948,17 +2177,19 @@ class NativeEngine:
             if frames:
                 if self._append_raw_to_disk(kind_name, pd.concat(frames, ignore_index=True)):
                     self._archive_offsets.update(pending_offsets)
+                    self._save_archive_offsets()
             elif pending_offsets:
                 self._archive_offsets.update(pending_offsets)
+                self._save_archive_offsets()
 
     def _archive_loop(self) -> None:
         from datetime import timedelta
-        logger.info("[native-archive] background archive loop started (smart-sleep: 11:35/15:05/15:30)")
+        logger.info("[native-archive] background archive loop started "
+                    "(smart-sleep: 11:35/15:05 snapshot, upload after daily done)")
         last_archive_date = ""
         archived_lunch = False
         archived_snapshot = False  # 15:05 SHM -> 本地 chunks
-        archived_upload = False    # 15:30 本地 chunks -> OSS
-        pending_files_by_code: Optional[Dict[str, Dict[int, str]]] = None
+        archived_upload = False    # 15:05 snapshot + daily done -> OSS upload
         while not self._stopped:
             try:
                 today = date.today().isoformat()
@@ -1968,7 +2199,7 @@ class NativeEngine:
                     archived_lunch = now_init.hour > 11 or (now_init.hour == 11 and now_init.minute >= 35)
                     archived_snapshot = False
                     archived_upload = False
-                    pending_files_by_code = None
+                    self._post_close_daily_done.clear()
 
                 now = datetime.now()
                 h, m = now.hour, now.minute
@@ -1981,39 +2212,45 @@ class NativeEngine:
                         archived_lunch = True
                         logger.info("[native-archive] lunch break snapshot done")
 
-                # 15:05 post-close SHM snapshot — 只落盘 chunks，不传 OSS
+                # 15:05 post-close SHM snapshot freezes the raw archive input.
+                # Tick files can keep growing after close, but post-15:00 rows
+                # are not useful for factor/backtest parity.  Upload waits for
+                # the 15:10 daily calculation so DuckDB merge does not release
+                # the worker pool while daily factors are still computing.
                 if h >= 15 and m >= 5 and not archived_snapshot:
                     files_by_code = self._scan_shm_files()
                     if files_by_code:
                         logger.info("[native-archive] post-close snapshot starting...")
                         self._archive_native_incremental(files_by_code)
-                        pending_files_by_code = files_by_code
                         archived_snapshot = True
                         logger.info("[native-archive] post-close snapshot done")
 
-                # 15:30 OSS upload — 独立于 snapshot。
-                # 之前 _check_raw_upload_time 在 15:05 调用时 now<15:30 直接 return，
-                # archived_close=True 后 smart-sleep 睡到明天，导致 RAW_DATA_UPLOAD_TIME
-                # 永远不命中。这里拆开两阶段，确保 upload 真正触发。
-                # 失败重试 ARCHIVE_UPLOAD_MAX_RETRIES 次，间隔 5 分钟。
-                if (archived_snapshot and not archived_upload
-                        and not self._uploaded_today
-                        and (h, m) >= (15, 30)):
-                    files_for_upload = pending_files_by_code or {}
+                daily_done = (
+                    not self._raw_archive_wait_daily_done
+                    or self._post_close_daily_done.is_set()
+                )
+                if archived_snapshot and not archived_upload and not self._uploaded_today and not daily_done:
+                    logger.info("[native-archive] waiting for post-close daily calculation before OSS upload")
+
+                # Upload as soon as all local chunks from the 15:05 snapshot
+                # have been written and the 15:10 daily calculation has ended.
+                # This avoids a second wall-clock gate while preserving daily.
+                if archived_snapshot and not archived_upload and not self._uploaded_today and daily_done:
                     max_attempts = max(1, _env_int("ARCHIVE_UPLOAD_MAX_RETRIES", 3, minimum=1))
                     for attempt in range(1, max_attempts + 1):
                         if self._stopped or self._uploaded_today:
                             break
-                        logger.info("[native-archive] post-close OSS upload attempt %d/%d starting...",
+                        logger.info("[native-archive] post-snapshot OSS upload attempt %d/%d starting...",
                                     attempt, max_attempts)
                         try:
-                            self._check_raw_upload_time(files_for_upload)
+                            if self._upload_raw_snapshot_now():
+                                archived_upload = True
                         except Exception as exc:
                             logger.error("[native-archive] OSS upload attempt %d failed: %s",
                                          attempt, exc, exc_info=True)
                         if self._uploaded_today:
                             archived_upload = True
-                            logger.info("[native-archive] post-close OSS upload done (attempt %d)",
+                            logger.info("[native-archive] post-snapshot OSS upload done (attempt %d)",
                                         attempt)
                             break
                         if attempt < max_attempts:
@@ -2030,18 +2267,20 @@ class NativeEngine:
                         archived_upload = True
 
                 if not archived_lunch:
-                    target_h, target_m = 11, 35
+                    target = now.replace(hour=11, minute=35, second=0, microsecond=0)
+                    if target <= now:
+                        target = target + timedelta(days=1)
+                    sleep_sec = max(1, (target - now).total_seconds())
                 elif not archived_snapshot:
-                    target_h, target_m = 15, 5
+                    target = now.replace(hour=15, minute=5, second=0, microsecond=0)
+                    if target <= now:
+                        target = target + timedelta(days=1)
+                    sleep_sec = max(1, (target - now).total_seconds())
                 elif not archived_upload:
-                    target_h, target_m = 15, 30
+                    sleep_sec = 60.0
                 else:
-                    target_h, target_m = 0, 0
-
-                target = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
-                if target <= now:
-                    target = target + timedelta(days=1)
-                sleep_sec = max(1, (target - now).total_seconds())
+                    target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                    sleep_sec = max(1, (target - now).total_seconds())
 
                 step = 60.0
                 slept = 0.0
@@ -2344,7 +2583,7 @@ class NativeEngine:
 
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         lock = (self._daily_position_lock
-                if (schedule is not None and schedule.name in ("daily_position", "open_position"))
+                if (schedule is not None and schedule.name == "open_position")
                 else self._compute_lock)
         try:
             with lock:
@@ -2352,6 +2591,9 @@ class NativeEngine:
         except Exception as exc:
             logger.error("[combined] background compute failed: %s", exc, exc_info=True)
         finally:
+            if schedule is not None and schedule.name == "daily":
+                self._post_close_daily_done.set()
+                logger.info("[native-archive] post-close daily calculation marked done")
             # Only the minute schedule sets _compute_running; reset it only for
             # minute (or unscheduled) runs so a concurrent daily_position run
             # cannot clear minute's guard while minute is still in flight.
@@ -2718,6 +2960,20 @@ class NativeEngine:
                 logger.warning("[open_position] latest_prices still empty after "
                                "60s wait; positions_to_orders may drop all rows")
 
+        # ── daily_position: inline 推理（不走 fork） ──────────────────
+        # os.fork() 在多线程进程（collector/tick-sync/order-gateway/archive
+        # 线程）中，子进程继承损坏的锁状态 → XGBoost (OpenMP) 加载静默崩溃。
+        # precompute 线程已证明树模型推理在 thread 中正常工作，daily_position
+        # 复用同一模式。
+        if schedule is not None and schedule.name == "daily_position":
+            self._write_daily_position_inline(
+                results, date_str, label, rt_end_time,
+                is_daily, output_path, inference_fn, portfolio_context_fn,
+                daily_basic_df, prev_day_factors, idx_cons_df,
+                trading_universe_df, pre_fork_latest_prices, outfun,
+            )
+            return
+
         try:
             read_fd, write_fd = os.pipe()
             pid = os.fork()
@@ -2833,6 +3089,131 @@ class NativeEngine:
                 except Exception:
                     pass
             pass
+
+    def _write_daily_position_inline(
+        self,
+        results: list,
+        date_str: str,
+        label: str,
+        rt_end_time: str,
+        is_daily: bool,
+        output_path: Optional[Path],
+        inference_fn: Optional[Callable],
+        portfolio_context_fn: Optional[Callable],
+        daily_basic_df,
+        prev_day_factors,
+        idx_cons_df,
+        trading_universe_df,
+        pre_fork_latest_prices: dict,
+        outfun: Optional[Callable],
+    ) -> None:
+        """daily_position: 写 CSV + 推理 + 下单全在 parent 线程完成，不走 fork。
+
+        os.fork() 在多线程进程中会导致 XGBoost (OpenMP) 加载时静默崩溃。
+        逻辑与 fork child (行 2728-2811) 等价，但在 parent 线程执行。
+        """
+        try:
+            result_df = pd.DataFrame(results)
+            if result_df.empty:
+                return
+
+            # 1. 写因子 CSV + 上传 OSS
+            compact_df = _compact_output_copy(result_df)
+            if output_path:
+                output_path.mkdir(parents=True, exist_ok=True)
+                out_file = output_path / f"{date_str}_{label}.csv"
+                compact_df.to_csv(out_file, index=False)
+                logger.info("[daily_position] wrote %s", out_file)
+            _upload_to_oss(
+                compact_df, date_str, label,
+                category="daily" if is_daily else "minutes",
+            )
+
+            # 2. 推理
+            positions_df = None
+            try:
+                portfolio_context = None
+                if portfolio_context_fn is not None:
+                    portfolio_context = portfolio_context_fn(date_str, rt_end_time)
+                if portfolio_context is not None and pre_fork_latest_prices:
+                    portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
+                    try:
+                        from quant_platform.broker.order_context import (
+                            enrich_portfolio_context_with_latest_prices,
+                        )
+                        enrich_portfolio_context_with_latest_prices(
+                            portfolio_context, pre_fork_latest_prices)
+                    except Exception as exc_enrich:
+                        logger.warning(
+                            "[daily_position] enrich_portfolio_context failed: %s",
+                            exc_enrich)
+
+                universe_extra = {
+                    "date": date_str,
+                    "end_time": rt_end_time,
+                    "codes": _result_codes(result_df),
+                    "factor_result": result_df,
+                    "idx_cons_df": idx_cons_df,
+                }
+                if trading_universe_df is not None and not trading_universe_df.empty:
+                    tu_df = trading_universe_df
+                else:
+                    tu_df = compute_trading_universe(
+                        daily_basic_df, universe_extra)
+                idx_comp_df = compute_index_composition(
+                    daily_basic_df, universe_extra,
+                    trading_day=date_str,
+                    idx_cons_cache=self._idx_cons_cache)
+
+                positions_df = call_inference(
+                    inference_fn,
+                    date_str,
+                    rt_end_time,
+                    prev_day_factors,
+                    result_df,
+                    daily_basic_df,
+                    tu_df,
+                    idx_comp_df,
+                    portfolio_context,
+                )
+                if positions_df is not None and not positions_df.empty:
+                    if output_path:
+                        pos_file = output_path / f"{date_str}_{label}_positions.csv"
+                        _compact_output_copy(positions_df).to_csv(pos_file, index=False)
+                        logger.info("[daily_position] wrote %d positions to %s",
+                                    len(positions_df), pos_file)
+            except Exception as exc:
+                logger.error("[daily_position] inference failed: %s", exc, exc_info=True)
+
+            # 3. outfun
+            if outfun is not None:
+                try:
+                    outfun(date_str, rt_end_time, result_df)
+                except Exception as exc:
+                    logger.error("[daily_position] outfun failed: %s", exc)
+
+            # 4. 下单
+            if positions_df is None or positions_df.empty:
+                logger.info("[daily_position] no positions produced, skip order push")
+                return
+
+            if self._order_queue is not None:
+                try:
+                    self._order_queue.put_nowait(
+                        (positions_df, date_str, rt_end_time))
+                    logger.info(
+                        "[daily_position] enqueued %d rows date=%s end_time=%s",
+                        len(positions_df), date_str, rt_end_time)
+                except queue.Full:
+                    logger.error(
+                        "[daily_position] order queue full, drop %d rows",
+                        len(positions_df))
+            else:
+                _push_to_order_gateway(positions_df, date_str, rt_end_time)
+
+        except Exception as exc:
+            logger.error("[daily_position] inline write+inference failed: %s",
+                         exc, exc_info=True)
 
     def run(self) -> None:
         """Main loop."""
@@ -2966,6 +3347,9 @@ class NativeEngine:
 
         # Build computation schedules from config
         self._schedules = build_schedules_from_env(self.factor_info)
+        self._raw_archive_wait_daily_done = any(s.name == "daily" for s in self._schedules)
+        if not self._raw_archive_wait_daily_done:
+            self._post_close_daily_done.set()
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
         # open_position 推理前置：pod 启动后异步跑树模型，把 target weights

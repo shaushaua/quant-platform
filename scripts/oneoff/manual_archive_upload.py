@@ -87,6 +87,61 @@ def select_clause(kind: str) -> str:
     return ",\n                            ".join(exprs)
 
 
+def output_columns(kind: str) -> list[str]:
+    if kind == "order":
+        return [
+            "Code", "Time", "UpdateTime", "OrderID", "Side", "Price",
+            "Volume", "OrderType", "SeqNum",
+        ]
+    if kind == "deal":
+        return [
+            "Code", "Time", "UpdateTime", "SaleOrderID", "BuyOrderID",
+            "Side", "Price", "Volume", "SeqNum",
+        ]
+    if kind == "tick":
+        cols = [
+            "Code", "Time", "UpdateTime", "CurrentPrice", "TotalVolume",
+            "PreClosePrice", "OpenPrice", "HighestPrice", "LowestPrice",
+            "HighLimitPrice", "LowLimitPrice", "IOPV", "TradeNum",
+            "TotalBidVolume", "TotalAskVolume", "AvgBidPrice",
+            "AvgAskPrice",
+        ]
+        cols += [f"AskPrice{i}" for i in range(1, 11)]
+        cols += [f"AskVolume{i}" for i in range(1, 11)]
+        cols += [f"AskNum{i}" for i in range(1, 11)]
+        cols += [f"BidPrice{i}" for i in range(1, 11)]
+        cols += [f"BidVolume{i}" for i in range(1, 11)]
+        cols += [f"BidNum{i}" for i in range(1, 11)]
+        cols.append("SeqNum")
+        return cols
+    raise ValueError(f"unsupported kind: {kind}")
+
+
+def log_duplicate_stats(con, kind: str, chunk_dir: Path, map_tmp: Path, map_code_col: str) -> None:
+    raw_rows, distinct_keys, dup_rows = con.execute(f"""
+        WITH mapped AS (
+            SELECT
+                m.SECURITY_ID::INTEGER AS Code,
+                x.SeqNum::INTEGER AS SeqNum
+            FROM read_parquet('{chunk_dir}/*.parquet') x
+            JOIN read_parquet('{map_tmp}') m
+              ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+        ),
+        grouped AS (
+            SELECT Code, SeqNum, COUNT(*) AS n
+            FROM mapped
+            GROUP BY Code, SeqNum
+        )
+        SELECT
+            COALESCE(SUM(n), 0)::BIGINT AS raw_rows,
+            COUNT(*)::BIGINT AS distinct_keys,
+            COALESCE(SUM(n - 1), 0)::BIGINT AS dup_rows
+        FROM grouped
+    """).fetchone()
+    log.info("[%s] duplicate stats: raw_rows=%d distinct_keys=%d dup_rows=%d",
+             kind, int(raw_rows or 0), int(distinct_keys or 0), int(dup_rows or 0))
+
+
 def validate_archive_times(con, kind: str, chunk_dir: Path, map_tmp: Path, map_code_col: str, tmp_file: Path) -> bool:
     """Fail fast if merged parquet Time/UpdateTime drift from source chunks.
 
@@ -95,7 +150,7 @@ def validate_archive_times(con, kind: str, chunk_dir: Path, map_tmp: Path, map_c
     对源 chunk 计算期望值，并和最终 tmp parquet 比较；不一致就拒绝上传。
     """
     stats = con.execute(f"""
-        WITH src AS (
+        WITH src_raw AS (
             SELECT
                 m.SECURITY_ID::INTEGER AS Code,
                 x.SeqNum::INTEGER AS SeqNum,
@@ -105,6 +160,19 @@ def validate_archive_times(con, kind: str, chunk_dir: Path, map_tmp: Path, map_c
             JOIN read_parquet('{map_tmp}') m
               ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
         ),
+        src AS (
+            SELECT Code, SeqNum, Time, UpdateTime
+            FROM (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY Code, SeqNum
+                        ORDER BY Time, UpdateTime
+                    ) AS _rn
+                FROM src_raw
+            )
+            WHERE _rn = 1
+        ),
         dst AS (
             SELECT Code, SeqNum, Time, UpdateTime
             FROM read_parquet('{tmp_file}')
@@ -112,15 +180,20 @@ def validate_archive_times(con, kind: str, chunk_dir: Path, map_tmp: Path, map_c
         SELECT
             COUNT(*) AS rows_checked,
             SUM(CASE WHEN dst.Time != src.Time THEN 1 ELSE 0 END) AS time_bad,
-            SUM(CASE WHEN dst.UpdateTime != src.UpdateTime THEN 1 ELSE 0 END) AS update_bad
+            SUM(CASE WHEN dst.UpdateTime != src.UpdateTime THEN 1 ELSE 0 END) AS update_bad,
+            (SELECT COUNT(*) FROM dst) AS dst_rows,
+            (SELECT COUNT(*) FROM src) AS src_rows
         FROM dst
         JOIN src USING (Code, SeqNum)
     """).fetchone()
-    rows_checked, time_bad, update_bad = (int(stats[0] or 0), int(stats[1] or 0), int(stats[2] or 0))
-    if rows_checked == 0 or time_bad or update_bad:
+    rows_checked, time_bad, update_bad, dst_rows, src_rows = (
+        int(stats[0] or 0), int(stats[1] or 0), int(stats[2] or 0),
+        int(stats[3] or 0), int(stats[4] or 0),
+    )
+    if rows_checked == 0 or rows_checked != dst_rows or rows_checked != src_rows or time_bad or update_bad:
         log.error(
-            "[%s] archive time validation failed: rows=%d time_bad=%d update_bad=%d",
-            kind, rows_checked, time_bad, update_bad,
+            "[%s] archive time validation failed: checked=%d dst_rows=%d src_rows=%d time_bad=%d update_bad=%d",
+            kind, rows_checked, dst_rows, src_rows, time_bad, update_bad,
         )
         return False
     log.info("[%s] archive time validation ok: rows=%d", kind, rows_checked)
@@ -232,14 +305,33 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
         con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '32GB')}'")
         log.info("[%s] merging %d chunks (%.2f GB)...", kind, len(chunks),
                  sum(c.stat().st_size for c in chunks) / 1024**3)
+        log_duplicate_stats(con, kind, chunk_dir, map_tmp, map_code_col)
+        out_cols = ", ".join(output_columns(kind))
         con.execute(f"""
             COPY (
-                SELECT
-                    {select_clause(kind)}
-                FROM read_parquet('{chunk_dir}/*.parquet') x
-                JOIN read_parquet('{map_tmp}') m
-                  ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
-                ORDER BY m.SECURITY_ID, x.SeqNum
+                WITH merged AS (
+                    SELECT
+                        {select_clause(kind)}
+                    FROM read_parquet('{chunk_dir}/*.parquet') x
+                    JOIN read_parquet('{map_tmp}') m
+                      ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                ),
+                ranked AS (
+                    SELECT
+                        *,
+                        -- Manual uploads may be used after a pod restart or a
+                        -- failed automatic upload.  De-dup by exchange sequence
+                        -- key so repeated chunks do not contaminate OSS.
+                        ROW_NUMBER() OVER (
+                            PARTITION BY Code, SeqNum
+                            ORDER BY Time, UpdateTime
+                        ) AS _rn
+                    FROM merged
+                )
+                SELECT {out_cols}
+                FROM ranked
+                WHERE _rn = 1
+                ORDER BY Code, SeqNum
             ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
         """)
         if not validate_archive_times(con, kind, chunk_dir, map_tmp, map_code_col, tmp_file):

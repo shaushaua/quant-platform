@@ -43,6 +43,8 @@ public:
 
     bool append(const double* row);  // returns false if dropped
     std::uint64_t row_count() const { return row_count_; }
+    std::uint64_t capacity() const { return capacity_; }
+    bool full() const { return row_count_ >= capacity_; }
     std::uint64_t dropped()   const { return dropped_.load(std::memory_order_relaxed); }
 
 private:
@@ -75,8 +77,19 @@ public:
     std::uint64_t total_dropped() const { return total_dropped_.load(std::memory_order_relaxed); }
 
 private:
+    struct BufferSlot {
+        std::unique_ptr<StockMmap> mmap;
+        std::size_t part{0};
+    };
+
     StockMmap& get_buffer(DataKind kind, const std::string& code, std::size_t n_cols);
-    std::string path_for(DataKind kind, const std::string& code) const;
+    bool append_with_overflow(DataKind kind, const std::string& code,
+                              const std::vector<double>& row, std::size_t n_cols);
+    BufferSlot create_buffer_slot(DataKind kind, const std::string& code,
+                                  std::size_t n_cols, std::size_t part) const;
+    std::size_t latest_existing_part(DataKind kind, const std::string& code) const;
+    std::string path_for(DataKind kind, const std::string& code, std::size_t part = 0) const;
+    static const char* kind_name(DataKind kind);
 
     std::string root_;
     std::size_t tick_capacity_;
@@ -84,7 +97,7 @@ private:
     std::size_t deal_capacity_;
     std::uint64_t trading_day_;
     std::mutex mutex_;
-    std::unordered_map<std::string, std::unique_ptr<StockMmap>> buffers_;
+    std::unordered_map<std::string, BufferSlot> buffers_;
     std::atomic<std::uint64_t> total_dropped_{0};
 };
 
