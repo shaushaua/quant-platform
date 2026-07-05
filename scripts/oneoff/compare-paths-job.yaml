@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: compare-paths-0703-smoke
+  namespace: quant-dev
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      hostNetwork: true
+      dnsPolicy: Default
+      nodeSelector:
+        quant.lianghua.io/dev: "true"
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: dev
+          effect: NoSchedule
+      containers:
+        - name: compare
+          image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+          command: ["python", "/scripts/compare_paths.py"]
+          args:
+            - "--date=20260703"
+            - "--codes=000001.SZ,000002.SZ,600000.SH,600519.SH,300750.SZ"
+            - "--workers=4"
+            - "--batch-size=64"
+          envFrom:
+            - secretRef: { name: quant-secrets }
+          env:
+            - { name: OSS_ENDPOINT, value: "https://oss-cn-hangzhou-internal.aliyuncs.com" }
+            - { name: OSS_DATA_BUCKET, value: "quant-mdl-data" }
+            - { name: OSS_RESULT_BUCKET, value: "stock-mdl-data-result" }
+            - { name: FACTOR_FORCE_STREAMING, value: "1" }
+            - { name: PYTHONPATH, value: "/app" }
+          volumeMounts:
+            - { name: script, mountPath: /scripts, readOnly: true }
+            - { name: out, mountPath: /tmp }
+      volumes:
+        - name: script
+          configMap: { name: compare-paths-script }
+        - name: out
+          emptyDir: { sizeLimit: 5Gi }
