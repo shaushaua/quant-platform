@@ -25,7 +25,6 @@ import json
 import logging
 import multiprocessing
 import os
-import pickle
 import queue
 import resource
 import signal
@@ -233,6 +232,17 @@ _kind_names = {
 }
 
 
+def _round_price_to_cent_values(values: np.ndarray) -> np.ndarray:
+    """Round positive market prices to historical int-cent semantics.
+
+    The historical Go converter stores price columns as integer cents using
+    decimal-string half-up rounding.  Live SHM has float64 values, so use a
+    positive-price half-up expression instead of np.rint (bankers rounding) to
+    avoid 3rd-decimal boundary divergence.
+    """
+    return np.floor(values * 100.0 + 0.5) / 100.0
+
+
 def _code_to_id_qi(code: str) -> str:
     """保留：_add_code_key 使用。"""
     return str(code).split(".")[0].zfill(6)
@@ -309,7 +319,7 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
                 _valid = np.isfinite(_v)
                 if _valid.any():
                     _out = _v.copy()
-                    _out[_valid] = np.rint(_out[_valid] * 100.0) / 100.0
+                    _out[_valid] = _round_price_to_cent_values(_out[_valid])
                     df[_col] = _out
 
     # Volume ×100 对齐回测（见函数 docstring 和模块级 _tick_volume_idx 注释）
@@ -941,7 +951,6 @@ class NativeEngine:
                 "(searched months=%s, dates_seen=%s)", ym_candidates, tried_dates[:10])
         except Exception as exc:
             logger.warning("[native] OSS prev day load failed: %s", exc)
-        return None
         return None
 
     def _load_idx_cons(self) -> None:
@@ -1963,14 +1972,22 @@ class NativeEngine:
         logger.info("[mdl-backup] done %d/%d, %d failed", done, len(csvs), len(failed))
 
     def _archive_select_clause(self, kind: str) -> str:
+        # Time/UpdateTime 编码对齐 Go converter（deeptrade opt_parquet_writer）：
+        #   - Time = CST 转 UTC 的 Unix 微秒（epoch_us - 8h）
+        #     Go 用 time.Local(CST) 构造后 UnixMicro()，本质就是 CST→UTC。
+        #     DuckDB epoch_us 把 CST 时间字符串当 UTC，要减 28800 秒（8h）。
+        #   - UpdateTime 保持 epoch_us（完整时间戳），暂不改成 Go 的偏移量格式，
+        #     因为偏移量格式影响下游读取，且因子计算不依赖 UpdateTime。
+        # 28800000000 = 28800 秒 × 1e6 微秒
+        _TIME_UTC = "(epoch_us(x.Time) - 28800000000)"
         if kind == "order":
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
-                "epoch_us(x.Time) AS Time",
+                f"{_TIME_UTC} AS Time",
                 "epoch_us(x.UpdateTime) AS UpdateTime",
                 "x.OrderID::INTEGER AS OrderID",
                 "x.Side::TINYINT AS Side",
-                "ROUND(x.Price * 100)::INTEGER AS Price",
+                "FLOOR(x.Price * 100 + 0.5)::INTEGER AS Price",
                 "x.Volume::BIGINT AS Volume",
                 "x.OrderType::TINYINT AS OrderType",
                 "x.SeqNum::INTEGER AS SeqNum",
@@ -1978,12 +1995,12 @@ class NativeEngine:
         elif kind == "deal":
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
-                "epoch_us(x.Time) AS Time",
+                f"{_TIME_UTC} AS Time",
                 "epoch_us(x.UpdateTime) AS UpdateTime",
                 "x.SaleOrderID::BIGINT AS SaleOrderID",
                 "x.BuyOrderID::BIGINT AS BuyOrderID",
                 "x.Side::TINYINT AS Side",
-                "ROUND(x.Price * 100)::INTEGER AS Price",
+                "FLOOR(x.Price * 100 + 0.5)::INTEGER AS Price",
                 "x.Volume::BIGINT AS Volume",
                 "x.SeqNum::INTEGER AS SeqNum",
             ]
@@ -1993,10 +2010,10 @@ class NativeEngine:
             # ×100 cast INT32 时溢出(10^11 > 2.1*10^9),导致整个 tick upload 失败。
             # LEAST(... , 2147483647) 把 sentinel clip 到 INT32_MAX,牺牲"无限制"语义
             # 但不丢这一行其他有效字段。
-            _clip = "LEAST(ROUND(x.{c} * 100), 2147483647)::INTEGER AS {c}"
+            _clip = "LEAST(FLOOR(x.{c} * 100 + 0.5), 2147483647)::INTEGER AS {c}"
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
-                "epoch_us(x.Time) AS Time",
+                f"{_TIME_UTC} AS Time",
                 "epoch_us(x.UpdateTime) AS UpdateTime",
                 _clip.format(c="CurrentPrice"),
                 "x.TotalVolume::BIGINT AS TotalVolume",
@@ -2103,7 +2120,7 @@ class NativeEngine:
                 SELECT
                     m.SECURITY_ID::INTEGER AS Code,
                     x.SeqNum::INTEGER AS SeqNum,
-                    epoch_us(x.Time) AS Time,
+                    (epoch_us(x.Time) - 28800000000) AS Time,
                     epoch_us(x.UpdateTime) AS UpdateTime
                 FROM read_parquet('{chunk_dir}/*.parquet') x
                 JOIN read_parquet('{map_tmp_path}') m
@@ -2570,6 +2587,12 @@ class NativeEngine:
                     logger.warning("[daily_basic_refresh] DatayesClient init failed: %s", exc)
             try:
                 ok = refresh_daily_data(td, oss, mysql, datayes, force=False)
+                try:
+                    from quant_platform.inference.tree_model_inference import clear_daily_basic_cache
+                    clear_daily_basic_cache()
+                    logger.info("[daily_basic_refresh] tree_model daily_basic cache cleared")
+                except Exception:
+                    pass
                 logger.info("[daily_basic_refresh] trading_day=%s ok=%s elapsed=%.1fs",
                             td, ok, time.time() - t0)
             finally:
@@ -2847,37 +2870,6 @@ class NativeEngine:
         # 因子有效率自检
         self._check_factor_valid_rate(results)
 
-    def _handle_output_child(self, pid: int, read_fd: int, date_str: str, end_time: str) -> None:
-        """Read inference output from the output child and enqueue order work in parent."""
-        positions_df = None
-        try:
-            with os.fdopen(read_fd, "rb") as pipe:
-                try:
-                    positions_df = pickle.load(pipe)
-                except EOFError:
-                    positions_df = None
-        except Exception as exc:
-            logger.error("[output-child] failed to read order payload from pid=%d: %s", pid, exc)
-        finally:
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
-
-        if positions_df is None or positions_df.empty:
-            return
-
-        if self._order_queue is not None:
-            try:
-                self._order_queue.put_nowait((positions_df, date_str, end_time))
-                logger.info("[order-gateway] enqueued %d rows date=%s end_time=%s",
-                            len(positions_df), date_str, end_time)
-            except queue.Full:
-                logger.error("[order-gateway] queue full, drop %d rows date=%s end_time=%s",
-                             len(positions_df), date_str, end_time)
-        else:
-            _push_to_order_gateway(positions_df, date_str, end_time)
-
     def _check_factor_valid_rate(self, results: list) -> None:
         """因子有效率自检：有效率骤降时告警。"""
         if not results:
@@ -2960,260 +2952,225 @@ class NativeEngine:
                 logger.warning("[open_position] latest_prices still empty after "
                                "60s wait; positions_to_orders may drop all rows")
 
-        # ── daily_position: inline 推理（不走 fork） ──────────────────
-        # os.fork() 在多线程进程（collector/tick-sync/order-gateway/archive
-        # 线程）中，子进程继承损坏的锁状态 → XGBoost (OpenMP) 加载静默崩溃。
-        # precompute 线程已证明树模型推理在 thread 中正常工作，daily_position
-        # 复用同一模式。
-        if schedule is not None and schedule.name == "daily_position":
-            self._write_daily_position_inline(
-                results, date_str, label, rt_end_time,
-                is_daily, output_path, inference_fn, portfolio_context_fn,
-                daily_basic_df, prev_day_factors, idx_cons_df,
-                trading_universe_df, pre_fork_latest_prices, outfun,
+        # ── inline 推理（所有 schedule 统一走线程） ───────────────────
+        # 历史曾用 os.fork() 隔离推理/输出，但在多线程进程中 fork 会让
+        # XGBoost (OpenMP) 加载时静默崩溃（child os._exit(0) 正常退出，
+        # 但 positions_df 是 None → 订单没推 → 实盘上极难发现的 silent
+        # failure）。daily_position 已先行验证 inline 可行，现统一所有
+        # schedule 走 inline，彻底删除 fork 路径。
+        # 注：因子计算的 multiprocessing.Pool（40 workers）不受影响，那才是
+        # 真正吃 CPU 的部分；此处只动"因子算完后的输出+推理+下单"。
+        try:
+            positions_df = self._write_factor_output_and_infer(
+                results=results,
+                date_str=date_str,
+                label=label,
+                rt_end_time=rt_end_time,
+                is_daily=is_daily,
+                run_inference=run_inference,
+                output_path=output_path,
+                outfun=outfun,
+                inference_fn=inference_fn,
+                portfolio_context_fn=portfolio_context_fn,
+                daily_basic_df=daily_basic_df,
+                # call_inference 第 4 参（模型 daily_feature_czhou1 输入）。
+                # 原版两份代码（fork child 和 inline）都传 prev_day_factors，
+                # 此处保持一致。
+                inference_factor_input=prev_day_factors,
+                idx_cons_df=idx_cons_df,
+                trading_universe_df=trading_universe_df,
+                pre_fork_latest_prices=pre_fork_latest_prices,
+                gc_before_inference=False,
+                log_tag=schedule.name if schedule is not None else "minute",
             )
+        except Exception as exc:
+            logger.error("[%s] inline write+inference failed: %s",
+                         schedule.name if schedule else "minute", exc, exc_info=True)
             return
 
-        try:
-            read_fd, write_fd = os.pipe()
-            pid = os.fork()
-            if pid == 0:
-                os.close(read_fd)
-                try:
-                    order_payload = None
-                    result_df = pd.DataFrame(results)
-                    if not result_df.empty:
-                        compact_df = _compact_output_copy(result_df)
-                        if output_path:
-                            output_path.mkdir(parents=True, exist_ok=True)
-                            out_file = output_path / f"{date_str}_{label}.csv"
-                            compact_df.to_csv(out_file, index=False)
-                            logger.info("[combined] wrote %s", out_file)
-                        _upload_to_oss(
-                            compact_df, date_str, label,
-                            category="daily" if is_daily else "minutes",
-                        )
-                    if run_inference and inference_fn is not None and not result_df.empty:
-                        try:
-                            portfolio_context = None
-                            if portfolio_context_fn is not None:
-                                portfolio_context = portfolio_context_fn(date_str, rt_end_time)
-                            # Augment with engine realtime tick prices (latest_price
-                            # from shm sync). Used by open_position at 9:30 to size
-                            # orders off live tick instead of daily_basic.close).
-                            # Snapshot is taken in the parent before fork (see
-                            # pre_fork_latest_prices) so we don't race against the
-                            # parent's tick thread from inside the child.
-                            if portfolio_context is not None and pre_fork_latest_prices:
-                                portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
-                                # Intraday ATX DBF lacks market_value/last_price
-                                # (only populated after EOD settlement). Backfill
-                                # from SHM latest_prices so inference paths that
-                                # need current weights (e.g. daily_position at
-                                # 14:50) don't crash or produce NaN weights.
-                                try:
-                                    from quant_platform.broker.order_context import (
-                                        enrich_portfolio_context_with_latest_prices,
-                                    )
-                                    enrich_portfolio_context_with_latest_prices(
-                                        portfolio_context, pre_fork_latest_prices)
-                                except Exception as exc_enrich:
-                                    logger.warning(
-                                        "[native] enrich_portfolio_context failed: %s",
-                                        exc_enrich)
-                            universe_extra = {
-                                "date": date_str,
-                                "end_time": rt_end_time,
-                                "codes": _result_codes(result_df),
-                                "factor_result": result_df,
-                                "idx_cons_df": idx_cons_df,
-                            }
-                            # Use pre-computed trading_universe from startup if available
-                            if trading_universe_df is not None and not trading_universe_df.empty:
-                                tu_df = trading_universe_df
-                            else:
-                                tu_df = compute_trading_universe(
-                                    daily_basic_df, universe_extra)
-                            idx_comp_df = compute_index_composition(
-                                daily_basic_df, universe_extra,
-                                trading_day=date_str,
-                                idx_cons_cache=self._idx_cons_cache)
-                            positions_df = call_inference(
-                                inference_fn,
-                                date_str,
-                                rt_end_time,
-                                prev_day_factors,
-                                result_df,
-                                daily_basic_df,
-                                tu_df,
-                                idx_comp_df,
-                                portfolio_context,
-                            )
-                            if positions_df is not None and not positions_df.empty:
-                                if output_path:
-                                    pos_file = output_path / f"{date_str}_{label}_positions.csv"
-                                    _compact_output_copy(positions_df).to_csv(pos_file, index=False)
-                                    logger.info("[inference] wrote %d positions to %s",
-                                                len(positions_df), pos_file)
-                                order_payload = positions_df
-                        except Exception as exc:
-                            logger.error("[inference] failed: %s", exc, exc_info=True)
-                    if outfun is not None:
-                        try:
-                            outfun(date_str, rt_end_time, result_df)
-                        except Exception as exc:
-                            logger.error("[combined] outfun failed: %s", exc)
-                    with os.fdopen(write_fd, "wb") as pipe:
-                        pickle.dump(order_payload, pipe, protocol=pickle.HIGHEST_PROTOCOL)
-                except Exception as exc:
-                    logger.error("[output-child] failed: %s", exc, exc_info=True)
-                    try:
-                        with os.fdopen(write_fd, "wb") as pipe:
-                            pickle.dump(None, pipe, protocol=pickle.HIGHEST_PROTOCOL)
-                    except OSError:
-                        pass
-                finally:
-                    os._exit(0)
-            os.close(write_fd)
-            threading.Thread(
-                target=self._handle_output_child,
-                args=(pid, read_fd, date_str, rt_end_time),
-                name=f"output-child-{pid}",
-                daemon=True,
-            ).start()
-            logger.info("[combined] output forked to child pid=%d", pid)
-        except OSError:
-            for fd in ("read_fd", "write_fd"):
-                try:
-                    os.close(locals()[fd])
-                except Exception:
-                    pass
-            pass
+        # 下单：positions_df 为空就跳过（推理关闭/无信号都会走到这里）
+        if positions_df is None or positions_df.empty:
+            return
 
-    def _write_daily_position_inline(
+        if self._order_queue is not None:
+            try:
+                self._order_queue.put_nowait(
+                    (positions_df, date_str, rt_end_time))
+                logger.info("[%s] enqueued %d rows date=%s end_time=%s",
+                            schedule.name if schedule else "minute",
+                            len(positions_df), date_str, rt_end_time)
+            except queue.Full:
+                logger.error("[%s] order queue full, drop %d rows",
+                             schedule.name if schedule else "minute",
+                             len(positions_df))
+        else:
+            _push_to_order_gateway(positions_df, date_str, rt_end_time)
+
+    def _write_factor_output_and_infer(
         self,
+        *,
         results: list,
         date_str: str,
         label: str,
         rt_end_time: str,
         is_daily: bool,
+        run_inference: bool,
         output_path: Optional[Path],
+        outfun: Optional[Callable],
         inference_fn: Optional[Callable],
         portfolio_context_fn: Optional[Callable],
         daily_basic_df,
-        prev_day_factors,
+        inference_factor_input: Optional[pd.DataFrame],
         idx_cons_df,
         trading_universe_df,
         pre_fork_latest_prices: dict,
-        outfun: Optional[Callable],
-    ) -> None:
-        """daily_position: 写 CSV + 推理 + 下单全在 parent 线程完成，不走 fork。
+        gc_before_inference: bool,
+        log_tag: str,
+    ) -> Optional[pd.DataFrame]:
+        """Shared factor-output + inference pipeline called inline (in a
+        thread) by _write_results for every schedule.
 
-        os.fork() 在多线程进程中会导致 XGBoost (OpenMP) 加载时静默崩溃。
-        逻辑与 fork child (行 2728-2811) 等价，但在 parent 线程执行。
+        History: this previously existed as two near-identical copies — a
+        forked child for minute/daily, and an inline version for
+        daily_position. The fork version silently dropped orders when
+        XGBoost/OpenMP crashed on load inside the forked child (child exited
+        cleanly but positions_df was None). Both are now unified here as
+        inline. The factor-computation Pool (40 workers) is unrelated and
+        untouched.
+
+        Both original copies passed prev_day_factors as the call_inference
+        4th argument (model daily_feature_czhou1 input); this is preserved
+        via inference_factor_input=prev_day_factors.
+
+        Note: an older comment claimed daily_position "uses same-day factors"
+        — that described intended behavior but the original code actually
+        passed prev_day_factors. That discrepancy is preserved here (not
+        "fixed" in a refactor); resolve it separately if needed.
+
+        Steps:
+          1. write factor CSV + upload OSS
+          2. (optional) gc.collect before inference to cut peak memory
+          3. build portfolio_context, enrich with realtime prices
+          4. compute trading universe + index composition
+          5. call inference, write positions CSV
+          6. call outfun
+
+        Returns the positions DataFrame (for order dispatch) or None.
+        Caller is responsible for order push/enqueue — this method does NOT
+        push orders, so it works identically inside a fork child (which must
+        hand the payload back via pipe) and in an inline thread.
         """
-        try:
-            result_df = pd.DataFrame(results)
-            if result_df.empty:
-                return
+        result_df = pd.DataFrame(results)
+        if result_df.empty:
+            return None
 
-            # 1. 写因子 CSV + 上传 OSS
-            compact_df = _compact_output_copy(result_df)
-            if output_path:
-                output_path.mkdir(parents=True, exist_ok=True)
-                out_file = output_path / f"{date_str}_{label}.csv"
-                compact_df.to_csv(out_file, index=False)
-                logger.info("[daily_position] wrote %s", out_file)
-            _upload_to_oss(
-                compact_df, date_str, label,
-                category="daily" if is_daily else "minutes",
-            )
+        # 1. 写因子 CSV + 上传 OSS
+        compact_df = _compact_output_copy(result_df)
+        if output_path:
+            output_path.mkdir(parents=True, exist_ok=True)
+            out_file = output_path / f"{date_str}_{label}.csv"
+            compact_df.to_csv(out_file, index=False)
+            logger.info("[%s] wrote %s", log_tag, out_file)
+        _upload_to_oss(
+            compact_df, date_str, label,
+            category="daily" if is_daily else "minutes",
+        )
 
-            # 2. 推理
-            positions_df = None
-            try:
-                portfolio_context = None
-                if portfolio_context_fn is not None:
-                    portfolio_context = portfolio_context_fn(date_str, rt_end_time)
-                if portfolio_context is not None and pre_fork_latest_prices:
-                    portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
-                    try:
-                        from quant_platform.broker.order_context import (
-                            enrich_portfolio_context_with_latest_prices,
-                        )
-                        enrich_portfolio_context_with_latest_prices(
-                            portfolio_context, pre_fork_latest_prices)
-                    except Exception as exc_enrich:
-                        logger.warning(
-                            "[daily_position] enrich_portfolio_context failed: %s",
-                            exc_enrich)
-
-                universe_extra = {
-                    "date": date_str,
-                    "end_time": rt_end_time,
-                    "codes": _result_codes(result_df),
-                    "factor_result": result_df,
-                    "idx_cons_df": idx_cons_df,
-                }
-                if trading_universe_df is not None and not trading_universe_df.empty:
-                    tu_df = trading_universe_df
-                else:
-                    tu_df = compute_trading_universe(
-                        daily_basic_df, universe_extra)
-                idx_comp_df = compute_index_composition(
-                    daily_basic_df, universe_extra,
-                    trading_day=date_str,
-                    idx_cons_cache=self._idx_cons_cache)
-
-                positions_df = call_inference(
-                    inference_fn,
-                    date_str,
-                    rt_end_time,
-                    prev_day_factors,
-                    result_df,
-                    daily_basic_df,
-                    tu_df,
-                    idx_comp_df,
-                    portfolio_context,
-                )
-                if positions_df is not None and not positions_df.empty:
-                    if output_path:
-                        pos_file = output_path / f"{date_str}_{label}_positions.csv"
-                        _compact_output_copy(positions_df).to_csv(pos_file, index=False)
-                        logger.info("[daily_position] wrote %d positions to %s",
-                                    len(positions_df), pos_file)
-            except Exception as exc:
-                logger.error("[daily_position] inference failed: %s", exc, exc_info=True)
-
-            # 3. outfun
+        # 2. 推理
+        if not (run_inference and inference_fn is not None):
+            # 3. outfun (still called when inference is skipped)
             if outfun is not None:
                 try:
                     outfun(date_str, rt_end_time, result_df)
                 except Exception as exc:
-                    logger.error("[daily_position] outfun failed: %s", exc)
+                    logger.error("[%s] outfun failed: %s", log_tag, exc)
+            return None
 
-            # 4. 下单
-            if positions_df is None or positions_df.empty:
-                logger.info("[daily_position] no positions produced, skip order push")
-                return
+        # 释放因子计算阶段的临时内存（result_df 副本、compact_df 等），
+        # 降低 XGBoost 加载时的峰值内存，避免 OOMKilled。
+        # fork child 不做：fork 已隔离内存，且 child 不再 return 给父进程
+        # 大对象，gc 反而增加 child 启动延迟。
+        if gc_before_inference:
+            gc.collect()
 
-            if self._order_queue is not None:
+        positions_df = None
+        try:
+            portfolio_context = None
+            if portfolio_context_fn is not None:
+                portfolio_context = portfolio_context_fn(date_str, rt_end_time)
+            # Augment with engine realtime tick prices (latest_price from shm
+            # sync). Used by open_position at 9:30 to size orders off live tick
+            # instead of daily_basic.close). Snapshot is taken in the parent
+            # before fork so we don't race against the parent's tick thread from
+            # inside the child.
+            if portfolio_context is not None and pre_fork_latest_prices:
+                portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
+                # Intraday ATX DBF lacks market_value/last_price (only populated
+                # after EOD settlement). Backfill from SHM latest_prices so
+                # inference paths that need current weights don't crash or
+                # produce NaN weights.
                 try:
-                    self._order_queue.put_nowait(
-                        (positions_df, date_str, rt_end_time))
-                    logger.info(
-                        "[daily_position] enqueued %d rows date=%s end_time=%s",
-                        len(positions_df), date_str, rt_end_time)
-                except queue.Full:
-                    logger.error(
-                        "[daily_position] order queue full, drop %d rows",
-                        len(positions_df))
-            else:
-                _push_to_order_gateway(positions_df, date_str, rt_end_time)
+                    from quant_platform.broker.order_context import (
+                        enrich_portfolio_context_with_latest_prices,
+                    )
+                    enrich_portfolio_context_with_latest_prices(
+                        portfolio_context, pre_fork_latest_prices)
+                except Exception as exc_enrich:
+                    logger.warning(
+                        "[%s] enrich_portfolio_context failed: %s",
+                        log_tag, exc_enrich)
 
+            universe_extra = {
+                "date": date_str,
+                "end_time": rt_end_time,
+                "codes": _result_codes(result_df),
+                "factor_result": result_df,
+                "idx_cons_df": idx_cons_df,
+            }
+            # Use pre-computed trading_universe from startup if available
+            if trading_universe_df is not None and not trading_universe_df.empty:
+                tu_df = trading_universe_df
+            else:
+                tu_df = compute_trading_universe(daily_basic_df, universe_extra)
+            idx_comp_df = compute_index_composition(
+                daily_basic_df, universe_extra,
+                trading_day=date_str,
+                idx_cons_cache=self._idx_cons_cache)
+
+            # Resolve the model's daily_feature_czhou1 input (call_inference
+            # param 4). None means "use the just-computed same-day result_df"
+            # (reserved for future use if daily_position is confirmed to need
+            # same-day features); both current callers pass prev_day_factors.
+            model_factor_input = result_df if inference_factor_input is None else inference_factor_input
+            positions_df = call_inference(
+                inference_fn,
+                date_str,
+                rt_end_time,
+                model_factor_input,
+                result_df,
+                daily_basic_df,
+                tu_df,
+                idx_comp_df,
+                portfolio_context,
+            )
+            if positions_df is not None and not positions_df.empty:
+                if output_path:
+                    pos_file = output_path / f"{date_str}_{label}_positions.csv"
+                    _compact_output_copy(positions_df).to_csv(pos_file, index=False)
+                    logger.info("[%s] wrote %d positions to %s",
+                                log_tag, len(positions_df), pos_file)
         except Exception as exc:
-            logger.error("[daily_position] inline write+inference failed: %s",
-                         exc, exc_info=True)
+            logger.error("[%s] inference failed: %s", log_tag, exc, exc_info=True)
+            positions_df = None
+
+        # 3. outfun
+        if outfun is not None:
+            try:
+                outfun(date_str, rt_end_time, result_df)
+            except Exception as exc:
+                logger.error("[%s] outfun failed: %s", log_tag, exc)
+
+        return positions_df
 
     def run(self) -> None:
         """Main loop."""

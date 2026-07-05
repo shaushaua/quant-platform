@@ -101,6 +101,7 @@ POSITION_OUTPUT: Optional[Path] = None
 
 _OSS_BUCKETS: dict[str, oss2.Bucket] = {}
 _DAILY_FEATURE_CACHE: dict[str, pd.DataFrame] = {}
+_DAILY_BASIC_MEM_CACHE: dict[str, pd.DataFrame] = {}
 
 
 def normalize_date(value) -> Optional[str]:
@@ -465,6 +466,11 @@ def load_daily_feature_czhou1_from_oss(start_date: str, end_date: str) -> pd.Dat
 
 def load_production_daily_basic(date_str: str, current_daily_basic: Optional[pd.DataFrame]) -> pd.DataFrame:
     date_str = normalize_date(date_str)
+
+    cached = _DAILY_BASIC_MEM_CACHE.get(date_str)
+    if cached is not None:
+        return cached
+
     if current_daily_basic is not None and not current_daily_basic.empty:
         current = normalize_daily_basic(current_daily_basic, date_str=date_str)
         current = current.loc[current["trade_date"].astype(str) <= date_str].copy()
@@ -478,7 +484,15 @@ def load_production_daily_basic(date_str: str, current_daily_basic: Optional[pd.
 
     start = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=DAILY_BASIC_LOOKBACK_DAYS)).strftime("%Y%m%d")
     history = normalize_daily_basic(load_daily_basic_from_oss(start, date_str))
-    return append_current_daily_basic(history, current_daily_basic, date_str)
+    result = append_current_daily_basic(history, current_daily_basic, date_str)
+    _DAILY_BASIC_MEM_CACHE[date_str] = result
+    print(f"[tree-infer] daily_basic cached for {date_str}: {len(result)} rows, "
+          f"{len(result.columns)} cols")
+    return result
+
+
+def clear_daily_basic_cache() -> None:
+    _DAILY_BASIC_MEM_CACHE.clear()
 
 
 def write_table(df: pd.DataFrame, path: Path) -> None:
