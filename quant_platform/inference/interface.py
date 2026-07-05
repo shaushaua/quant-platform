@@ -344,7 +344,7 @@ def positions_to_orders(
         total_capital_override: Force a specific capital amount.
 
     Returns:
-        DataFrame with columns [code, side, volume, price_type, strategy, note]
+        DataFrame with columns [code, side, volume, price_type, price, strategy, note]
         consumed by `_build_order_gateway_orders` in native_engine.py.
     """
     import math
@@ -507,6 +507,7 @@ def positions_to_orders(
     # Build {code6: current_weight}. current_weight uses the same price
     # source (meta latest_prices preferred, broker last_price fallback)
     # so the comparison is consistent with the order price.
+    vol_col = None
     if use_delta and has_positions:
         pos = positions_df_pos
         vol_col = next(
@@ -542,7 +543,7 @@ def positions_to_orders(
                         for k, v in meta_prices.items()
                     }
                     tick_price = pos_c6.map(price_map_6).fillna(0.0)
-                    pos_price = pos_price.where(pos_price > 0, tick_price)
+                    pos_price = tick_price.where(tick_price > 0, pos_price)
             held_value = (pos_vol * pos_price).where(pos_price > 0, 0.0)
             current_weight = (
                 pd.Series(held_value.values, index=pos_c6) / total_capital
@@ -583,16 +584,25 @@ def positions_to_orders(
     kcb_sell_mask = is_kcb & ~is_buy
     df.loc[kcb_sell_mask, "volume"] = df.loc[kcb_sell_mask, "_raw_vol"].astype(int)
 
-    # Cap sell volume at held volume (delta_mode only). A-share T+1 + no
-    # shorting means a sell exceeding holdings is invalid; clamp to held
-    # qty (rounded down to 100) and drop the row if it rounds to 0.
-    if use_delta and has_positions:
-        held_shares = (
-            df["_current_weight"] * total_capital / df["_price"]
-        ).fillna(0.0)
-        held_lot = (held_shares // 100).astype(int) * 100
+    # Cap sell volume at available volume (delta_mode only). A-share T+1 + no
+    # shorting means a sell exceeding available holdings is invalid; clamp to
+    # available qty (rounded down to 100) and drop the row if it rounds to 0.
+    if use_delta and has_positions and vol_col is not None:
+        pos = positions_df_pos
+        avail_col = next(
+            (c for c in (
+                "available_volume", "available_qty", "available", "sellable_qty",
+                "sellable_volume", vol_col,
+            ) if c in pos.columns),
+            vol_col,
+        )
+        pos_c6 = pos["code"].astype(str).map(_norm_code6)
+        avail_qty = pd.to_numeric(pos[avail_col], errors="coerce").fillna(0.0)
+        available_by_code = pd.Series(avail_qty.values, index=pos_c6).groupby(level=0).sum()
+        available_shares = df["_code6"].map(available_by_code).fillna(0.0)
+        held_lot = (available_shares // 100).astype(int) * 100
         # 科创板持仓可卖零股
-        held_lot = held_lot.where(~is_kcb, held_shares.astype(int))
+        held_lot = held_lot.where(~is_kcb, available_shares.astype(int))
         sell_mask = df["_delta_weight"] < 0
         df.loc[sell_mask, "volume"] = df.loc[sell_mask, "volume"].clip(
             upper=held_lot.loc[sell_mask]
@@ -613,8 +623,8 @@ def positions_to_orders(
         "side": df["side"],
         "volume": df["volume"].astype(int),
         "price_type": price_type,
+        "price": df["_price"].astype(float),
         "strategy": strategy,
         "note": note,
     })
     return out.reset_index(drop=True)
-

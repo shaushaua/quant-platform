@@ -167,7 +167,8 @@ def targets_to_orders(
             ``meta['latest_prices']`` populated by the engine caller.
 
     Returns:
-        DataFrame with columns ``[code, side, volume, price_type, strategy, note]``.
+        DataFrame with columns
+        ``[code, side, volume, price_type, price, strategy, note]``.
     """
     if positions is None or positions.empty:
         return pd.DataFrame()

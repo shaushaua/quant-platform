@@ -27,13 +27,16 @@ import multiprocessing
 import os
 import queue
 import resource
+import shutil
 import signal
+import struct
+import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
 import urllib.request
-import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -47,7 +50,7 @@ from ..core.constants import (
 )
 from ..data.native_shm_reader import (
     NativeShmReader, scan_shm_dir, get_codes, open_all_readers,
-    KIND_TICK, KIND_ORDER, KIND_DEAL, COLS_BY_KIND, SHM_HEADER_SIZE,
+    KIND_TICK, KIND_ORDER, KIND_DEAL, COLS_BY_KIND, SHM_HEADER_SIZE, SHM_MAGIC, SHM_VERSION,
 )
 from ..data.mysql_loader import DailyBasicCache, IdxConsCache
 from ..data.oss_loader import OSSDataLoader
@@ -607,7 +610,8 @@ class NativeEngine:
         self._archive_offsets_loaded_day: str = ""
         self._archive_code_map_cache: Optional[Tuple[str, pd.DataFrame]] = None
         self._disk_chunk_idx: Dict[str, int] = {}
-        self._uploaded_today = False
+        self._uploaded_today = False           # parquet 归档是否已上传
+        self._shm_uploaded_today = False       # SHM raw 包是否已上传（独立跟踪，失败可重试）
         self._raw_archive_wait_daily_done = False
         self._post_close_daily_done = threading.Event()
         self._stopped = False
@@ -1706,7 +1710,10 @@ class NativeEngine:
         return oss2.Bucket(auth, endpoint, bucket_name)
 
     def _check_raw_upload_time(self, files_by_code: Dict[str, Dict[int, object]]) -> None:
-        if not self._raw_archive_enabled or self._uploaded_today:
+        # 退出兜底：parquet 和 SHM 任一未完成都尝试补传。
+        if not self._raw_archive_enabled:
+            return
+        if self._uploaded_today and self._shm_uploaded_today:
             return
         upload_hour, upload_minute = self._parse_upload_time(
             os.environ.get("RAW_DATA_UPLOAD_TIME", os.environ.get("RAW_DATA_UPLOAD_HOUR", "16"))
@@ -1716,24 +1723,33 @@ class NativeEngine:
             return
         self._archive_native_incremental(files_by_code)
         self._release_pool()
-        if self._upload_raw_day_to_oss():
-            self._uploaded_today = True
-        # 上传 feeder_client 原始 CSV 备份到 raw_msgs/{date}/（和 ftp 同名）
-        self._upload_mdl_backup_to_oss()
+        if not self._uploaded_today:
+            if self._upload_raw_day_to_oss():
+                self._uploaded_today = True
+        if not self._shm_uploaded_today:
+            # 上传 SHM 原始数据到 OSS（float64，不做转换，用于调试重放）
+            if self._upload_shm_raw_to_oss():
+                self._shm_uploaded_today = True
 
     def _upload_raw_snapshot_now(self) -> bool:
-        """Upload already-snapshotted raw chunks without a wall-clock gate."""
-        if not self._raw_archive_enabled or self._uploaded_today:
-            return bool(self._uploaded_today)
+        """Upload already-snapshotted raw chunks without a wall-clock gate.
+
+        parquet 归档和 SHM raw 包独立跟踪成功状态，任一未完成就尝试上传：
+          - parquet 失败 → 整个返回 False（_uploaded_today 不变，外层重试）
+          - parquet 成功但 SHM 失败 → _uploaded_today=True，_shm_uploaded_today=False，
+            外层根据 _shm_uploaded_today 重试（_upload_raw_day_to_oss 内部会跳过已传）
+        """
+        if not self._raw_archive_enabled:
+            return self._uploaded_today and self._shm_uploaded_today
         self._release_pool()
-        if self._upload_raw_day_to_oss():
-            self._uploaded_today = True
-            # 上传 feeder_client 原始 CSV 备份到 raw_msgs/{date}/（和 ftp 同名）
-            self._upload_mdl_backup_to_oss()
+        if not self._uploaded_today:
+            if self._upload_raw_day_to_oss():
+                self._uploaded_today = True
+        if not self._shm_uploaded_today:
             # 上传 SHM 原始数据到 OSS（float64，不做转换，用于调试重放）
-            self._upload_shm_raw_to_oss()
-            return True
-        return False
+            if self._upload_shm_raw_to_oss():
+                self._shm_uploaded_today = True
+        return self._uploaded_today and self._shm_uploaded_today
 
     def _upload_raw_day_to_oss(self) -> bool:
         date_str = self.trading_day
@@ -1875,119 +1891,72 @@ class NativeEngine:
         logger.info("[native-archive] %s upload finished", date_str)
         return uploaded_any and not had_error
 
-    def _upload_mdl_backup_to_oss(self) -> None:
-        """上传 feeder_client mdl_msg_backup 当日 CSV 到 OSS raw_msgs/{date}/。
+    def _shm_effective_size(self, mmap_path: Path) -> int:
+        """读 mmap header 的 row_count，计算有效数据字节数。
 
-        每个 csv 单独 zip 压缩，上传到：
-            oss://{bucket}/raw_msgs/{date}/{csv文件名}.zip
+        mmap 文件是 ftruncate 按 capacity 预分配的 sparse file（虚拟大小 = capacity ×
+        n_cols × 8 + header，但实际磁盘块只占已写入部分）。tarfile / cat 不感知
+        sparse hole，会把整个虚拟大小读出来，膨胀到 TB 级。
 
-        命名和 ftp-to-oss 拉来的完全对齐（如 20260629_mdl_6_50_0.csv.zip），
-        下游无需区分数据来源。OSS 已存在同名的跳过。
+        这里只截取 header + row_count × n_cols × 8 字节（有效行），跳过 capacity
+        空洞。截断后的文件 header.capacity 字段保留原值（replay 时 reader 只看
+        row_count，不依赖 capacity）。
+
+        返回 0 表示文件 header 损坏，应跳过（不要 fallback 到 stat().st_size ——
+        那是 sparse 虚拟大小，打进去会膨胀到 TB 级）。
         """
-        backup_dir = Path(os.environ.get("MDL_BACKUP_DIR", "/data/quant/mdl_msg_backup"))
-        if not backup_dir.exists():
-            logger.warning("[mdl-backup] %s missing, skip", backup_dir)
-            return
-
-        date_str = self.trading_day
-        oss_prefix = os.environ.get("MDL_MSG_OSS_PREFIX", "raw_msgs").strip("/")
-
-        # 按 mtime 过滤当日文件（CST 时区）
-        day = datetime.strptime(date_str, "%Y%m%d")
-        day_start = day - timedelta(hours=8)
-        day_end = day_start + timedelta(days=1)
-        ts_start = day_start.timestamp()
-        ts_end = day_end.timestamp()
-
-        csvs = []
-        for p in sorted(backup_dir.glob("*.csv")):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            if ts_start <= st.st_mtime < ts_end:
-                csvs.append((p, st.st_size))
-
-        if not csvs:
-            logger.warning("[mdl-backup] no csv files for %s under %s", date_str, backup_dir)
-            return
-
-        total = sum(s for _, s in csvs)
-        logger.info("[mdl-backup] %d csv files (%.2f GB) for %s",
-                    len(csvs), total / 1024**3, date_str)
-
         try:
-            import oss2
-            bucket = self._get_oss_bucket()
-        except Exception as exc:
-            logger.error("[mdl-backup] OSS init failed: %s", exc)
-            return
+            with open(mmap_path, "rb") as f:
+                header = f.read(SHM_HEADER_SIZE)
+        except OSError as exc:
+            logger.warning("[shm-upload] read header failed %s: %s, skip",
+                           mmap_path.name, exc)
+            return 0
+        if len(header) < SHM_HEADER_SIZE:
+            logger.warning("[shm-upload] header truncated %s (%d bytes), skip",
+                           mmap_path.name, len(header))
+            return 0
+        magic, version, kind, capacity, n_cols, row_count, _td, _gen = \
+            struct.unpack_from("<QQQQQQQQ", header, 0)
+        if magic != SHM_MAGIC:
+            logger.warning("[shm-upload] bad magic %s (0x%016x), skip",
+                           mmap_path.name, magic)
+            return 0
+        if version != SHM_VERSION:
+            logger.warning("[shm-upload] bad version %s (%d), skip",
+                           mmap_path.name, version)
+            return 0
+        if n_cols == 0 or n_cols > 1024:
+            logger.warning("[shm-upload] bad n_cols %s (%d), skip",
+                           mmap_path.name, n_cols)
+            return 0
+        if row_count > capacity:
+            logger.warning("[shm-upload] row_count>capacity %s (%d>%d), skip",
+                           mmap_path.name, row_count, capacity)
+            return 0
+        # 行数据：row_count 行 × n_cols 列 × 8 字节（float64）
+        return SHM_HEADER_SIZE + row_count * n_cols * 8
 
-        tmp_root = Path("/tmp/mdl_backup_zip")
-        tmp_root.mkdir(parents=True, exist_ok=True)
-
-        done = 0
-        failed = []
-        for csv_path, csv_size in csvs:
-            oss_key = f"{oss_prefix}/{date_str}/{csv_path.name}.zip"
-
-            # OSS 已有同名则跳过（ftp 已传过）
-            try:
-                meta = bucket.head_object(oss_key)
-                if meta.content_length > 0:
-                    logger.info("[mdl-backup] skip (exists): %s", oss_key)
-                    done += 1
-                    continue
-            except oss2.exceptions.NoSuchKey:
-                pass
-            except Exception as exc:
-                logger.warning("[mdl-backup] head %s failed: %s", oss_key, exc)
-
-            tmp_zip = tmp_root / f"{csv_path.name}.zip"
-            try:
-                with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
-                    zf.write(csv_path, csv_path.name)
-                zip_size = tmp_zip.stat().st_size
-
-                if zip_size >= 100 * 1024 * 1024:
-                    oss2.resumable_upload(
-                        bucket, oss_key, str(tmp_zip),
-                        multipart_threshold=100 * 1024 * 1024,
-                        part_size=20 * 1024 * 1024,
-                        num_threads=4,
-                    )
-                else:
-                    bucket.put_object_from_file(oss_key, str(tmp_zip))
-                done += 1
-                logger.info("[mdl-backup] uploaded %s (%.1f MB → %.1f MB)",
-                            oss_key, csv_size / 1024**2, zip_size / 1024**2)
-            except Exception as exc:
-                logger.error("[mdl-backup] upload %s failed: %s", csv_path.name, exc,
-                             exc_info=True)
-                failed.append(csv_path.name)
-            finally:
-                try:
-                    tmp_zip.unlink()
-                except OSError:
-                    pass
-
-        logger.info("[mdl-backup] done %d/%d, %d failed", done, len(csvs), len(failed))
-
-    def _upload_shm_raw_to_oss(self) -> None:
-        """把当天 SHM 目录的 mmap 文件（二进制原样）打包上传到 OSS。
+    def _upload_shm_raw_to_oss(self) -> bool:
+        """把当天 SHM 目录的 mmap 文件（有效行二进制）打包上传到 OSS。
 
         SHM 是 collector 写的原始数据（float64，mdl_float_to_f64 decode 后的值），
         包含 tick/order/deal 三种 kind，按 code 分散成 quant_{kind}_{code}.mmap 文件。
-        这里把整个目录打成一个 tar.zst 上传，回放时解压还原目录，用 live engine 的
-        NativeShmReader 直接 mmap 读——跟实盘读取方式完全一致。
+        这里把整个目录的有效数据打成一个 tar.zst 上传，回放时解压还原目录，用 live
+        engine 的 NativeShmReader 直接 mmap 读——跟实盘读取方式完全一致。
+
+        关键：mmap 是 ftruncate 按 capacity 预分配的 sparse file，tarfile 不感知
+        hole 会把整个虚拟大小读出来（膨胀到 TB 级）。所以只截取每个文件的 header +
+        row_count × n_cols × 8 字节（有效行），跳过 capacity 空洞。
 
         与归档 parquet（{date}_tick/order/deal.parquet）的区别：
           - 归档 parquet：从 SHM 读出后加工（价格×100、Time微秒、去重排序），用于回测
-          - SHM 原始包：mmap 二进制原样，用于调试重放（用 live 逻辑读，对比计算差异）
+          - SHM 原始包：mmap 二进制有效行原样，用于调试重放（用 live 逻辑读，对比差异）
 
         OSS 路径：{year}/{ym}/{date}/{date}_shm.tar.zst
+
+        返回 True 表示成功上传（含 OSS 已存在跳过）；False 表示失败，调用方可重试。
         """
-        import tarfile
         date_str = self.trading_day
         year = date_str[:4]
         month = date_str[4:6]
@@ -1996,122 +1965,167 @@ class NativeEngine:
 
         if not shm_dir.exists():
             logger.warning("[shm-upload] SHM dir not exists: %s, skip", shm_dir)
-            return
+            return False
 
-        # 统计 SHM 目录大小和文件数
+        # 统计 SHM 目录：实际磁盘块占用（du）和文件数
         shm_files = sorted(shm_dir.glob("*.mmap"))
         if not shm_files:
             logger.warning("[shm-upload] no .mmap files in %s, skip", shm_dir)
-            return
-        total_disk = sum(f.stat().st_size for f in shm_files)
-        logger.info("[shm-upload] %d files, %.1f GB on disk", len(shm_files), total_disk / 1e9)
+            return False
+        total_disk = sum(f.stat().st_blocks * 512 for f in shm_files)
+        logger.info("[shm-upload] %d files, %.1f GB on disk (sparse, du)",
+                    len(shm_files), total_disk / 1e9)
+
+        # 计算有效数据大小（header + row_count 行，跳过 capacity 空洞）。
+        # _shm_effective_size 返回 0 表示 header 损坏，跳过该文件（不 fallback 到
+        # 虚拟大小，否则会把 sparse hole 打进去膨胀到 TB 级）。
+        pack_list = []  # [(path, eff_size), ...]
+        skipped = 0
+        for f in shm_files:
+            eff = self._shm_effective_size(f)
+            if eff > 0:
+                pack_list.append((f, eff))
+            else:
+                skipped += 1
+        if skipped:
+            logger.warning("[shm-upload] %d files skipped (bad header)", skipped)
+        if not pack_list:
+            logger.error("[shm-upload] all files bad, abort")
+            return False
+        total_effective = sum(eff for _, eff in pack_list)
+        logger.info("[shm-upload] %d valid files, effective data: %.1f GB (header+rows only)",
+                    len(pack_list), total_effective / 1e9)
 
         try:
             bucket = self._get_oss_bucket()
         except Exception as exc:
             logger.error("[shm-upload] OSS bucket init failed: %s", exc)
-            return
+            return False
 
-        # 打包成 tar.zst（mmap 文件是二进制，zstd 压缩率高）
-        oss_key = f"{prefix}/{date_str}_shm.tar.zst"
         disk_dir = self._disk_output_dir / date_str
         disk_dir.mkdir(parents=True, exist_ok=True)
-        local_tar = disk_dir / f"{date_str}_shm.tar.zst"
 
-        # 跳过已上传的
-        try:
-            bucket.head_object(oss_key)
-            logger.info("[shm-upload] OSS 已存在: %s, 跳过", oss_key)
-            return
-        except Exception:
-            pass
+        # 决定压缩格式 + oss_key。zstd 优先，没装则 gzip。
+        use_zstd = bool(shutil.which("zstd"))
+        ext = ".tar.zst" if use_zstd else ".tar.gz"
+        oss_key = f"{prefix}/{date_str}_shm{ext}"
+        local_out = disk_dir / f"{date_str}_shm{ext}"
+
+        # 跳过已上传的（同时检查 .tar.zst 和 .tar.gz 两种历史产物，
+        # 避免换压缩格式后旧文件还在导致重复打包）
+        already_uploaded = False
+        for try_key in (oss_key,
+                        f"{prefix}/{date_str}_shm.tar.zst",
+                        f"{prefix}/{date_str}_shm.tar.gz"):
+            if try_key == oss_key:
+                continue
+            try:
+                bucket.head_object(try_key)
+                logger.info("[shm-upload] OSS 已存在（历史格式）: %s, 跳过", try_key)
+                already_uploaded = True
+                break
+            except Exception:
+                pass
+        if not already_uploaded:
+            try:
+                bucket.head_object(oss_key)
+                logger.info("[shm-upload] OSS 已存在: %s, 跳过", oss_key)
+                already_uploaded = True
+            except Exception:
+                pass
+        if already_uploaded:
+            return True
 
         t0 = time.time()
-        # 用 tarfile 打包，不压缩（tar），再用 zstd 压缩
-        # 注意：mmap 文件大小是 capacity 分配的（含空洞），但 mmap reader 只读 header
-        # 的 row_count 行。打包整个文件（含空洞）最简单，回放时 reader 自动截断。
-        tmp_tar = disk_dir / f"{date_str}_shm.tar"
-        logger.info("[shm-upload] creating tar: %s ...", tmp_tar.name)
-        try:
-            with tarfile.open(str(tmp_tar), "w") as tar:
-                for f in shm_files:
-                    # 用相对路径（去掉 shm_dir 前缀），回放时解压到 shm_dir 还原
-                    tar.add(str(f), arcname=f.name)
-        except Exception as exc:
-            logger.error("[shm-upload] tar failed: %s", exc)
-            if tmp_tar.exists():
-                tmp_tar.unlink()
-            return
 
-        tar_size = tmp_tar.stat().st_size
-        logger.info("[shm-upload] tar done: %d MB in %.1fs",
-                    tar_size // 1024 // 1024, time.time() - t0)
-
-        # zstd 压缩
-        t1 = time.time()
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["zstd", "-3", "-f", "-T4",
-                 str(tmp_tar), "-o", str(local_tar)],
-                capture_output=True, text=True, timeout=1800,
+        if use_zstd:
+            # 流式管道：tarfile（只写有效行）→ zstd stdin → 本地 .tar.zst
+            # 避免：① 中间 tar 文件膨胀到虚拟大小；② tarfile 不感知 sparse hole。
+            zstd_proc = subprocess.Popen(
+                ["zstd", "-3", "-T4", "-f", "-o", str(local_out)],
+                stdin=subprocess.PIPE,
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"zstd failed: {result.stderr}")
-        except FileNotFoundError:
-            # zstd 没装，用 tarfile 直接写 tar.gz（兼容性 fallback）
+            try:
+                with tarfile.open(fileobj=zstd_proc.stdin, mode="w|") as tar:
+                    for fpath, eff_size in pack_list:
+                        self._add_shm_to_tar(tar, fpath, eff_size)
+                zstd_proc.stdin.close()
+                rc = zstd_proc.wait(timeout=1800)
+                if rc != 0:
+                    raise RuntimeError(f"zstd exited {rc}")
+            except Exception as exc:
+                logger.error("[shm-upload] tar|zstd failed: %s", exc)
+                zstd_proc.kill()
+                local_out.unlink(missing_ok=True)
+                return False
+        else:
+            # 无 zstd：fallback 用 tarfile + gzip 内置压缩
             logger.warning("[shm-upload] zstd not found, fallback to gzip")
-            local_gz = disk_dir / f"{date_str}_shm.tar.gz"
-            local_gz.unlink(missing_ok=True)
-            local_tar.rename(local_gz.with_suffix(""))  # 重命名回来
-            import shutil
-            with tarfile.open(str(local_gz), "w:gz") as tar:
-                for f in shm_files:
-                    tar.add(str(f), arcname=f.name)
-            local_tar = local_gz
-            oss_key = oss_key.replace(".tar.zst", ".tar.gz")
-        except Exception as exc:
-            logger.error("[shm-upload] compress failed: %s", exc)
-            if tmp_tar.exists():
-                tmp_tar.unlink()
-            return
-        finally:
-            if tmp_tar.exists() and tmp_tar != local_tar:
-                tmp_tar.unlink()
+            try:
+                with tarfile.open(str(local_out), "w|gz") as tar:
+                    for fpath, eff_size in pack_list:
+                        self._add_shm_to_tar(tar, fpath, eff_size)
+            except Exception as exc:
+                logger.error("[shm-upload] tar|gz failed: %s", exc)
+                local_out.unlink(missing_ok=True)
+                return False
 
-        compressed_size = local_tar.stat().st_size
-        logger.info("[shm-upload] compressed: %d MB in %.1fs (ratio %.1f%%)",
+        compressed_size = local_out.stat().st_size
+        logger.info("[shm-upload] compressed: %d MB in %.1fs (ratio %.1f%% vs effective)",
                     compressed_size // 1024 // 1024,
-                    time.time() - t1,
-                    compressed_size * 100 / tar_size if tar_size else 0)
+                    time.time() - t0,
+                    compressed_size * 100 / total_effective if total_effective else 0)
 
         # 上传 OSS
         t2 = time.time()
+        upload_ok = False
         try:
             if compressed_size > 100 * 1024 * 1024:
                 # 大文件用断点续传
                 import oss2
                 oss2.resumable_upload(
-                    bucket, oss_key, str(local_tar),
+                    bucket, oss_key, str(local_out),
                     store=oss2.ResumableStore(root=str(disk_dir / ".oss_resume")),
                     multipart_threshold=50 * 1024 * 1024,
                     part_size=20 * 1024 * 1024,
                     num_threads=4,
                 )
             else:
-                bucket.put_object_from_file(oss_key, str(local_tar))
+                bucket.put_object_from_file(oss_key, str(local_out))
             logger.info("[shm-upload] uploaded %s in %.1fs (%d MB)",
                         oss_key, time.time() - t2, compressed_size // 1024 // 1024)
+            upload_ok = True
         except Exception as exc:
             logger.error("[shm-upload] upload failed: %s", exc)
 
         # 清理本地压缩文件（磁盘空间有限）
         try:
-            local_tar.unlink()
+            local_out.unlink()
         except OSError:
             pass
 
         logger.info("[shm-upload] total: %.1fs", time.time() - t0)
+        return upload_ok
+
+    def _add_shm_to_tar(self, tar, fpath: Path, eff_size: int) -> None:
+        """把单个 mmap 文件的有效行（header + row_count 行）写入 tar 流。
+
+        用自定义 TarInfo + fileobj，只读 eff_size 字节，跳过 capacity 空洞。
+        tar 流式模式（w|）下不能用 tar.add（它会 seek），必须用 addfile +
+        fileobj（addfile 精确读 ti.size 字节，正好是有效行大小）。
+        """
+        ti = tarfile.TarInfo(name=fpath.name)
+        ti.size = eff_size
+        ti.mtime = int(fpath.stat().st_mtime)
+        ti.mode = 0o644
+        # 只读 eff_size 字节（header + 有效行），不读 capacity 空洞。
+        # tarfile.addfile 会从 fileobj 精确读 ti.size 字节，传入打开的文件句柄即可，
+        # 无需把整文件 load 到内存（BytesIO 会占内存）。
+        fobj = open(fpath, "rb")
+        try:
+            tar.addfile(ti, fobj)
+        finally:
+            fobj.close()
 
     def _archive_select_clause(self, kind: str) -> str:
         # Time/UpdateTime 编码对齐 Go converter（deeptrade opt_parquet_writer）：
@@ -2344,11 +2358,11 @@ class NativeEngine:
     def _archive_loop(self) -> None:
         from datetime import timedelta
         logger.info("[native-archive] background archive loop started "
-                    "(smart-sleep: 11:35/15:05 snapshot, upload after daily done)")
+                    "(smart-sleep: 11:35/15:35 snapshot, upload after daily done)")
         last_archive_date = ""
         archived_lunch = False
-        archived_snapshot = False  # 15:05 SHM -> 本地 chunks
-        archived_upload = False    # 15:05 snapshot + daily done -> OSS upload
+        archived_snapshot = False  # 15:35 SHM -> 本地 chunks
+        archived_upload = False    # 15:35 snapshot + daily done -> OSS upload
         while not self._stopped:
             try:
                 today = date.today().isoformat()
@@ -2358,6 +2372,8 @@ class NativeEngine:
                     archived_lunch = now_init.hour > 11 or (now_init.hour == 11 and now_init.minute >= 35)
                     archived_snapshot = False
                     archived_upload = False
+                    self._uploaded_today = False
+                    self._shm_uploaded_today = False
                     self._post_close_daily_done.clear()
 
                 now = datetime.now()
@@ -2371,12 +2387,11 @@ class NativeEngine:
                         archived_lunch = True
                         logger.info("[native-archive] lunch break snapshot done")
 
-                # 15:05 post-close SHM snapshot freezes the raw archive input.
+                # 15:35 post-close SHM snapshot freezes the raw archive input.
                 # Tick files can keep growing after close, but post-15:00 rows
-                # are not useful for factor/backtest parity.  Upload waits for
-                # the 15:10 daily calculation so DuckDB merge does not release
-                # the worker pool while daily factors are still computing.
-                if h >= 15 and m >= 5 and not archived_snapshot:
+                # are not useful for factor/backtest parity.  15:35 在 15:10 daily
+                # 计算之后，snapshot 完成后 daily_done 必为 True，可直接 upload。
+                if h >= 15 and m >= 35 and not archived_snapshot:
                     files_by_code = self._scan_shm_files()
                     if files_by_code:
                         logger.info("[native-archive] post-close snapshot starting...")
@@ -2388,41 +2403,52 @@ class NativeEngine:
                     not self._raw_archive_wait_daily_done
                     or self._post_close_daily_done.is_set()
                 )
-                if archived_snapshot and not archived_upload and not self._uploaded_today and not daily_done:
+                if archived_snapshot and not archived_upload and not daily_done:
                     logger.info("[native-archive] waiting for post-close daily calculation before OSS upload")
 
-                # Upload as soon as all local chunks from the 15:05 snapshot
-                # have been written and the 15:10 daily calculation has ended.
-                # This avoids a second wall-clock gate while preserving daily.
-                if archived_snapshot and not archived_upload and not self._uploaded_today and daily_done:
+                # Upload as soon as the 15:35 snapshot chunks are written and
+                # the 15:10 daily calculation has ended (daily_done).  Since
+                # 15:35 > 15:10, daily_done is virtually always True here.
+                #
+                # 完成条件 = parquet(_uploaded_today) 且 SHM(_shm_uploaded_today) 都成功。
+                # 任一失败都会重试 ARCHIVE_UPLOAD_MAX_RETRIES 次。
+                if archived_snapshot and not archived_upload and not (
+                    self._uploaded_today and self._shm_uploaded_today
+                ) and daily_done:
                     max_attempts = max(1, _env_int("ARCHIVE_UPLOAD_MAX_RETRIES", 3, minimum=1))
                     for attempt in range(1, max_attempts + 1):
-                        if self._stopped or self._uploaded_today:
+                        if self._stopped:
                             break
-                        logger.info("[native-archive] post-snapshot OSS upload attempt %d/%d starting...",
-                                    attempt, max_attempts)
+                        if self._uploaded_today and self._shm_uploaded_today:
+                            break
+                        logger.info("[native-archive] post-snapshot OSS upload attempt %d/%d starting... "
+                                    "(parquet=%s, shm=%s)",
+                                    attempt, max_attempts,
+                                    self._uploaded_today, self._shm_uploaded_today)
                         try:
-                            if self._upload_raw_snapshot_now():
-                                archived_upload = True
+                            self._upload_raw_snapshot_now()
                         except Exception as exc:
                             logger.error("[native-archive] OSS upload attempt %d failed: %s",
                                          attempt, exc, exc_info=True)
-                        if self._uploaded_today:
-                            archived_upload = True
+                        if self._uploaded_today and self._shm_uploaded_today:
                             logger.info("[native-archive] post-snapshot OSS upload done (attempt %d)",
                                         attempt)
                             break
                         if attempt < max_attempts:
-                            logger.warning("[native-archive] OSS upload attempt %d did not succeed, "
-                                           "sleeping 300s before retry", attempt)
+                            logger.warning("[native-archive] OSS upload attempt %d incomplete "
+                                           "(parquet=%s, shm=%s), sleeping 300s before retry",
+                                           attempt, self._uploaded_today, self._shm_uploaded_today)
                             for _ in range(300):
                                 if self._stopped:
                                     break
                                 time.sleep(1)
-                    if not archived_upload:
-                        logger.error("[native-archive] OSS upload gave up after %d attempts",
-                                     max_attempts)
+                    if not (self._uploaded_today and self._shm_uploaded_today):
+                        logger.error("[native-archive] OSS upload gave up after %d attempts "
+                                     "(parquet=%s, shm=%s)",
+                                     max_attempts, self._uploaded_today, self._shm_uploaded_today)
                         # 标记避免明天之前无限重试；日志已 ERROR 告警，人工介入。
+                        archived_upload = True
+                    else:
                         archived_upload = True
 
                 if not archived_lunch:
@@ -2431,7 +2457,7 @@ class NativeEngine:
                         target = target + timedelta(days=1)
                     sleep_sec = max(1, (target - now).total_seconds())
                 elif not archived_snapshot:
-                    target = now.replace(hour=15, minute=5, second=0, microsecond=0)
+                    target = now.replace(hour=15, minute=35, second=0, microsecond=0)
                     if target <= now:
                         target = target + timedelta(days=1)
                     sleep_sec = max(1, (target - now).total_seconds())

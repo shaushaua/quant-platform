@@ -86,6 +86,8 @@ spec:
             # --- 实盘资金：通过 order-gateway /v1/balance 接口取真实总资产 ---
             # portfolio_context_fn 调 _fetch_balance(ORDER_GATEWAY_URL, BROKER_ACCOUNT_ID)
             # → positions_to_orders 用 account.total_asset 做 position sizing。
+            # 首日无持仓时按目标仓位买入；后续调仓仍按目标仓位生成完整买单。
+            # gateway 会把同批卖单排在买单前，并用本批卖出估值的 90% 做买入预算。
             # 模拟盘才打开下面两行（强制 1000 万虚拟资金），实盘必须注释掉。
             # - name: OPEN_POSITION_SIM_MODE
             #   value: "1"
