@@ -469,7 +469,8 @@ def load_production_daily_basic(date_str: str, current_daily_basic: Optional[pd.
 
     cached = _DAILY_BASIC_MEM_CACHE.get(date_str)
     if cached is not None:
-        return cached
+        # 返回副本，防止调用方 in-place 修改污染缓存
+        return cached.copy()
 
     if current_daily_basic is not None and not current_daily_basic.empty:
         current = normalize_daily_basic(current_daily_basic, date_str=date_str)
@@ -565,7 +566,12 @@ def inference(
     index_composition_df: Optional[pd.DataFrame] = None,
     portfolio_context=None,
 ) -> pd.DataFrame:
+    import time as _time
+    _t0 = _time.time()
+
     daily_basic = load_production_daily_basic(date_str, current_daily_basic=daily_basic_df)
+    _t_daily_basic = _time.time()
+    print(f"[tree-infer-timing] daily_basic: {_t_daily_basic - _t0:.3f}s ({len(daily_basic)} rows)", flush=True)
     universe = normalize_universe_codes(trading_universe_df)
     # Tolerate backtest-format daily factors that carry `code` (6-digit) instead
     # of `ID_QI` (e.g. merged protected-eillen-strategy-v2 shards). Bridge both
@@ -639,7 +645,10 @@ def inference(
         if Path(DEFAULT_MODEL_PATH).exists() and Path(DEFAULT_MODEL_PATH).stat().st_size > 0
         else load_model_from_oss(OSS_MODEL_KEY, OSS_MODEL_BUCKET)
     )
+    _t_model = _time.time()
+    print(f"[tree-infer-timing] model_path resolve: {_t_model - _t_daily_basic:.3f}s path={model_path}", flush=True)
 
+    _t_pre_predict = _time.time()
     out = predict_tree_model(
         daily_basic=daily_basic,
         daily_feature_czhou1=prev_day_factors_df,
@@ -676,6 +685,10 @@ def inference(
         optimizer_industry_exposure_tol=OPTIMIZER_INDUSTRY_EXPOSURE_TOL,
         optimizer_min_benchmark_constituent_weight=OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT,
     )
+
+    _t_predict = _time.time()
+    print(f"[tree-infer-timing] predict_tree_model(.so): {_t_predict - _t_pre_predict:.3f}s ({len(out)} positions)", flush=True)
+    print(f"[tree-infer-timing] TOTAL: {_t_predict - _t0:.3f}s", flush=True)
 
     if universe is not None:
         out = out[out["_code6"].isin(set(universe))].copy()

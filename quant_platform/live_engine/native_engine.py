@@ -2974,13 +2974,17 @@ class NativeEngine:
                 portfolio_context_fn=portfolio_context_fn,
                 daily_basic_df=daily_basic_df,
                 # call_inference 第 4 参（模型 daily_feature_czhou1 输入）。
-                # 原版两份代码（fork child 和 inline）都传 prev_day_factors，
-                # 此处保持一致。
-                inference_factor_input=prev_day_factors,
+                # daily_position 用当天 14:50 刚算出的因子（result_df），不是 T-1 因子。
+                # 传 None → _write_factor_output_and_infer 内部用 result_df。
+                # minute/daily 用 T-1 因子（prev_day_factors）。
+                inference_factor_input=(None if (schedule is not None and schedule.name == "daily_position")
+                                        else prev_day_factors),
                 idx_cons_df=idx_cons_df,
                 trading_universe_df=trading_universe_df,
                 pre_fork_latest_prices=pre_fork_latest_prices,
-                gc_before_inference=False,
+                # daily_position 算全市场，内存压力大，推理前 gc 释放因子计算阶段内存
+                # （改前 _write_daily_position_inline 有 gc.collect，此处恢复）
+                gc_before_inference=(schedule is not None and schedule.name == "daily_position"),
                 log_tag=schedule.name if schedule is not None else "minute",
             )
         except Exception as exc:
