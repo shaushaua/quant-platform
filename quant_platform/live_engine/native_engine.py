@@ -1730,6 +1730,8 @@ class NativeEngine:
             self._uploaded_today = True
             # 上传 feeder_client 原始 CSV 备份到 raw_msgs/{date}/（和 ftp 同名）
             self._upload_mdl_backup_to_oss()
+            # 上传 SHM 原始数据到 OSS（float64，不做转换，用于调试重放）
+            self._upload_shm_raw_to_oss()
             return True
         return False
 
@@ -1970,6 +1972,131 @@ class NativeEngine:
                     pass
 
         logger.info("[mdl-backup] done %d/%d, %d failed", done, len(csvs), len(failed))
+
+    def _upload_shm_raw_to_oss(self) -> None:
+        """把当天 SHM 的原始数据（float64，不做任何转换）上传到 OSS。
+
+        与归档 parquet 区分：
+          - 归档 parquet（{date}_{kind}.parquet）：价格×100 整数分、Volume 不放大、Time 微秒
+          - SHM 原始（{date}_{kind}_shm.parquet）：float64 元价、Volume 原值、Time 秒数
+
+        用途：调试重放时用原始 SHM 数据跑因子，对比"历史计算 vs 实盘计算"差异。
+        SHM 原始数据保持了 collector decode 后的原始值（mdl_float_to_f64 的输出），
+        不经过任何量化/放大/时区转换。
+
+        OSS 路径：{year}/{ym}/{date}/{date}_{kind}_shm.parquet
+        """
+        from quant_platform.data.native_shm_reader import NativeShmReader
+        date_str = self.trading_day
+        year = date_str[:4]
+        month = date_str[4:6]
+        prefix = f"{year}/{year}{month}/{date_str}"
+        shm_dir = Path(os.environ.get("NATIVE_SHM_DIR", "/data/quant/shm"))
+
+        # SHM 文件按 code 分散：quant_{kind}_{code}.mmap + 滚动分片 _partNNN
+        # 收集所有 code（扫描目录）
+        import glob as _glob
+        import pandas as _pd
+
+        kind_cols = {
+            "tick":  _tick_buf_cols,
+            "order": _order_buf_cols,
+            "deal":  _deal_buf_cols,
+        }
+        kind_shm_n = {"tick": 79, "order": 9, "deal": 10}
+
+        try:
+            bucket = self._get_oss_bucket()
+        except Exception as exc:
+            logger.error("[shm-upload] OSS bucket init failed: %s", exc)
+            return
+
+        for kind, buf_cols in kind_cols.items():
+            t0 = time.time()
+            # 扫描该 kind 的所有 SHM 文件（去重 code，含分片）
+            pattern = str(shm_dir / f"quant_{kind}_*.mmap")
+            all_files = sorted(_glob.glob(pattern))
+            if not all_files:
+                logger.warning("[shm-upload] no SHM files for %s, skip", kind)
+                continue
+
+            # 提取 code 列表（去掉 part 文件，它们会被 reader 自动读）
+            codes = sorted(set(
+                f.split(f"quant_{kind}_")[1].replace(".mmap", "").split("_part")[0]
+                for f in all_files
+            ))
+            logger.info("[shm-upload] %s: %d codes, reading SHM...", kind, len(codes))
+
+            frames = []
+            total_rows = 0
+            errors = 0
+            for code in codes:
+                try:
+                    safe_code = code.replace(".", "_")
+                    # reader 会自动合并 part0 + partNNN 分片
+                    reader = NativeShmReader(
+                        shm_dir / f"quant_{kind}_{safe_code}.mmap")
+                    rows = reader.read_rows()
+                    if rows.shape[0] == 0:
+                        continue
+                    # 构建 DataFrame：buf_cols + Code
+                    df = _pd.DataFrame(rows, columns=buf_cols)
+                    # 把 code（. 替换回原始格式）插入为第一列
+                    raw_code = code.replace("_", ".")
+                    df.insert(0, "Code", raw_code)
+                    frames.append(df)
+                    total_rows += rows.shape[0]
+                except Exception as exc:
+                    errors += 1
+                    if errors <= 3:
+                        logger.warning("[shm-upload] %s read %s failed: %s", kind, code, exc)
+
+            if not frames:
+                logger.warning("[shm-upload] %s: no valid data, skip", kind)
+                continue
+
+            # 合并所有股票
+            merged = _pd.concat(frames, ignore_index=True)
+            elapsed_read = time.time() - t0
+            logger.info("[shm-upload] %s: read %d rows (%d codes) in %.1fs",
+                        kind, total_rows, len(frames), elapsed_read)
+
+            # 写本地 parquet（zstd 压缩，原始 float64）
+            disk_dir = self._disk_output_dir / date_str
+            disk_dir.mkdir(parents=True, exist_ok=True)
+            local_path = disk_dir / f"{date_str}_{kind}_shm.parquet"
+            t1 = time.time()
+            merged.to_parquet(local_path, compression="zstd",
+                              index=False, engine="pyarrow")
+            elapsed_write = time.time() - t1
+            file_size = local_path.stat().st_size
+            logger.info("[shm-upload] %s: wrote %s (%d MB) in %.1fs",
+                        kind, local_path.name, file_size // 1024 // 1024, elapsed_write)
+
+            # 上传 OSS
+            oss_key = f"{prefix}/{date_str}_{kind}_shm.parquet"
+            t2 = time.time()
+            try:
+                # 跳过已存在的
+                try:
+                    bucket.head_object(oss_key)
+                    logger.info("[shm-upload] %s: OSS 已存在, 跳过", oss_key)
+                except Exception:
+                    # 不存在，上传
+                    bucket.put_object_from_file(oss_key, str(local_path))
+                    elapsed_upload = time.time() - t2
+                    logger.info("[shm-upload] %s: uploaded in %.1fs",
+                                oss_key, elapsed_upload)
+            except Exception as exc:
+                logger.error("[shm-upload] %s: upload failed: %s", oss_key, exc)
+
+            # 释放内存
+            del merged, frames
+            gc.collect()
+
+            total_elapsed = time.time() - t0
+            logger.info("[shm-upload] %s: done in %.1fs total (%d rows, %d errors)",
+                        kind, total_elapsed, total_rows, errors)
 
     def _archive_select_clause(self, kind: str) -> str:
         # Time/UpdateTime 编码对齐 Go converter（deeptrade opt_parquet_writer）：
