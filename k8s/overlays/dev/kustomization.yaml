@@ -1,6 +1,18 @@
-# Dev overlay: small machines, reduced resources
+# Dev overlay: 独立 quant-dev namespace，小规格资源，手动按需启停
+#
+# 用法:
+#   kubectl apply -f k8s/namespace-dev.yaml                 # 创建 namespace（只需一次）
+#   kubectl apply -k k8s/overlays/dev/                      # 部署 dev deployment（replicas=0）
+#   kubectl scale -n quant-dev deploy/combined-engine --replicas=1  # 测试时拉起
+#   kubectl scale -n quant-dev deploy/combined-engine --replicas=0  # 测完释放
+#
+# secrets 需从 quant namespace 复制（只需一次）:
+#   kubectl get secret quant-secrets -n quant -o yaml \
+#     | sed 's/namespace: quant/namespace: quant-dev/' \
+#     | kubectl apply -f -
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+namespace: quant-dev
 resources:
   - ../../base
 patches:
@@ -11,11 +23,20 @@ patches:
       apiVersion: apps/v1
       kind: Deployment
       metadata:
-        name: combined-engine
-        namespace: quant
+        name: combined-engine-dev
+        namespace: quant-dev
       spec:
+        replicas: 0
         template:
           spec:
+            nodeSelector:
+              quant.lianghua.io/combined-engine: null
+              quant.lianghua.io/dev: "true"
+            tolerations:
+              - key: dedicated
+                operator: Equal
+                value: dev
+                effect: NoSchedule
             containers:
               - name: combined-engine
                 env:
@@ -27,4 +48,4 @@ patches:
                     memory: 2Gi
                   limits:
                     cpu: "4"
-                    memory: 6Gi
+                    memory: 14Gi

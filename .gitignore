@@ -33,6 +33,9 @@ local_test_result.*
 # Local reference materials (trader examples, data samples)
 local/
 
+# Local design docs (not for git tracking, internal planning)
+docs/design-*.md
+
 # Rust build artifacts
 mdl_parser/target/
 
