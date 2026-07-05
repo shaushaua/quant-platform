@@ -1974,36 +1974,37 @@ class NativeEngine:
         logger.info("[mdl-backup] done %d/%d, %d failed", done, len(csvs), len(failed))
 
     def _upload_shm_raw_to_oss(self) -> None:
-        """把当天 SHM 的原始数据（float64，不做任何转换）上传到 OSS。
+        """把当天 SHM 目录的 mmap 文件（二进制原样）打包上传到 OSS。
 
-        与归档 parquet 区分：
-          - 归档 parquet（{date}_{kind}.parquet）：价格×100 整数分、Volume 不放大、Time 微秒
-          - SHM 原始（{date}_{kind}_shm.parquet）：float64 元价、Volume 原值、Time 秒数
+        SHM 是 collector 写的原始数据（float64，mdl_float_to_f64 decode 后的值），
+        包含 tick/order/deal 三种 kind，按 code 分散成 quant_{kind}_{code}.mmap 文件。
+        这里把整个目录打成一个 tar.zst 上传，回放时解压还原目录，用 live engine 的
+        NativeShmReader 直接 mmap 读——跟实盘读取方式完全一致。
 
-        用途：调试重放时用原始 SHM 数据跑因子，对比"历史计算 vs 实盘计算"差异。
-        SHM 原始数据保持了 collector decode 后的原始值（mdl_float_to_f64 的输出），
-        不经过任何量化/放大/时区转换。
+        与归档 parquet（{date}_tick/order/deal.parquet）的区别：
+          - 归档 parquet：从 SHM 读出后加工（价格×100、Time微秒、去重排序），用于回测
+          - SHM 原始包：mmap 二进制原样，用于调试重放（用 live 逻辑读，对比计算差异）
 
-        OSS 路径：{year}/{ym}/{date}/{date}_{kind}_shm.parquet
+        OSS 路径：{year}/{ym}/{date}/{date}_shm.tar.zst
         """
-        from quant_platform.data.native_shm_reader import NativeShmReader
+        import tarfile
         date_str = self.trading_day
         year = date_str[:4]
         month = date_str[4:6]
         prefix = f"{year}/{year}{month}/{date_str}"
         shm_dir = Path(os.environ.get("NATIVE_SHM_DIR", "/data/quant/shm"))
 
-        # SHM 文件按 code 分散：quant_{kind}_{code}.mmap + 滚动分片 _partNNN
-        # 收集所有 code（扫描目录）
-        import glob as _glob
-        import pandas as _pd
+        if not shm_dir.exists():
+            logger.warning("[shm-upload] SHM dir not exists: %s, skip", shm_dir)
+            return
 
-        kind_cols = {
-            "tick":  _tick_buf_cols,
-            "order": _order_buf_cols,
-            "deal":  _deal_buf_cols,
-        }
-        kind_shm_n = {"tick": 79, "order": 9, "deal": 10}
+        # 统计 SHM 目录大小和文件数
+        shm_files = sorted(shm_dir.glob("*.mmap"))
+        if not shm_files:
+            logger.warning("[shm-upload] no .mmap files in %s, skip", shm_dir)
+            return
+        total_disk = sum(f.stat().st_size for f in shm_files)
+        logger.info("[shm-upload] %d files, %.1f GB on disk", len(shm_files), total_disk / 1e9)
 
         try:
             bucket = self._get_oss_bucket()
@@ -2011,92 +2012,106 @@ class NativeEngine:
             logger.error("[shm-upload] OSS bucket init failed: %s", exc)
             return
 
-        for kind, buf_cols in kind_cols.items():
-            t0 = time.time()
-            # 扫描该 kind 的所有 SHM 文件（去重 code，含分片）
-            pattern = str(shm_dir / f"quant_{kind}_*.mmap")
-            all_files = sorted(_glob.glob(pattern))
-            if not all_files:
-                logger.warning("[shm-upload] no SHM files for %s, skip", kind)
-                continue
+        # 打包成 tar.zst（mmap 文件是二进制，zstd 压缩率高）
+        oss_key = f"{prefix}/{date_str}_shm.tar.zst"
+        disk_dir = self._disk_output_dir / date_str
+        disk_dir.mkdir(parents=True, exist_ok=True)
+        local_tar = disk_dir / f"{date_str}_shm.tar.zst"
 
-            # 提取 code 列表（去掉 part 文件，它们会被 reader 自动读）
-            codes = sorted(set(
-                f.split(f"quant_{kind}_")[1].replace(".mmap", "").split("_part")[0]
-                for f in all_files
-            ))
-            logger.info("[shm-upload] %s: %d codes, reading SHM...", kind, len(codes))
+        # 跳过已上传的
+        try:
+            bucket.head_object(oss_key)
+            logger.info("[shm-upload] OSS 已存在: %s, 跳过", oss_key)
+            return
+        except Exception:
+            pass
 
-            frames = []
-            total_rows = 0
-            errors = 0
-            for code in codes:
-                try:
-                    safe_code = code.replace(".", "_")
-                    # reader 会自动合并 part0 + partNNN 分片
-                    reader = NativeShmReader(
-                        shm_dir / f"quant_{kind}_{safe_code}.mmap")
-                    rows = reader.read_rows()
-                    if rows.shape[0] == 0:
-                        continue
-                    # 构建 DataFrame：buf_cols + Code
-                    df = _pd.DataFrame(rows, columns=buf_cols)
-                    # 把 code（. 替换回原始格式）插入为第一列
-                    raw_code = code.replace("_", ".")
-                    df.insert(0, "Code", raw_code)
-                    frames.append(df)
-                    total_rows += rows.shape[0]
-                except Exception as exc:
-                    errors += 1
-                    if errors <= 3:
-                        logger.warning("[shm-upload] %s read %s failed: %s", kind, code, exc)
+        t0 = time.time()
+        # 用 tarfile 打包，不压缩（tar），再用 zstd 压缩
+        # 注意：mmap 文件大小是 capacity 分配的（含空洞），但 mmap reader 只读 header
+        # 的 row_count 行。打包整个文件（含空洞）最简单，回放时 reader 自动截断。
+        tmp_tar = disk_dir / f"{date_str}_shm.tar"
+        logger.info("[shm-upload] creating tar: %s ...", tmp_tar.name)
+        try:
+            with tarfile.open(str(tmp_tar), "w") as tar:
+                for f in shm_files:
+                    # 用相对路径（去掉 shm_dir 前缀），回放时解压到 shm_dir 还原
+                    tar.add(str(f), arcname=f.name)
+        except Exception as exc:
+            logger.error("[shm-upload] tar failed: %s", exc)
+            if tmp_tar.exists():
+                tmp_tar.unlink()
+            return
 
-            if not frames:
-                logger.warning("[shm-upload] %s: no valid data, skip", kind)
-                continue
+        tar_size = tmp_tar.stat().st_size
+        logger.info("[shm-upload] tar done: %d MB in %.1fs",
+                    tar_size // 1024 // 1024, time.time() - t0)
 
-            # 合并所有股票
-            merged = _pd.concat(frames, ignore_index=True)
-            elapsed_read = time.time() - t0
-            logger.info("[shm-upload] %s: read %d rows (%d codes) in %.1fs",
-                        kind, total_rows, len(frames), elapsed_read)
+        # zstd 压缩
+        t1 = time.time()
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["zstd", "-3", "-f", "-T4",
+                 str(tmp_tar), "-o", str(local_tar)],
+                capture_output=True, text=True, timeout=1800,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"zstd failed: {result.stderr}")
+        except FileNotFoundError:
+            # zstd 没装，用 tarfile 直接写 tar.gz（兼容性 fallback）
+            logger.warning("[shm-upload] zstd not found, fallback to gzip")
+            local_gz = disk_dir / f"{date_str}_shm.tar.gz"
+            local_gz.unlink(missing_ok=True)
+            local_tar.rename(local_gz.with_suffix(""))  # 重命名回来
+            import shutil
+            with tarfile.open(str(local_gz), "w:gz") as tar:
+                for f in shm_files:
+                    tar.add(str(f), arcname=f.name)
+            local_tar = local_gz
+            oss_key = oss_key.replace(".tar.zst", ".tar.gz")
+        except Exception as exc:
+            logger.error("[shm-upload] compress failed: %s", exc)
+            if tmp_tar.exists():
+                tmp_tar.unlink()
+            return
+        finally:
+            if tmp_tar.exists() and tmp_tar != local_tar:
+                tmp_tar.unlink()
 
-            # 写本地 parquet（zstd 压缩，原始 float64）
-            disk_dir = self._disk_output_dir / date_str
-            disk_dir.mkdir(parents=True, exist_ok=True)
-            local_path = disk_dir / f"{date_str}_{kind}_shm.parquet"
-            t1 = time.time()
-            merged.to_parquet(local_path, compression="zstd",
-                              index=False, engine="pyarrow")
-            elapsed_write = time.time() - t1
-            file_size = local_path.stat().st_size
-            logger.info("[shm-upload] %s: wrote %s (%d MB) in %.1fs",
-                        kind, local_path.name, file_size // 1024 // 1024, elapsed_write)
+        compressed_size = local_tar.stat().st_size
+        logger.info("[shm-upload] compressed: %d MB in %.1fs (ratio %.1f%%)",
+                    compressed_size // 1024 // 1024,
+                    time.time() - t1,
+                    compressed_size * 100 / tar_size if tar_size else 0)
 
-            # 上传 OSS
-            oss_key = f"{prefix}/{date_str}_{kind}_shm.parquet"
-            t2 = time.time()
-            try:
-                # 跳过已存在的
-                try:
-                    bucket.head_object(oss_key)
-                    logger.info("[shm-upload] %s: OSS 已存在, 跳过", oss_key)
-                except Exception:
-                    # 不存在，上传
-                    bucket.put_object_from_file(oss_key, str(local_path))
-                    elapsed_upload = time.time() - t2
-                    logger.info("[shm-upload] %s: uploaded in %.1fs",
-                                oss_key, elapsed_upload)
-            except Exception as exc:
-                logger.error("[shm-upload] %s: upload failed: %s", oss_key, exc)
+        # 上传 OSS
+        t2 = time.time()
+        try:
+            if compressed_size > 100 * 1024 * 1024:
+                # 大文件用断点续传
+                import oss2
+                oss2.resumable_upload(
+                    bucket, oss_key, str(local_tar),
+                    store=oss2.ResumableStore(root=str(disk_dir / ".oss_resume")),
+                    multipart_threshold=50 * 1024 * 1024,
+                    part_size=20 * 1024 * 1024,
+                    num_threads=4,
+                )
+            else:
+                bucket.put_object_from_file(oss_key, str(local_tar))
+            logger.info("[shm-upload] uploaded %s in %.1fs (%d MB)",
+                        oss_key, time.time() - t2, compressed_size // 1024 // 1024)
+        except Exception as exc:
+            logger.error("[shm-upload] upload failed: %s", exc)
 
-            # 释放内存
-            del merged, frames
-            gc.collect()
+        # 清理本地压缩文件（磁盘空间有限）
+        try:
+            local_tar.unlink()
+        except OSError:
+            pass
 
-            total_elapsed = time.time() - t0
-            logger.info("[shm-upload] %s: done in %.1fs total (%d rows, %d errors)",
-                        kind, total_elapsed, total_rows, errors)
+        logger.info("[shm-upload] total: %.1fs", time.time() - t0)
 
     def _archive_select_clause(self, kind: str) -> str:
         # Time/UpdateTime 编码对齐 Go converter（deeptrade opt_parquet_writer）：
