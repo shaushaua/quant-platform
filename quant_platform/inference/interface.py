@@ -437,6 +437,7 @@ def positions_to_orders(
             broker_map = pd.Series(
                 pos["last_price"].astype(float).values, index=pos_c6
             ).dropna()
+            broker_map = broker_map[broker_map > 0].groupby(level=0).first()
             prices = prices.where(prices > 0, code6.map(broker_map).fillna(0.0))
     # Source 3 (fallback, opt-in): daily_basic_df yesterday close.
     # Enabled via OPEN_POSITION_FALLBACK_CLOSE=1 — for dry-run testing before
@@ -470,17 +471,22 @@ def positions_to_orders(
         logger.warning(
             "positions_to_orders: dropped %d rows with no realtime price "
             "(check portfolio_context.meta['latest_prices'])", dropped)
+    # 保存价格过滤前的原始目标 code 集合。后面 exit_codes 判断"持仓不在目标列表"
+    # 时必须用这个原始集合——否则一只"模型选了但暂时没 tick 价格"的持仓会被
+    # 误判为"不在目标列表"，生成错误的清仓卖单。
+    original_target_codes = set(df["_code6"].astype(str))
     df = df[df["_price"] > 0]
-    if df.empty:
-        return pd.DataFrame()
+    # 不在 df 为空时直接 return——目标票全部缺实时价时，仍需清掉不在目标列表的
+    # 旧持仓（exit rows）。下面先处理清仓，再判断 df 是否为空。
 
     # ── target vs delta weight ─────────────────────────────────────
     # Default: delta against current holdings so rebalancing doesn't
     # double-buy existing positions. Inference `position` is the TARGET
     # weight; current_weight is computed from broker positions; trade the
     # delta.
-    df["_position_num"] = pd.to_numeric(df["position"], errors="coerce").fillna(0.0)
-    df["_weight"] = df["_position_num"]  # target weight, signed
+    if not df.empty:
+        df["_position_num"] = pd.to_numeric(df["position"], errors="coerce").fillna(0.0)
+        df["_weight"] = df["_position_num"]  # target weight, signed
     df["_current_weight"] = 0.0  # default; overwritten if delta resolves
 
     positions_df_pos = (
@@ -507,6 +513,7 @@ def positions_to_orders(
     # Build {code6: current_weight}. current_weight uses the same price
     # source (meta latest_prices preferred, broker last_price fallback)
     # so the comparison is consistent with the order price.
+    price_map_6: dict = {}  # code6 → latest tick price (may stay empty)
     vol_col = None
     if use_delta and has_positions:
         pos = positions_df_pos
@@ -553,6 +560,69 @@ def positions_to_orders(
             df["_current_weight"] = (
                 df["_code6"].map(current_weight).fillna(0.0)
             )
+
+            # ── liquidate holdings not in target list ──────────────────
+            # 持仓里有但目标列表里没有的票（模型不再看好 / 被剔除），目标权重=0，
+            # 应该全卖。如果不补这些清仓单，rebalance 会因为只卖了一点减仓单，
+            # 释放不出足够资金去买目标列表里的新票，导致买单因资金不足被网关拒。
+            #
+            # 用 original_target_codes（价格过滤前的完整目标集合）判断，
+            # 不是过滤后的 df["_code6"]——避免"模型选了但暂时没 tick 价格"的
+            # 持仓被误判为清仓目标。
+            held_codes = set(current_weight.index)
+            exit_codes = held_codes - original_target_codes
+            if exit_codes:
+                exit_rows = []
+                # 从持仓表取这些票的可用量、价格（用于卖单定价）
+                pos_indexed = pos.set_index(pos_c6)
+                for code6 in sorted(exit_codes):
+                    if code6 not in pos_indexed.index:
+                        continue
+                    pos_rows = pos_indexed.loc[[code6]]
+                    # 可用量：聚合同一 code 的多行持仓（可能有多条记录），取总和。
+                    # 卖单价：从多行里选第一个有效价格。
+                    if "available_qty" in pos_rows.columns:
+                        avail_vol = float(pd.to_numeric(
+                            pos_rows["available_qty"], errors="coerce"
+                        ).fillna(0).sum())
+                    elif vol_col is not None:
+                        avail_vol = float(pd.to_numeric(
+                            pos_rows[vol_col], errors="coerce"
+                        ).fillna(0).sum())
+                    else:
+                        avail_vol = 0.0
+                    # 卖单价：优先用最新行情价（和买单一致），fallback broker last_price
+                    sell_price = price_map_6.get(code6, 0.0) if price_map_6 else 0.0
+                    if sell_price <= 0 and "last_price" in pos_rows.columns:
+                        # 从多行里选第一个 >0 的价格
+                        for lp in pos_rows["last_price"]:
+                            try:
+                                lp_f = float(lp)
+                            except (TypeError, ValueError):
+                                continue
+                            if lp_f > 0 and lp_f == lp_f:
+                                sell_price = lp_f
+                                break
+                    if avail_vol <= 0 or sell_price <= 0:
+                        continue
+                    exit_rows.append({
+                        "code": code6,
+                        "_code6": code6,
+                        "_price": float(sell_price),
+                        "_position_num": 0.0,        # 目标权重 = 0（清仓）
+                        "_weight": 0.0,
+                        "_current_weight": float(current_weight.loc[code6]),
+                    })
+                if exit_rows:
+                    exit_df = pd.DataFrame(exit_rows)
+                    logger.info(
+                        "positions_to_orders: liquidating %d holdings not in "
+                        "target list (target_weight=0)", len(exit_rows)
+                    )
+                    df = pd.concat([df, exit_df], ignore_index=True)
+
+    if df.empty:
+        return pd.DataFrame()
 
     # delta_weight: + → buy, − → sell
     df["_delta_weight"] = df["_weight"] - df["_current_weight"]

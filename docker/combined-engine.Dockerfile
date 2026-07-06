@@ -24,8 +24,9 @@ LABEL description="Native combined engine: feeder_client + C++ MDL collector + P
 WORKDIR /app
 
 # jemalloc is installed in this runtime image for the native collector and Python engine.
+# zstd: SHM raw archive compression (50GB mmap → tar.zst, 比 gzip 快 5-10x).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libjemalloc2 \
+    && apt-get install -y --no-install-recommends libjemalloc2 zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install MDL Linux client (feeder_client sidecar) from local vendor cache.
@@ -53,9 +54,15 @@ COPY quant_platform/ ./quant_platform/
 # lightgbm/xgboost: model artifacts deserialization (tree_model_inference)
 # cvxpy: position optimizer inside calc_predict_tree_model.so (USE_OPTIMIZER=True)
 # polars: required by .so for lazy frame operations
+#
+# 拆成两层：重依赖（xgboost 223MB / lightgbm / cvxpy）单独缓存，
+# 避免改其他包时重下。xgboost 下载+解压 peak ~700MB 临时空间。
+RUN pip install --no-cache-dir \
+    "xgboost>=1.7,<3" "lightgbm>=4.0,<5" "cvxpy>=1.4,<2"
+
 RUN pip install --no-cache-dir \
     "joblib>=1.3,<2" "cloudpickle>=2.2,<4" "scikit-learn>=1.3,<2" "paramiko>=3.0,<4" \
-    "lightgbm>=4.0,<5" "xgboost>=1.7,<3" "cvxpy>=1.4,<2" "polars>=1.0,<2"
+    "polars>=1.0,<2"
 
 ENV LD_LIBRARY_PATH=/opt/native-mdl-collector/lib:/opt/mdl-client
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2

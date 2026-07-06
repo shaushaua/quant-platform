@@ -246,7 +246,7 @@ spec:
               memory: 48Gi
             limits:
               cpu: "32"
-              memory: 90Gi
+              memory: 88Gi
               # Override in overlays: k8s/overlays/dev or k8s/overlays/prod
       volumes:
         - name: factor-output

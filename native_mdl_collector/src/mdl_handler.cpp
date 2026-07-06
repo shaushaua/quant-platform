@@ -105,6 +105,24 @@ void MdlHandler::OnMDLSHL2Message(const datayes::mdl::MDLMessage* msg) {
                 _sample_push_delay("deal", result.code, result.deal.row[deal::Time], recv_sec);
             }
         }
+    } else if (mid == mdl_shl2_msg::ATPMarketData::MessageID) {
+        // SH 盘后定价行情 (MID=16) → tick
+        auto result = parse_sh_atp_tick(body, body_size, static_cast<std::int64_t>(seq), recv_sec);
+        if (result.valid) {
+            writer_.append_tick(result.code, result.row);
+            _sample_internal_latency("tick", recv_sec);
+            tick_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("tick", result.code, result.row[tick::Time], recv_sec);
+        }
+    } else if (mid == mdl_shl2_msg::ATPTransaction::MessageID) {
+        // SH 盘后定价逐笔成交 (MID=17) → deal
+        auto result = parse_sh_atp_deal(body, body_size, recv_sec);
+        if (result.valid) {
+            writer_.append_deal(result.code, result.row);
+            _sample_internal_latency("deal", recv_sec);
+            deal_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("deal", result.code, result.row[deal::Time], recv_sec);
+        }
     }
 
     msg_count_.fetch_add(1, std::memory_order_relaxed);
@@ -152,6 +170,15 @@ void MdlHandler::OnMDLSZL2Message(const datayes::mdl::MDLMessage* msg) {
             _sample_internal_latency("deal", recv_sec);
             deal_count_.fetch_add(1, std::memory_order_relaxed);
             _sample_push_delay("deal", result.code, result.row[deal::Time], recv_sec);
+        }
+    } else if (mid == mdl_szl2_msg::Snapshot300611_v2::MessageID) {
+        // SZ 盘后定价行情 (MID=31) → tick
+        auto result = parse_sz_post_close_tick(body, body_size, static_cast<std::int64_t>(seq), recv_sec);
+        if (result.valid) {
+            writer_.append_tick(result.code, result.row);
+            _sample_internal_latency("tick", recv_sec);
+            tick_count_.fetch_add(1, std::memory_order_relaxed);
+            _sample_push_delay("tick", result.code, result.row[tick::Time], recv_sec);
         }
     }
 

@@ -113,12 +113,15 @@ int main(int argc, char* argv[]) {
     sub->SetUserName(token.c_str());
     sub->SetMessageEncoding(MDLEID_MKTPRO);
 
-    // Subscribe to the 5 message types
+    // Subscribe to message types
     sub->SubcribeMessage<mdl_shl2_msg::SHL2MarketData>();     // MID=4, SH tick
     sub->SubcribeMessage<mdl_shl2_msg::NGTSTick>();           // MID=24, SH NGTS (order+deal)
+    sub->SubcribeMessage<mdl_shl2_msg::ATPMarketData>();      // MID=16, SH 盘后定价行情 (tick)
+    sub->SubcribeMessage<mdl_shl2_msg::ATPTransaction>();     // MID=17, SH 盘后定价逐笔成交 (deal)
     sub->SubcribeMessage<mdl_szl2_msg::Snapshot300111_v2>();  // MID=28, SZ tick
     sub->SubcribeMessage<mdl_szl2_msg::Order300192_v2>();     // MID=33, SZ order
     sub->SubcribeMessage<mdl_szl2_msg::Transaction300191_v2>();// MID=36, SZ deal
+    sub->SubcribeMessage<mdl_szl2_msg::Snapshot300611_v2>();  // MID=31, SZ 盘后定价行情 (tick)
 
     std::cerr << "[main] connecting to " << server << "...\n";
 

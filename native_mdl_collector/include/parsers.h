@@ -48,4 +48,20 @@ ParseResult parse_sz_order(const void* msg_data, std::size_t msg_len,
 ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len,
                           double recv_sec);
 
+// ── Post-close (盘后定价交易) parsers ──────────────────────────────
+
+// SH 盘后定价行情 (MID=16, ATPMarketData) → tick
+// 字段比 SHL2MarketData 少（无 OpenPrice/HighPrice/LowPrice/涨跌停/IOPV），缺的列填 0
+ParseResult parse_sh_atp_tick(const void* msg_data, std::size_t msg_len,
+                              std::int64_t seq_id, double recv_sec);
+
+// SH 盘后定价逐笔成交 (MID=17, ATPTransaction) → deal
+ParseResult parse_sh_atp_deal(const void* msg_data, std::size_t msg_len,
+                              double recv_sec);
+
+// SZ 盘后定价行情 (MID=31, Snapshot300611_v2) → tick
+// 字段比 Snapshot300111_v2 少（无 LastPrice/OpenPrice/HighPrice/涨跌停/IOPV/Avg），缺的列填 0
+ParseResult parse_sz_post_close_tick(const void* msg_data, std::size_t msg_len,
+                                     std::int64_t seq_id, double recv_sec);
+
 } // namespace quant::native_mdl

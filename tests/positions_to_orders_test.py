@@ -84,3 +84,89 @@ def test_positions_to_orders_sell_clamps_to_available_volume():
     assert len(orders) == 1
     assert orders.iloc[0]["side"] == "sell"
     assert orders.iloc[0]["volume"] == 300
+
+
+def test_positions_to_orders_missing_price_without_exit_returns_empty():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{
+            "total_asset": 100_000.0,
+            "available_cash": 100_000.0,
+            "market_value": 0.0,
+        }]),
+        positions=pd.DataFrame(),
+        meta={"latest_prices": {}},
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.10}]),
+        ctx,
+    )
+
+    assert orders.empty
+
+
+def test_positions_to_orders_missing_price_target_holding_is_not_liquidated():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{
+            "total_asset": 100_000.0,
+            "available_cash": 1_000.0,
+            "market_value": 99_000.0,
+        }]),
+        positions=pd.DataFrame([{
+            "code": "600000.SH",
+            "current_volume": 1000,
+            "available_volume": 1000,
+            "last_price": 10.0,
+        }]),
+        meta={"latest_prices": {}},
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "600000", "position": 0.10}]),
+        ctx,
+    )
+
+    assert orders.empty
+
+
+def test_positions_to_orders_missing_target_prices_still_liquidates_exits():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{
+            "total_asset": 100_000.0,
+            "available_cash": 1_000.0,
+            "market_value": 99_000.0,
+        }]),
+        positions=pd.DataFrame([
+            {
+                "code": "600000.SH",
+                "current_volume": 500,
+                "available_volume": 200,
+                "last_price": 10.0,
+            },
+            {
+                "code": "600000.SH",
+                "current_volume": 500,
+                "available_volume": 300,
+                "last_price": 10.0,
+            },
+            {
+                "code": "000002.SZ",
+                "current_volume": 100,
+                "available_volume": 100,
+                "last_price": 10.0,
+            },
+        ]),
+        meta={"latest_prices": {}},
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.10}]),
+        ctx,
+    )
+
+    sell_orders = orders[orders["side"] == "sell"].sort_values("code").reset_index(drop=True)
+    assert len(sell_orders) == 2
+    assert sell_orders.iloc[0]["code"] == "000002"
+    assert sell_orders.iloc[0]["volume"] == 100
+    assert sell_orders.iloc[1]["code"] == "600000"
+    assert sell_orders.iloc[1]["volume"] == 500

@@ -208,4 +208,66 @@ ParseResult parse_sz_deal(const void* msg_data, std::size_t msg_len, double recv
     return result;
 }
 
+// ── SZ 盘后定价行情 (MID=31, Snapshot300611_v2) ─────────────────────
+//
+// 深交所盘后固定价格交易行情快照。结构类似 Snapshot300111_v2（6.28），但字段更少：
+//   有:  UpdateTime, ChannelNo, SecurityID, PreCloPrice, TurnNum, Volume,
+//        Turnover, BidPriceLevel(Price+Volume), AskPriceLevel(Price+Volume)
+//   无:  LastPrice, OpenPrice, HighPrice, LowPrice, HighLimitPrice, LowLimitPrice,
+//        IOPV, WeightedAvgBid/OfferPx, TotalBidQty, TotalOfferQty, NumOrders
+// 缺的字段填 0.0。
+ParseResult parse_sz_post_close_tick(const void* msg_data, std::size_t msg_len,
+                                     std::int64_t seq_id, double recv_sec) {
+    ParseResult result;
+    result.kind = DataKind::Tick;
+    result.row.resize(kTickCols, 0.0);
+
+    if (msg_len < sizeof(mdl_szl2_msg::Snapshot300611_v2)) return result;
+    const auto* msg = reinterpret_cast<const mdl_szl2_msg::Snapshot300611_v2*>(msg_data);
+
+    // Code + filter
+    const char* code_raw = msg->SecurityID.c_str();
+    auto code_len = msg->SecurityID.Length;
+    if (!is_stock_or_index_sz(code_raw, code_len)) return result;
+    result.code = format_code(std::string(code_raw, code_len), "XSHE");
+
+    // Time
+    result.row[tick::Time]       = mdl_time_to_seconds(msg->UpdateTime.m_Value);
+    result.row[tick::UpdateTime] = recv_sec;
+
+    // Volume / Turnover / TradeNum
+    result.row[tick::TotalVolume] = static_cast<double>(msg->Volume);
+    result.row[tick::TotalMoney]  = mdl_double_to_f64(msg->Turnover.m_Value, 4);
+    result.row[tick::TradeNum]    = static_cast<double>(msg->TurnNum);
+
+    // PreClosePrice
+    result.row[tick::PreClosePrice] = mdl_double_to_f64(msg->PreCloPrice.m_Value, 4);
+
+    // CurrentPrice 无（盘后定价行情不推最新价），保持 0.0
+
+    // Channel
+    result.row[tick::Channel] = static_cast<double>(msg->ChannelNo);
+
+    // Bid levels (有 Price + Volume, 无 NumOrders)
+    std::size_t bid_len = msg->BidPriceLevel.Length;
+    for (std::size_t i = 0; i < 10 && i < bid_len; ++i) {
+        const auto& item = *msg->BidPriceLevel[i];
+        result.row[tick::BidVolume1 + i] = static_cast<double>(item.Volume);
+        result.row[tick::BidPrice1  + i] = mdl_double_to_f64(item.Price.m_Value, 6);
+    }
+    // Ask levels
+    std::size_t ask_len = msg->AskPriceLevel.Length;
+    for (std::size_t i = 0; i < 10 && i < ask_len; ++i) {
+        const auto& item = *msg->AskPriceLevel[i];
+        result.row[tick::AskVolume1 + i] = static_cast<double>(item.Volume);
+        result.row[tick::AskPrice1  + i] = mdl_double_to_f64(item.Price.m_Value, 6);
+    }
+
+    // SeqNum
+    result.row[tick::SeqNum] = static_cast<double>(seq_id);
+
+    result.valid = true;
+    return result;
+}
+
 } // namespace quant::native_mdl

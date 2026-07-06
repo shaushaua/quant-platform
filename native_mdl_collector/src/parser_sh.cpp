@@ -202,4 +202,122 @@ NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len, double recv_
     return result;
 }
 
+// ── SH 盘后定价行情 (MID=16, ATPMarketData) ─────────────────────────
+//
+// 科创板/主板盘后固定价格交易行情快照。字段比 SHL2MarketData 少：
+//   有:  UpdateTime, ClosePx, NumTrades, TotalVolumeTrade, TotalValueTrade,
+//        TotalBidQty, TotalOfferQty, BidLevels(只有量/笔数, 无价),
+//        OfferLevels(同)
+//   无:  OpenPrice, HighPrice, LowPrice, HighLimitPrice, LowLimitPrice, IOPV,
+//        WAvgBidPri, WAvgAskPri
+// 缺的字段填 0.0。levels 没有价格，BidPrice/AskPrice 填 0。
+ParseResult parse_sh_atp_tick(const void* msg_data, std::size_t msg_len,
+                              std::int64_t seq_id, double recv_sec) {
+    ParseResult result;
+    result.kind = DataKind::Tick;
+    result.row.resize(kTickCols, 0.0);
+
+    if (msg_len < sizeof(mdl_shl2_msg::ATPMarketData)) return result;
+    const auto* msg = reinterpret_cast<const mdl_shl2_msg::ATPMarketData*>(msg_data);
+
+    // Code + filter
+    const char* code_raw = msg->SecurityID.c_str();
+    auto code_len = msg->SecurityID.Length;
+    if (!is_stock_or_index_sh(code_raw, code_len)) return result;
+    result.code = format_code(std::string(code_raw, code_len), "XSHG");
+
+    // Time
+    result.row[tick::Time]       = mdl_time_to_seconds(msg->UpdateTime.m_Value);
+    result.row[tick::UpdateTime] = recv_sec;
+
+    // Prices (ATP 只有收盘价 ClosePx，填到 CurrentPrice)
+    result.row[tick::CurrentPrice] = mdl_float_to_f64(msg->ClosePx.m_Value, 3);
+
+    // Volume / Turnover
+    result.row[tick::TotalVolume]    = mdl_double_to_f64(msg->TotalVolumeTrade.m_Value, 3);
+    result.row[tick::TotalMoney]     = mdl_double_to_f64(msg->TotalValueTrade.m_Value, 5);
+    result.row[tick::TradeNum]       = static_cast<double>(msg->NumTrades);
+
+    // Total bid/ask volume
+    result.row[tick::TotalBidVolume] = mdl_double_to_f64(msg->TotalBidQty.m_Value, 3);
+    result.row[tick::TotalAskVolume] = mdl_double_to_f64(msg->TotalOfferQty.m_Value, 3);
+
+    // Bid levels (只有量/笔数, 无价格)
+    std::size_t bid_len = msg->BidLevels.Length;
+    for (std::size_t i = 0; i < 10 && i < bid_len; ++i) {
+        const auto& item = *msg->BidLevels[i];
+        result.row[tick::BidVolume1 + i] = mdl_double_to_f64(item.OrderQty.m_Value, 3);
+        result.row[tick::BidNum1    + i] = static_cast<double>(item.NumOrders);
+        // BidPrice 无数据，保持 0.0
+    }
+    // Offer levels
+    std::size_t offer_len = msg->OfferLevels.Length;
+    for (std::size_t i = 0; i < 10 && i < offer_len; ++i) {
+        const auto& item = *msg->OfferLevels[i];
+        result.row[tick::AskVolume1 + i] = mdl_double_to_f64(item.OrderQty.m_Value, 3);
+        result.row[tick::AskNum1    + i] = static_cast<double>(item.NumOrders);
+    }
+
+    // Channel = 0 (SH), SeqNum = header seq
+    result.row[tick::Channel] = 0.0;
+    result.row[tick::SeqNum]  = static_cast<double>(seq_id);
+
+    result.valid = true;
+    return result;
+}
+
+// ── SH 盘后定价逐笔成交 (MID=17, ATPTransaction) ────────────────────
+//
+// 科创板/主板盘后固定价格交易成交记录。字段映射到 deal row (10 列)。
+ParseResult parse_sh_atp_deal(const void* msg_data, std::size_t msg_len,
+                              double recv_sec) {
+    ParseResult result;
+    result.kind = DataKind::Deal;
+    result.row.resize(kDealCols, 0.0);
+
+    if (msg_len < sizeof(mdl_shl2_msg::ATPTransaction)) return result;
+    const auto* msg = reinterpret_cast<const mdl_shl2_msg::ATPTransaction*>(msg_data);
+
+    // Code + filter
+    const char* code_raw = msg->SecurityID.c_str();
+    auto code_len = msg->SecurityID.Length;
+    if (!is_stock_or_index_sh(code_raw, code_len)) return result;
+    result.code = format_code(std::string(code_raw, code_len), "XSHG");
+
+    // Time
+    result.row[deal::Time]       = mdl_time_to_seconds(msg->TradeTime.m_Value);
+    result.row[deal::UpdateTime] = recv_sec;
+
+    // Order IDs
+    result.row[deal::SaleOrderID] = static_cast<double>(msg->TradeSellNo);
+    result.row[deal::BuyOrderID]  = static_cast<double>(msg->TradeBuyNo);
+
+    // Side: TradeBSFlag 'B'→0 buy, 'S'→1 sell
+    {
+        const char* bsf = msg->TradeBSFlag.c_str();
+        double side = 10.0;  // unknown
+        if (msg->TradeBSFlag.Length > 0) {
+            char c = bsf[0];
+            if (c == 'B' || c == 'b') side = 0.0;
+            else if (c == 'S' || c == 's') side = 1.0;
+        }
+        result.row[deal::Side] = side;
+    }
+
+    // Price / Volume / Money
+    double price = mdl_float_to_f64(msg->TradePrice.m_Value, 3);
+    double qty   = mdl_double_to_f64(msg->TradeQty.m_Value, 3);
+    result.row[deal::Price]  = price;
+    result.row[deal::Volume] = qty;
+    double money = mdl_double_to_f64(msg->TradeMoney.m_Value, 5);
+    result.row[deal::Money]  = (money != 0.0) ? money : price * qty;
+
+    // Channel / SeqNum
+    result.row[deal::Channel] = static_cast<double>(msg->TradeChannel);
+    result.row[deal::SeqNum]  = static_cast<double>(msg->TradeIndex);
+
+    result.valid = true;
+    return result;
+}
+
 } // namespace quant::native_mdl

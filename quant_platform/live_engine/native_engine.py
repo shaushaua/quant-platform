@@ -1700,6 +1700,73 @@ class NativeEngine:
             return int(hour), int(minute)
         return int(raw), 0
 
+    def _build_archive_code_map(self) -> Optional["pd.DataFrame"]:
+        """归档用的 code map（TICKER_SYMBOL → SECURITY_ID）。
+
+        优先用 md_security（证券基础信息表，~2万 A 股，新股上市当天就有），
+        不受 daily_basic 开盘前查询不完整的影响。
+
+        fallback 才用 _daily_basic_df（可能缺新股，但聊胜于无）。
+        """
+        # 优先：md_security（MySQL，完整且实时）
+        try:
+            import pymysql
+            conn = pymysql.connect(
+                host=os.environ["MYSQL_HOST"],
+                port=int(os.environ.get("MYSQL_PORT", "23307")),
+                user=os.environ["MYSQL_USER"],
+                password=os.environ["MYSQL_PASSWORD"],
+                database=os.environ.get("MYSQL_DATABASE", "hermes"),
+                connect_timeout=10,
+            )
+            try:
+                with conn.cursor() as cur:
+                    # A 股股票：6 位代码，0/3/6 开头。
+                    # ASSET_CLASS='E' 排除指数(IDX)——同代码可能同时有深交所股票
+                    # 和上交所指数（如 000001: 平安银行[E] vs 上证综指[IDX]），
+                    # MIN(SECURITY_ID) 会取到指数的 ID，导致归档 Code 列写错。
+                    # 带 EXCHANGE_CD 用于 join 时按代码+交易所后缀消歧。
+                    cur.execute(
+                        "SELECT TICKER_SYMBOL, SECURITY_ID, EXCHANGE_CD FROM md_security "
+                        "WHERE ASSET_CLASS = 'E' "
+                        "AND EXCHANGE_CD IN ('XSHG', 'XSHE') "
+                        "AND TICKER_SYMBOL RLIKE '^[036][0-9]{5}'"
+                    )
+                    rows = cur.fetchall()
+            finally:
+                conn.close()
+            if rows:
+                import pandas as pd
+                map_df = pd.DataFrame(rows, columns=["ID_QI", "SECURITY_ID", "EXCHANGE_CD"])
+                map_df["ID_QI"] = map_df["ID_QI"].astype(str).str.zfill(6)
+                logger.info("[native-archive] code map from md_security: %d codes", len(map_df))
+                return map_df
+        except Exception as exc:
+            logger.warning("[native-archive] md_security map failed: %s, fallback to daily_basic", exc)
+
+        # fallback：_daily_basic_df（可能缺新股）
+        if self._daily_basic_df is not None and not self._daily_basic_df.empty:
+            import pandas as pd
+            col = "_ID_QI_PAD" if "_ID_QI_PAD" in self._daily_basic_df.columns else "ID_QI"
+            map_df = self._daily_basic_df[[col, "SECURITY_ID"]].drop_duplicates()
+            map_df = map_df.rename(columns={col: "ID_QI"})
+            map_df["ID_QI"] = map_df["ID_QI"].astype(str).str.zfill(6)
+            # 从代码推断交易所（6 开头=上交所 XSHG，0/3 开头=深交所 XSHE）
+            map_df["EXCHANGE_CD"] = map_df["ID_QI"].str[0].map({"6": "XSHG", "0": "XSHE", "3": "XSHE"}).fillna("XSHG")
+            logger.warning("[native-archive] code map from daily_basic (fallback): %d codes", len(map_df))
+            return map_df
+
+        # 最后兜底：缓存
+        if self._archive_code_map_cache is not None:
+            map_code_col, map_df = self._archive_code_map_cache
+            map_df = map_df.rename(columns={map_code_col: "ID_QI"})
+            if "EXCHANGE_CD" not in map_df.columns:
+                map_df["EXCHANGE_CD"] = map_df["ID_QI"].astype(str).str[0].map({"6": "XSHG", "0": "XSHE", "3": "XSHE"}).fillna("XSHG")
+            logger.warning("[native-archive] code map from cache (last resort): %d codes", len(map_df))
+            return map_df
+
+        return None
+
     def _get_oss_bucket(self):
         import oss2
         auth = oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
@@ -1775,22 +1842,14 @@ class NativeEngine:
 
         map_tmp_path = disk_dir / "tmp_code_map.parquet"
         try:
-            # _ID_QI_PAD is the zero-padded 6-digit code added by _add_code_key
-            # (e.g. "000001"). Using the raw ID_QI column risks losing leading
-            # zeros via `::VARCHAR` when ID_QI is integer-typed, which silently
-            # drops all XSHE (Shenzhen) codes from the archived parquet.
-            if self._daily_basic_df is not None:
-                if "_ID_QI_PAD" in self._daily_basic_df.columns:
-                    map_code_col = "_ID_QI_PAD"
-                    map_df = self._daily_basic_df[["_ID_QI_PAD", "SECURITY_ID"]].drop_duplicates()
-                else:
-                    map_code_col = "ID_QI"
-                    map_df = self._daily_basic_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
-                self._archive_code_map_cache = (map_code_col, map_df.copy())
-            elif self._archive_code_map_cache is not None:
-                map_code_col, map_df = self._archive_code_map_cache
-            else:
-                raise RuntimeError("daily_basic_df already released and code map cache is empty")
+            # 归档 code map 优先用 md_security（证券基础信息表，新股上市当天就有，
+            # 不受 daily_basic 开盘前查询不完整的影响）。fallback 才用 _daily_basic_df。
+            map_df = self._build_archive_code_map()
+            if map_df is None or map_df.empty:
+                raise RuntimeError("code map empty (md_security and daily_basic both failed)")
+            # md_security 的列名是 ID_QI/SECURITY_ID，统一列名给后续 JOIN 用
+            map_code_col = "ID_QI"
+            self._archive_code_map_cache = (map_code_col, map_df.copy())
             map_df.to_parquet(map_tmp_path, index=False)
         except Exception as exc:
             logger.error("[native-archive] code map write failed: %s", exc)
@@ -1846,6 +1905,7 @@ class NativeEngine:
                             FROM read_parquet('{chunk_dir}/*.parquet') x
                             JOIN read_parquet('{map_tmp_path}') m
                               ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                              AND regexp_extract(x.Code, '\\.([A-Z]+)$', 1) = m.EXCHANGE_CD::VARCHAR
                         ),
                         ranked AS (
                             SELECT
@@ -2059,14 +2119,26 @@ class NativeEngine:
                 local_out.unlink(missing_ok=True)
                 return False
         else:
-            # 无 zstd：fallback 用 tarfile + gzip 内置压缩
-            logger.warning("[shm-upload] zstd not found, fallback to gzip")
+            # 无 zstd：fallback 用系统 gzip 管道（C 实现，比 Python tarfile w|gz 快
+            # 3-5x）。compresslevel=1 优先速度（ratio 略差但 mmap 二进制已经很有规律）。
+            logger.warning("[shm-upload] zstd not found, fallback to system gzip")
+            gz_proc = subprocess.Popen(
+                ["gzip", "-1", "-c"],
+                stdin=subprocess.PIPE,
+                stdout=open(str(local_out), "wb"),
+            )
             try:
-                with tarfile.open(str(local_out), "w|gz") as tar:
+                with tarfile.open(fileobj=gz_proc.stdin, mode="w|") as tar:
                     for fpath, eff_size in pack_list:
                         self._add_shm_to_tar(tar, fpath, eff_size)
+                gz_proc.stdin.close()
+                gz_proc.stdout.close() if gz_proc.stdout else None
+                rc = gz_proc.wait(timeout=3600)
+                if rc != 0:
+                    raise RuntimeError(f"gzip exited {rc}")
             except Exception as exc:
-                logger.error("[shm-upload] tar|gz failed: %s", exc)
+                logger.error("[shm-upload] tar|gzip failed: %s", exc)
+                gz_proc.kill()
                 local_out.unlink(missing_ok=True)
                 return False
 
@@ -2136,6 +2208,10 @@ class NativeEngine:
         #     因为偏移量格式影响下游读取，且因子计算不依赖 UpdateTime。
         # 28800000000 = 28800 秒 × 1e6 微秒
         _TIME_UTC = "(epoch_us(x.Time) - 28800000000)"
+        # 通联对"无价格限制"档位用 sentinel（999999999.0 等），×100 cast INT32 时
+        # 溢出（10^11 > 2.1*10^9），导致整个 upload 失败。LEAST clip 到 INT32_MAX。
+        # tick/order/deal 三类都可能有 sentinel，统一用 _PRICE_CLIP。
+        _PRICE_CLIP = "LEAST(FLOOR(x.Price * 100 + 0.5), 2147483647)::INTEGER AS Price"
         if kind == "order":
             exprs = [
                 "m.SECURITY_ID::INTEGER AS Code",
@@ -2143,7 +2219,7 @@ class NativeEngine:
                 "epoch_us(x.UpdateTime) AS UpdateTime",
                 "x.OrderID::INTEGER AS OrderID",
                 "x.Side::TINYINT AS Side",
-                "FLOOR(x.Price * 100 + 0.5)::INTEGER AS Price",
+                _PRICE_CLIP,
                 "x.Volume::BIGINT AS Volume",
                 "x.OrderType::TINYINT AS OrderType",
                 "x.SeqNum::INTEGER AS SeqNum",
@@ -2156,7 +2232,7 @@ class NativeEngine:
                 "x.SaleOrderID::BIGINT AS SaleOrderID",
                 "x.BuyOrderID::BIGINT AS BuyOrderID",
                 "x.Side::TINYINT AS Side",
-                "FLOOR(x.Price * 100 + 0.5)::INTEGER AS Price",
+                _PRICE_CLIP,
                 "x.Volume::BIGINT AS Volume",
                 "x.SeqNum::INTEGER AS SeqNum",
             ]
@@ -2212,6 +2288,7 @@ class NativeEngine:
                     FROM read_parquet('{chunk_dir}/*.parquet') x
                     JOIN read_parquet('{map_tmp_path}') m
                       ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                      AND regexp_extract(x.Code, '\\.([A-Z]+)$', 1) = m.EXCHANGE_CD::VARCHAR
                 ),
                 grouped AS (
                     SELECT Code, SeqNum, COUNT(*) AS n
@@ -2281,6 +2358,7 @@ class NativeEngine:
                 FROM read_parquet('{chunk_dir}/*.parquet') x
                 JOIN read_parquet('{map_tmp_path}') m
                   ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                  AND regexp_extract(x.Code, '\\.([A-Z]+)$', 1) = m.EXCHANGE_CD::VARCHAR
             ),
             src AS (
                 SELECT Code, SeqNum, Time, UpdateTime
@@ -2727,11 +2805,14 @@ class NativeEngine:
                     logger.warning("[open_position] cache unlink failed %s: %s", p, exc)
 
     def _refresh_daily_basic_upload(self) -> None:
-        """盘后 15:30 trigger: 重新生成并上传 T-0 daily_basic + composition 到 OSS。
+        """盘后 15:30 trigger: 重新生成并上传 T-0 和 T-1 daily_basic + composition 到 OSS。
 
         MySQL mkt_equd 在 15:07 左右写入当日行情，pod 启动 8:50 拉时 T-0 还空。
-        此 trigger 在收盘后补刷 T-0，让次日 pod 启动 OSS path 能直接命中
+        此 trigger 在收盘后补刷 T-0 和 T-1，让次日 pod 启动 OSS path 能直接命中
         完整 market_count 天数据（无需 MySQL fallback / T-1 latest_date 降级）。
+
+        T-1 也要刷：开盘前查 T-1 时通联可能还没补全（5283 行），收盘后补全到
+        5607 行。次日推理 fallback 用 T-1 时需要完整版。
         """
         td = self.trading_day
         if not td:
@@ -2754,15 +2835,34 @@ class NativeEngine:
                 except Exception as exc:
                     logger.warning("[daily_basic_refresh] DatayesClient init failed: %s", exc)
             try:
-                ok = refresh_daily_data(td, oss, mysql, datayes, force=False)
+                # 刷新 T-0（当天）
+                ok_today = refresh_daily_data(td, oss, mysql, datayes, force=True)
+                logger.info("[daily_basic_refresh] T-0 %s ok=%s", td, ok_today)
+
+                # 刷新 T-1（前一交易日）——开盘前查 T-1 时可能不完整，收盘后补全
+                try:
+                    mysql._ensure_connection()
+                    with mysql._conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT MAX(TRADE_DATE) FROM mkt_equd WHERE TRADE_DATE < %s",
+                            (td.replace("-", ""),),
+                        )
+                        row = cur.fetchone()
+                    prev_td = str(row[0]).replace("-", "") if row and row[0] else None
+                    if prev_td:
+                        ok_prev = refresh_daily_data(prev_td, oss, mysql, datayes, force=True)
+                        logger.info("[daily_basic_refresh] T-1 %s ok=%s", prev_td, ok_prev)
+                except Exception as exc:
+                    logger.warning("[daily_basic_refresh] T-1 refresh failed: %s", exc)
+
                 try:
                     from quant_platform.inference.tree_model_inference import clear_daily_basic_cache
                     clear_daily_basic_cache()
                     logger.info("[daily_basic_refresh] tree_model daily_basic cache cleared")
                 except Exception:
                     pass
-                logger.info("[daily_basic_refresh] trading_day=%s ok=%s elapsed=%.1fs",
-                            td, ok, time.time() - t0)
+                logger.info("[daily_basic_refresh] trading_day=%s elapsed=%.1fs",
+                            td, time.time() - t0)
             finally:
                 try:
                     mysql.close()
@@ -3765,8 +3865,27 @@ def _push_to_order_gateway_http(orders_df: pd.DataFrame, date_str: str, end_time
         if response and not response.get("ok", False):
             logger.error("[order-gateway] push rejected: %s", response)
             return
-        logger.info("[order-gateway] pushed %d rows to %s file=%s",
-                    len(orders), url, response.get("order_file", "") if response else "")
+        # 网关接受了请求，但内部可能因资金不足/字段非法跳过了部分订单。
+        # 网关返回 rows（实际写 DBF 行数）、skipped（跳过原因）、record_failed
+        # （RecordOrder 失败明细）。这里完整记录，避免"看似全推成功"的假象。
+        dbf_rows = response.get("rows", len(orders)) if response else len(orders)
+        skipped = response.get("skipped", []) if response else []
+        record_failed = response.get("record_failed", []) if response else []
+        logger.info("[order-gateway] pushed %d rows (sent=%d, dbf=%d) to %s file=%s",
+                    len(orders), len(orders), dbf_rows, url,
+                    response.get("order_file", "") if response else "")
+        if skipped:
+            logger.warning("[order-gateway] %d orders skipped by gateway: %s",
+                           len(skipped), skipped)
+        if record_failed:
+            logger.error("[order-gateway] %d orders failed RecordOrder: %s",
+                         len(record_failed), record_failed)
+        if skipped or record_failed:
+            sent = dbf_rows
+            dropped = len(orders) - sent
+            logger.error("[order-gateway] %d/%d orders NOT written to DBF "
+                         "(check cash validation / position availability)",
+                         dropped, len(orders))
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", errors="replace")
         logger.error("[order-gateway] HTTP %s: %s", exc.code, body_text[:500])
