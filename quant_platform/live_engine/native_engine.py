@@ -3046,6 +3046,40 @@ class NativeEngine:
         deal_paths = {code: files_by_code[code].get(KIND_DEAL, "") for code in all_codes}
         order_paths = {code: files_by_code[code].get(KIND_ORDER, "") for code in all_codes}
 
+        # ── 预热 SHM 到 page cache ──────────────────────────────────
+        # 44 workers 同时 mmap 读 SHM 会触发 page fault 风暴 + mmap_sem 锁竞争，
+        # 导致 pool 等待时间从理论 ~300ms 膨胀到 13s。主进程提前用 posix_fadvise
+        # (WILLNEED) 预读有效行区域，worker 的 view_rows 变成 cache hit。
+        # 注意：SHM 是 sparse 文件，虚拟大小 TB 级但有效数据只有 ~23GB，
+        # 必须用 _shm_effective_size 限制预读范围，否则 fadvise 整个文件会卡死。
+        if os.environ.get("FACTOR_SHM_PREHEAT", "1") == "1" and all_codes:
+            preheat_t0 = time.perf_counter()
+            preheat_count = 0
+            _has_fadvise = hasattr(os, "posix_fadvise")
+            for paths in (tick_paths, deal_paths, order_paths):
+                for code in all_codes:
+                    p = paths.get(code, "")
+                    if p and os.path.exists(p):
+                        try:
+                            eff_size = self._shm_effective_size(Path(p))
+                            if eff_size <= 0:
+                                continue
+                            fd = os.open(p, os.O_RDONLY)
+                            try:
+                                if _has_fadvise:
+                                    os.posix_fadvise(fd, 0, eff_size, os.POSIX_FADV_WILLNEED)
+                                else:
+                                    os.read(fd, min(eff_size, 4096))
+                                preheat_count += 1
+                            finally:
+                                os.close(fd)
+                        except OSError:
+                            pass
+            preheat_ms = (time.perf_counter() - preheat_t0) * 1000
+            if preheat_ms > 50:
+                logger.info("[combined] SHM preheat: %d files fadvise, %.0fms",
+                            preheat_count, preheat_ms)
+
         results = []
         errors = 0
         pool_t0 = time.perf_counter()
@@ -3066,9 +3100,17 @@ class NativeEngine:
         factor_ms_total = 0.0
         if self._pool is not None:
             try:
+                _diag_t0 = time.perf_counter()
+                _diag_batches = 0
                 for batch_results, batch_errors, build_ms, factor_ms, err in self._pool.imap_unordered(
                     _compute_code_batch_shm, tasks, chunksize=1,
                 ):
+                    _diag_batches += 1
+                    if _diag_batches <= 3 or _diag_batches >= len(tasks) - 2:
+                        logger.info("[diag] batch %d/%d returned at %.0fms (build=%.0fms factor=%.0fms)",
+                                    _diag_batches, len(tasks),
+                                    (time.perf_counter() - _diag_t0) * 1000,
+                                    build_ms, factor_ms)
                     build_ms_total += build_ms
                     factor_ms_total += factor_ms
                     if err:

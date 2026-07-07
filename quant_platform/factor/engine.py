@@ -1261,7 +1261,12 @@ def _normalize_batch_results(code: str, end_times: list, value) -> Optional[dict
 
 
 def _group_flat_rows_by_code(codes: list, end_times: list, rows: list) -> Optional[dict]:
-    """Group flat row output from a batched strategy into worker result shape."""
+    """Group flat row output from a batched strategy into worker result shape.
+
+    集合竞价期间（9:15-9:25）部分股票还没有成交数据，factor 可能只返回部分 code
+    的结果。允许部分 code 缺失（填 None），而不是直接 return None 触发
+    "protocol mismatch: got list"。下游会跳过 None 的 code，不影响其他 code。
+    """
     if len(end_times) != 1 or not rows:
         return None
 
@@ -1269,16 +1274,18 @@ def _group_flat_rows_by_code(codes: list, end_times: list, rows: list) -> Option
     grouped = {code: [] for code in codes}
     for row in rows:
         if not isinstance(row, dict):
-            return None
+            # 非 dict 行：跳过这条，不整体失败
+            continue
         row_code = _row_code_key(row)
         code = wanted.get(row_code)
-        if code is None:
-            return None
-        grouped[code].append(row)
+        if code is not None:
+            grouped[code].append(row)
 
-    if any(not items for items in grouped.values()):
-        return None
-    return {code: {end_times[0]: items} for code, items in grouped.items()}
+    # 允许部分 code 缺失（集合竞价期间正常现象）
+    result = {}
+    for code, items in grouped.items():
+        result[code] = {end_times[0]: items if items else None}
+    return result
 
 
 def _row_code_key(row: dict) -> str:

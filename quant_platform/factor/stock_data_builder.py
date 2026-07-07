@@ -17,6 +17,7 @@
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -132,14 +133,30 @@ def _filter_daily_for_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
     """从多日 daily_basic 中过滤出单只股票的数据。
 
     支持 _ID_QI_PAD（预计算索引列）、ID_QI、TICKER_SYMBOL 等列名。
+    首次调用时按 _ID_QI_PAD 预分组并缓存到 df._group_cache，后续 O(1) 查找。
+    缓存直接 attach 在 DataFrame 对象上，避免 id() 复用风险。
     """
     if df.empty:
         return df
     key = code.split(".")[0].zfill(6)
 
     if "_ID_QI_PAD" in df.columns:
-        result = df[df["_ID_QI_PAD"] == key].reset_index(drop=True)
-        return result.drop(columns=["_ID_QI_PAD"], errors="ignore")
+        # 缓存直接 attach 在 df 上（不用 id(df)，避免 GC 后 id 复用）
+        groups = getattr(df, "_group_cache", None)
+        if groups is None:
+            t0 = time.perf_counter()
+            groups = {k: g.drop(columns=["_ID_QI_PAD"], errors="ignore").reset_index(drop=True)
+                      for k, g in df.groupby("_ID_QI_PAD", sort=False)}
+            try:
+                df._group_cache = groups  # type: ignore[attr-defined]
+            except Exception:
+                pass  # 某些 DataFrame 子类不允许设属性
+            logger.debug("[builder] daily_basic grouped: %d codes in %.0fms",
+                         len(groups), (time.perf_counter() - t0) * 1000)
+        result = groups.get(key)
+        if result is not None:
+            return result
+        return df.drop(columns=["_ID_QI_PAD"], errors="ignore").iloc[:0].reset_index(drop=True)
 
     for col in ("ID_QI", "TICKER_SYMBOL", "code", "Code", "stock_code"):
         if col in df.columns:
