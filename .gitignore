@@ -47,3 +47,7 @@ native_mdl_collector/build/
 .vscode/
 *.swp
 *.swo
+20260708_093000_positions.csv
+20260708_open_position_targets.consumed.csv
+*_positions.csv
+*_targets.consumed.csv

@@ -126,6 +126,7 @@ def log_duplicate_stats(con, kind: str, chunk_dir: Path, map_tmp: Path, map_code
             FROM read_parquet('{chunk_dir}/*.parquet') x
             JOIN read_parquet('{map_tmp}') m
               ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+             AND regexp_extract(x.Code, '\\.([A-Z]+)$', 1) = m.EXCHANGE_CD::VARCHAR
         ),
         grouped AS (
             SELECT Code, SeqNum, COUNT(*) AS n
@@ -156,10 +157,11 @@ def validate_archive_times(con, kind: str, chunk_dir: Path, map_tmp: Path, map_c
                 x.SeqNum::INTEGER AS SeqNum,
                 epoch_us(x.Time) AS Time,
                 epoch_us(x.UpdateTime) AS UpdateTime
-            FROM read_parquet('{chunk_dir}/*.parquet') x
-            JOIN read_parquet('{map_tmp}') m
-              ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
-        ),
+                FROM read_parquet('{chunk_dir}/*.parquet') x
+                JOIN read_parquet('{map_tmp}') m
+                  ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                 AND regexp_extract(x.Code, '\\.([A-Z]+)$', 1) = m.EXCHANGE_CD::VARCHAR
+            ),
         src AS (
             SELECT Code, SeqNum, Time, UpdateTime
             FROM (
@@ -283,14 +285,20 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
         log.error("[%s] daily_basic not found, cannot map code", kind)
         return False
 
-    # 决定 map_code_col：优先用零填充字符串
+    # 统一成 6 位证券代码，和生产归档路径的 md_security map 口径一致。
     map_code_col = "ID_QI"
     if "_ID_QI_PAD" in db_df.columns:
-        map_code_col = "_ID_QI_PAD"
-    map_df = db_df[["_ID_QI_PAD"] if map_code_col == "_ID_QI_PAD" else ["ID_QI", "SECURITY_ID"]].drop_duplicates()
-    if map_code_col == "ID_QI":
+        map_df = db_df[["_ID_QI_PAD", "SECURITY_ID"]].drop_duplicates()
+        map_df = map_df.rename(columns={"_ID_QI_PAD": "ID_QI"})
+    else:
         map_df = db_df[["ID_QI", "SECURITY_ID"]].drop_duplicates()
-        map_df["ID_QI"] = map_df["ID_QI"].astype(str).str.strip()
+    map_df["ID_QI"] = map_df["ID_QI"].astype(str).str.split(".").str[0].str.zfill(6)
+    if "EXCHANGE_CD" not in map_df.columns:
+        map_df["EXCHANGE_CD"] = (
+            map_df["ID_QI"].astype(str).str[0]
+            .map({"6": "XSHG", "0": "XSHE", "3": "XSHE"})
+            .fillna("XSHG")
+        )
 
     map_tmp = disk_dir / f"tmp_code_map_{kind}.parquet"
     map_df.to_parquet(map_tmp, index=False)
@@ -300,12 +308,20 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
     tmp_file.unlink(missing_ok=True)
 
     import duckdb
-    con = duckdb.connect(":memory:")
+    con = None
     try:
-        con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '32GB')}'")
+        con = duckdb.connect(":memory:")
+        duckdb_tmp = disk_dir / "duckdb_tmp"
+        duckdb_tmp.mkdir(parents=True, exist_ok=True)
+        con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '8GB')}'")
+        con.execute(f"SET threads={int(os.environ.get('ARCHIVE_DUCKDB_THREADS', '4'))}")
+        con.execute("SET preserve_insertion_order=false")
+        con.execute(f"SET temp_directory='{str(duckdb_tmp).replace(chr(39), chr(39) + chr(39))}'")
+        con.execute(f"SET max_temp_directory_size='{os.environ.get('ARCHIVE_DUCKDB_MAX_TEMP', '200GB')}'")
         log.info("[%s] merging %d chunks (%.2f GB)...", kind, len(chunks),
                  sum(c.stat().st_size for c in chunks) / 1024**3)
-        log_duplicate_stats(con, kind, chunk_dir, map_tmp, map_code_col)
+        if os.environ.get("ARCHIVE_DUPLICATE_STATS_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+            log_duplicate_stats(con, kind, chunk_dir, map_tmp, map_code_col)
         out_cols = ", ".join(output_columns(kind))
         con.execute(f"""
             COPY (
@@ -315,6 +331,7 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
                     FROM read_parquet('{chunk_dir}/*.parquet') x
                     JOIN read_parquet('{map_tmp}') m
                       ON regexp_extract(x.Code, '^\\d+') = m.{map_code_col}::VARCHAR
+                     AND regexp_extract(x.Code, '\\.([A-Z]+)$', 1) = m.EXCHANGE_CD::VARCHAR
                 ),
                 ranked AS (
                     SELECT
@@ -334,16 +351,24 @@ def upload_kind(bucket, date_str: str, kind: str, disk_dir: Path,
                 ORDER BY Code, SeqNum
             ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
         """)
-        if not validate_archive_times(con, kind, chunk_dir, map_tmp, map_code_col, tmp_file):
+        if (
+            os.environ.get("ARCHIVE_VALIDATE_TIMES_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+            and not validate_archive_times(con, kind, chunk_dir, map_tmp, map_code_col, tmp_file)
+        ):
             tmp_file.unlink(missing_ok=True)
             map_tmp.unlink(missing_ok=True)
             return False
-        con.close()
     except Exception as exc:
         log.error("[%s] duckdb merge failed: %s", kind, exc, exc_info=True)
         tmp_file.unlink(missing_ok=True)
         map_tmp.unlink(missing_ok=True)
         return False
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
     size_mb = tmp_file.stat().st_size / 1024 / 1024
     log.info("[%s] merged → %s (%.1f MB), uploading...", kind, tmp_file, size_mb)
@@ -388,7 +413,7 @@ def main():
         log.error("archive dir not exist: %s", disk_dir)
         sys.exit(2)
 
-    kinds = [args.kind] if args.kind else ["tick", "order", "deal"]
+    kinds = [args.kind] if args.kind else ["order", "deal", "tick"]
     skip = not args.no_skip_existing
 
     try:

@@ -129,6 +129,36 @@ def _maybe_empty_hist(
     return dfs or []
 
 
+def _ensure_daily_group_cache(df: pd.DataFrame) -> Optional[Dict[str, pd.DataFrame]]:
+    """Ensure per-code daily_basic groups are attached to ``df``.
+
+    Live native workers are forked after daily_basic load, so building this cache
+    in the parent lets children share the grouped frames through copy-on-write.
+    """
+    if df.empty or "_ID_QI_PAD" not in df.columns:
+        return None
+    groups = getattr(df, "_group_cache", None)
+    if groups is not None:
+        return groups
+
+    t0 = time.perf_counter()
+    groups = {
+        k: g.drop(columns=["_ID_QI_PAD"], errors="ignore").reset_index(drop=True)
+        for k, g in df.groupby("_ID_QI_PAD", sort=False)
+    }
+    try:
+        object.__setattr__(df, "_group_cache", groups)
+    except Exception:
+        try:
+            df._group_cache = groups  # type: ignore[attr-defined]
+        except Exception:
+            logger.debug("[builder] cannot attach daily_basic group cache", exc_info=True)
+            return groups
+    logger.debug("[builder] daily_basic grouped: %d codes in %.0fms",
+                 len(groups), (time.perf_counter() - t0) * 1000)
+    return groups
+
+
 def _filter_daily_for_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
     """从多日 daily_basic 中过滤出单只股票的数据。
 
@@ -141,21 +171,14 @@ def _filter_daily_for_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
     key = code.split(".")[0].zfill(6)
 
     if "_ID_QI_PAD" in df.columns:
-        # 缓存直接 attach 在 df 上（不用 id(df)，避免 GC 后 id 复用）
-        groups = getattr(df, "_group_cache", None)
+        groups = _ensure_daily_group_cache(df)
         if groups is None:
-            t0 = time.perf_counter()
-            groups = {k: g.drop(columns=["_ID_QI_PAD"], errors="ignore").reset_index(drop=True)
-                      for k, g in df.groupby("_ID_QI_PAD", sort=False)}
-            try:
-                df._group_cache = groups  # type: ignore[attr-defined]
-            except Exception:
-                pass  # 某些 DataFrame 子类不允许设属性
-            logger.debug("[builder] daily_basic grouped: %d codes in %.0fms",
-                         len(groups), (time.perf_counter() - t0) * 1000)
+            return df.drop(columns=["_ID_QI_PAD"], errors="ignore").iloc[:0].reset_index(drop=True)
         result = groups.get(key)
         if result is not None:
-            return result
+            # Return a distinct frame object so strategy code cannot mutate the
+            # cached per-code frame for later calls.
+            return result.copy(deep=True)
         return df.drop(columns=["_ID_QI_PAD"], errors="ignore").iloc[:0].reset_index(drop=True)
 
     for col in ("ID_QI", "TICKER_SYMBOL", "code", "Code", "stock_code"):

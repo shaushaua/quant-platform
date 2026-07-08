@@ -233,6 +233,9 @@ _kind_names = {
     KIND_ORDER: "order",
     KIND_DEAL: "deal",
 }
+_kind_by_name = {name: kind for kind, name in _kind_names.items()}
+_DEFAULT_ARCHIVE_KINDS = ("order", "deal", "tick")
+_DEFAULT_POST_CLOSE_ARCHIVE_KINDS = ("order", "deal", "tick")
 
 
 def _round_price_to_cent_values(values: np.ndarray) -> np.ndarray:
@@ -294,7 +297,7 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
 
     # Fast time conversion: f64 seconds → datetime64[ns]
-    # NaN/inf/negative seconds → NaT instead of 1970-01-01. np.int64 min is the
+    # NaN/inf/negative seconds → NaT instead of 1970-01-01.  np.int64 min is the
     # canonical NaT marker for datetime64[ns].
     base_ns = _base_ns
     _nat_int = np.datetime64('NaT').view('i8')  # int64 sentinel for NaT
@@ -417,7 +420,12 @@ def _compute_code_batch_shm(args):
     try:
         _base_ns = pd.Timestamp(trading_day).value
         factor_fn, active_factor_info = _get_worker_strategy(factor_module, factor_info)
-        from ..factor.stock_data_builder import build_stock_data
+        from ..factor.stock_data_builder import build_stock_data, _ensure_daily_group_cache
+
+        # Parent normally pre-warms this before forking the pool. Keep a cheap
+        # fallback for inline execution or old workers created before pre-warm.
+        if not _market_df.empty and not hasattr(_market_df, "_group_cache"):
+            _ensure_daily_group_cache(_market_df)
 
         need_tick = active_factor_info.get("need_l1_tick", True)
         need_deal = active_factor_info.get("need_l2_deal", True)
@@ -625,6 +633,39 @@ class NativeEngine:
         # collector, so every cycle must re-scan to pick up new stocks.
         self._sync_warn_ts: Dict[Any, float] = {}  # rate-limited warning log
 
+    @staticmethod
+    def _parse_archive_kinds(raw: Optional[str], default: Tuple[str, ...]) -> Tuple[str, ...]:
+        if not raw:
+            return default
+        kinds: List[str] = []
+        for item in raw.split(","):
+            name = item.strip().lower()
+            if not name:
+                continue
+            if name not in _kind_by_name:
+                logger.warning("[native-archive] ignore unsupported archive kind: %s", name)
+                continue
+            if name not in kinds:
+                kinds.append(name)
+        return tuple(kinds) or default
+
+    def _archive_marker_path(self, name: str) -> Path:
+        return self._disk_output_dir / self.trading_day / f"{name}.done"
+
+    def _archive_marker_done(self, name: str) -> bool:
+        try:
+            return self._archive_marker_path(name).exists()
+        except Exception:
+            return False
+
+    def _mark_archive_done(self, name: str) -> None:
+        marker = self._archive_marker_path(name)
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(datetime.now().isoformat(), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[native-archive] write marker %s failed: %s", marker, exc)
+
     def _init_pool(self) -> None:
         """Create persistent worker pool."""
         if self._pool is not None:
@@ -728,6 +769,13 @@ class NativeEngine:
         self._daily_cache.load(self.trading_day)
         market_df = self._daily_cache.get_daily_basic()
         market_df = _add_code_key(market_df)
+        try:
+            from ..factor.stock_data_builder import _ensure_daily_group_cache
+            groups = _ensure_daily_group_cache(market_df)
+            if groups is not None:
+                logger.info("[native] daily_basic group cache prewarmed: %d codes", len(groups))
+        except Exception as exc:
+            logger.warning("[native] daily_basic group cache prewarm failed: %s", exc)
         self._market_df = market_df
 
         if not market_df.empty and "_date" in market_df.columns:
@@ -743,6 +791,11 @@ class NativeEngine:
                 self._daily_basic_df = market_df[date_values == latest_date].reset_index(drop=True)
         else:
             self._daily_basic_df = market_df
+        try:
+            from ..factor.stock_data_builder import _ensure_daily_group_cache
+            _ensure_daily_group_cache(self._daily_basic_df)
+        except Exception as exc:
+            logger.debug("[native] daily_basic day-slice group cache prewarm failed: %s", exc)
 
         logger.info(
             "[native] daily_basic: %d stocks, market: %d entries, market_count=%d",
@@ -1788,17 +1841,29 @@ class NativeEngine:
         now = datetime.now()
         if (now.hour, now.minute) < (upload_hour, upload_minute):
             return
-        self._archive_native_incremental(files_by_code)
+        fallback_kinds = self._parse_archive_kinds(
+            os.environ.get("RAW_ARCHIVE_EXIT_SNAPSHOT_KINDS"),
+            _DEFAULT_POST_CLOSE_ARCHIVE_KINDS,
+        )
+        if not self._archive_native_incremental(files_by_code, kinds=fallback_kinds):
+            logger.warning("[native-archive] fallback snapshot incomplete, skip upload")
+            return
         self._release_pool()
-        if not self._uploaded_today:
-            if self._upload_raw_day_to_oss():
+        full_fallback = fallback_kinds == _DEFAULT_ARCHIVE_KINDS
+        if (not full_fallback) or not self._uploaded_today:
+            if self._upload_raw_day_to_oss(kinds=fallback_kinds) and full_fallback:
                 self._uploaded_today = True
-        if not self._shm_uploaded_today:
+        if _env_bool("RAW_ARCHIVE_EXIT_UPLOAD_SHM", False) and not self._shm_uploaded_today:
             # 上传 SHM 原始数据到 OSS（float64，不做转换，用于调试重放）
             if self._upload_shm_raw_to_oss():
                 self._shm_uploaded_today = True
 
-    def _upload_raw_snapshot_now(self) -> bool:
+    def _upload_raw_snapshot_now(
+        self,
+        kinds: Optional[Tuple[str, ...]] = None,
+        *,
+        include_shm: bool = True,
+    ) -> bool:
         """Upload already-snapshotted raw chunks without a wall-clock gate.
 
         parquet 归档和 SHM raw 包独立跟踪成功状态，任一未完成就尝试上传：
@@ -1809,16 +1874,19 @@ class NativeEngine:
         if not self._raw_archive_enabled:
             return self._uploaded_today and self._shm_uploaded_today
         self._release_pool()
-        if not self._uploaded_today:
-            if self._upload_raw_day_to_oss():
+        all_parquet_kinds = kinds is None or tuple(kinds) == _DEFAULT_ARCHIVE_KINDS
+        parquet_ok = self._uploaded_today if all_parquet_kinds else False
+        if (not all_parquet_kinds) or not self._uploaded_today:
+            parquet_ok = self._upload_raw_day_to_oss(kinds=kinds)
+            if parquet_ok and all_parquet_kinds:
                 self._uploaded_today = True
-        if not self._shm_uploaded_today:
+        if include_shm and not self._shm_uploaded_today:
             # 上传 SHM 原始数据到 OSS（float64，不做转换，用于调试重放）
             if self._upload_shm_raw_to_oss():
                 self._shm_uploaded_today = True
-        return self._uploaded_today and self._shm_uploaded_today
+        return parquet_ok and (self._shm_uploaded_today or not include_shm)
 
-    def _upload_raw_day_to_oss(self) -> bool:
+    def _upload_raw_day_to_oss(self, kinds: Optional[Tuple[str, ...]] = None) -> bool:
         date_str = self.trading_day
         year = date_str[:4]
         month = date_str[4:6]
@@ -1878,25 +1946,48 @@ class NativeEngine:
         gc.collect()
         logger.info("[native-archive] pre-upload memory freed, starting upload")
 
-        uploaded_any = False
+        uploaded_kinds: set[str] = set()
         had_error = False
 
-        for kind in ("order", "deal", "tick"):
+        upload_kinds = kinds or _DEFAULT_ARCHIVE_KINDS
+        for kind in upload_kinds:
             chunk_dir = disk_dir / kind
             chunks = sorted(chunk_dir.glob("*.parquet")) if chunk_dir.exists() else []
             if not chunks:
+                oss_key = f"{prefix}/{date_str}_{kind}.parquet"
+                try:
+                    meta = bucket.head_object(oss_key)
+                    if getattr(meta, "content_length", 0) > 0:
+                        logger.info("[native-archive] %s already on OSS, no local chunks: oss://%s/%s (%d bytes)",
+                                    kind, os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"),
+                                    oss_key, meta.content_length)
+                        uploaded_kinds.add(kind)
+                        continue
+                except Exception:
+                    pass
+                logger.error("[native-archive] requested %s upload but no local chunks found: %s",
+                             kind, chunk_dir)
+                had_error = True
                 continue
             tmp_file = disk_dir / f"tmp_{kind}.parquet"
+            con = None
             try:
                 tmp_file.unlink(missing_ok=True)
+                duckdb_tmp_dir = disk_dir / "duckdb_tmp"
+                duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
                 con = duckdb.connect(":memory:")
-                con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '32GB')}'")
+                con.execute(f"SET memory_limit='{os.environ.get('ARCHIVE_DUCKDB_MEMORY', '8GB')}'")
+                con.execute(f"SET threads={_env_int('ARCHIVE_DUCKDB_THREADS', 4, minimum=1)}")
+                con.execute("SET preserve_insertion_order=false")
+                con.execute(f"SET temp_directory='{str(duckdb_tmp_dir).replace(chr(39), chr(39) + chr(39))}'")
+                con.execute(f"SET max_temp_directory_size='{os.environ.get('ARCHIVE_DUCKDB_MAX_TEMP', '200GB')}'")
                 select_clause = self._archive_select_clause(kind)
                 # map_code_col determined before _daily_basic_df was freed below;
                 # map_df carries either "_ID_QI_PAD" (zero-padded str) or "ID_QI".
                 output_cols = ", ".join(self._archive_output_columns(kind))
-                self._log_archive_duplicate_stats(
-                    con, kind, chunk_dir, map_tmp_path, map_code_col)
+                if _env_bool("ARCHIVE_DUPLICATE_STATS_ENABLED", False):
+                    self._log_archive_duplicate_stats(
+                        con, kind, chunk_dir, map_tmp_path, map_code_col)
                 con.execute(f"""
                     COPY (
                         WITH merged AS (
@@ -1925,20 +2016,18 @@ class NativeEngine:
                         ORDER BY Code, SeqNum
                     ) TO '{tmp_file}' (FORMAT PARQUET, COMPRESSION 'zstd')
                 """)
-                if not self._validate_archive_times(
+                if _env_bool("ARCHIVE_VALIDATE_TIMES_ENABLED", True) and not self._validate_archive_times(
                     con, kind, chunk_dir, map_tmp_path, map_code_col, tmp_file
                 ):
                     had_error = True
                     tmp_file.unlink(missing_ok=True)
-                    con.close()
                     continue
-                con.close()
                 oss_key = f"{prefix}/{date_str}_{kind}.parquet"
                 bucket.put_object_from_file(oss_key, str(tmp_file))
                 size_mb = tmp_file.stat().st_size / 1024 / 1024
                 logger.info("[native-archive] uploaded %s -> oss://%s/%s (%.1f MB, %d chunks)",
                             kind, os.environ.get("OSS_DATA_BUCKET", "quant-mdl-data"), oss_key, size_mb, len(chunks))
-                uploaded_any = True
+                uploaded_kinds.add(kind)
                 tmp_file.unlink(missing_ok=True)
                 for chunk in chunks:
                     chunk.unlink()
@@ -1946,10 +2035,20 @@ class NativeEngine:
                 had_error = True
                 logger.error("[native-archive] upload %s failed: %s", kind, exc, exc_info=True)
                 tmp_file.unlink(missing_ok=True)
+            finally:
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
 
         map_tmp_path.unlink(missing_ok=True)
         logger.info("[native-archive] %s upload finished", date_str)
-        return uploaded_any and not had_error
+        missing = [kind for kind in upload_kinds if kind not in uploaded_kinds]
+        if missing:
+            logger.error("[native-archive] upload incomplete, missing kinds: %s", ",".join(missing))
+            had_error = True
+        return not had_error
 
     def _shm_effective_size(self, mmap_path: Path) -> int:
         """读 mmap header 的 row_count，计算有效数据字节数。
@@ -2400,17 +2499,56 @@ class NativeEngine:
         logger.info("[native-archive] %s time validation ok rows=%d", kind, rows_checked)
         return True
 
-    def _archive_native_incremental(self, files_by_code: Dict[str, Dict[int, object]]) -> None:
+    def _archive_native_incremental(
+        self,
+        files_by_code: Dict[str, Dict[int, object]],
+        kinds: Optional[Tuple[str, ...]] = None,
+    ) -> bool:
         if not self._raw_archive_enabled:
-            return
+            return True
         self._load_archive_offsets()
-        for kind, kind_name in _kind_names.items():
+        archive_kinds = kinds or _DEFAULT_ARCHIVE_KINDS
+        archive_ok = True
+        max_rows_per_chunk = max(
+            1,
+            _env_int("ARCHIVE_SNAPSHOT_MAX_ROWS_PER_CHUNK", 100_000, minimum=1),
+        )
+        chunk_pause_sec = max(
+            0.0,
+            float(os.environ.get("ARCHIVE_SNAPSHOT_CHUNK_PAUSE_SEC", "0.2")),
+        )
+        for kind_name in archive_kinds:
+            kind = _kind_by_name.get(kind_name)
+            if kind is None:
+                logger.warning("[native-archive] skip unsupported snapshot kind: %s", kind_name)
+                continue
             frames = []
+            frame_rows = 0
             pending_offsets: Dict[Tuple[str, int], int] = {}
+            write_failed = False
+            seen_path = False
+
+            def flush_frames() -> bool:
+                nonlocal frames, frame_rows, pending_offsets
+                if not frames:
+                    return True
+                if not self._append_raw_to_disk(kind_name, pd.concat(frames, ignore_index=True)):
+                    return False
+                self._archive_offsets.update(pending_offsets)
+                self._save_archive_offsets()
+                frames = []
+                frame_rows = 0
+                pending_offsets = {}
+                gc.collect()
+                if chunk_pause_sec > 0:
+                    time.sleep(chunk_pause_sec)
+                return True
+
             for code, kinds in files_by_code.items():
                 path = kinds.get(kind)
                 if not path:
                     continue
+                seen_path = True
                 offset_key = (self._offset_path_key(path), kind)
                 start = self._archive_offsets.get(offset_key, 0)
                 try:
@@ -2423,20 +2561,47 @@ class NativeEngine:
                     pending_offsets[offset_key] = current
                     if not df.empty:
                         frames.append(df)
+                        frame_rows += len(df)
+                        if frame_rows >= max_rows_per_chunk and not flush_frames():
+                            logger.warning("[native-archive] stop snapshot kind=%s after chunk write failure", kind_name)
+                            write_failed = True
+                            break
                 except Exception as exc:
+                    write_failed = True
                     logger.warning("[native-archive] snapshot failed kind=%s code=%s: %s", kind_name, code, exc)
-            if frames:
-                if self._append_raw_to_disk(kind_name, pd.concat(frames, ignore_index=True)):
-                    self._archive_offsets.update(pending_offsets)
-                    self._save_archive_offsets()
-            elif pending_offsets:
+            if frames and not write_failed:
+                if not flush_frames():
+                    write_failed = True
+            elif pending_offsets and not write_failed:
                 self._archive_offsets.update(pending_offsets)
                 self._save_archive_offsets()
+            if not seen_path:
+                logger.error("[native-archive] requested snapshot kind=%s but no SHM files found", kind_name)
+                archive_ok = False
+            if write_failed:
+                logger.error("[native-archive] snapshot incomplete kind=%s", kind_name)
+                archive_ok = False
+        return archive_ok
 
     def _archive_loop(self) -> None:
         from datetime import timedelta
+        post_close_snapshot_kinds = self._parse_archive_kinds(
+            os.environ.get("RAW_ARCHIVE_POST_CLOSE_SNAPSHOT_KINDS"),
+            _DEFAULT_POST_CLOSE_ARCHIVE_KINDS,
+        )
+        post_close_upload_kinds = self._parse_archive_kinds(
+            os.environ.get("RAW_ARCHIVE_POST_CLOSE_UPLOAD_KINDS"),
+            post_close_snapshot_kinds,
+        )
+        post_close_upload_shm = _env_bool("RAW_ARCHIVE_POST_CLOSE_UPLOAD_SHM", False)
+        post_close_snapshot_marker = "post_close_" + "_".join(post_close_snapshot_kinds) + "_snapshot"
+        post_close_upload_marker = "post_close_" + "_".join(post_close_upload_kinds) + "_upload"
         logger.info("[native-archive] background archive loop started "
-                    "(smart-sleep: 11:35/15:35 snapshot, upload after daily done)")
+                    "(smart-sleep: 11:35/15:35 snapshot, upload after daily done, "
+                    "post_close_snapshot_kinds=%s, post_close_upload_kinds=%s, post_close_upload_shm=%s)",
+                    ",".join(post_close_snapshot_kinds),
+                    ",".join(post_close_upload_kinds),
+                    post_close_upload_shm)
         last_archive_date = ""
         archived_lunch = False
         archived_snapshot = False  # 15:35 SHM -> 本地 chunks
@@ -2448,8 +2613,8 @@ class NativeEngine:
                     last_archive_date = today
                     now_init = datetime.now()
                     archived_lunch = now_init.hour > 11 or (now_init.hour == 11 and now_init.minute >= 35)
-                    archived_snapshot = False
-                    archived_upload = False
+                    archived_snapshot = self._archive_marker_done(post_close_snapshot_marker)
+                    archived_upload = self._archive_marker_done(post_close_upload_marker)
                     self._uploaded_today = False
                     self._shm_uploaded_today = False
                     self._post_close_daily_done.clear()
@@ -2461,9 +2626,11 @@ class NativeEngine:
                     files_by_code = self._scan_shm_files()
                     if files_by_code:
                         logger.info("[native-archive] lunch break snapshot starting...")
-                        self._archive_native_incremental(files_by_code)
-                        archived_lunch = True
-                        logger.info("[native-archive] lunch break snapshot done")
+                        if self._archive_native_incremental(files_by_code):
+                            archived_lunch = True
+                            logger.info("[native-archive] lunch break snapshot done")
+                        else:
+                            logger.error("[native-archive] lunch break snapshot incomplete, will retry")
 
                 # 15:35 post-close SHM snapshot freezes the raw archive input.
                 # Tick files can keep growing after close, but post-15:00 rows
@@ -2472,10 +2639,17 @@ class NativeEngine:
                 if h >= 15 and m >= 35 and not archived_snapshot:
                     files_by_code = self._scan_shm_files()
                     if files_by_code:
-                        logger.info("[native-archive] post-close snapshot starting...")
-                        self._archive_native_incremental(files_by_code)
-                        archived_snapshot = True
-                        logger.info("[native-archive] post-close snapshot done")
+                        self._release_pool()
+                        logger.info("[native-archive] post-close snapshot starting kinds=%s...",
+                                    ",".join(post_close_snapshot_kinds))
+                        if self._archive_native_incremental(files_by_code, kinds=post_close_snapshot_kinds):
+                            archived_snapshot = True
+                            self._mark_archive_done(post_close_snapshot_marker)
+                            logger.info("[native-archive] post-close snapshot done")
+                        else:
+                            logger.error("[native-archive] post-close snapshot incomplete, will retry")
+                    else:
+                        logger.warning("[native-archive] post-close snapshot pending: no SHM files found")
 
                 daily_done = (
                     not self._raw_archive_wait_daily_done
@@ -2488,27 +2662,36 @@ class NativeEngine:
                 # the 15:10 daily calculation has ended (daily_done).  Since
                 # 15:35 > 15:10, daily_done is virtually always True here.
                 #
-                # 完成条件 = parquet(_uploaded_today) 且 SHM(_shm_uploaded_today) 都成功。
-                # 任一失败都会重试 ARCHIVE_UPLOAD_MAX_RETRIES 次。
-                if archived_snapshot and not archived_upload and not (
-                    self._uploaded_today and self._shm_uploaded_today
-                ) and daily_done:
+                # Post-close order/deal archive is tracked with a durable marker,
+                # so a pod restart after 15:35 can retry without depending on
+                # in-memory _uploaded_today/_shm_uploaded_today flags.
+                if (
+                    archived_snapshot
+                    and not archived_upload
+                    and not self._archive_marker_done(post_close_upload_marker)
+                    and daily_done
+                ):
                     max_attempts = max(1, _env_int("ARCHIVE_UPLOAD_MAX_RETRIES", 3, minimum=1))
                     for attempt in range(1, max_attempts + 1):
                         if self._stopped:
                             break
-                        if self._uploaded_today and self._shm_uploaded_today:
+                        if self._archive_marker_done(post_close_upload_marker):
                             break
                         logger.info("[native-archive] post-snapshot OSS upload attempt %d/%d starting... "
-                                    "(parquet=%s, shm=%s)",
+                                    "(parquet=%s, shm=%s, kinds=%s, include_shm=%s)",
                                     attempt, max_attempts,
-                                    self._uploaded_today, self._shm_uploaded_today)
+                                    self._uploaded_today, self._shm_uploaded_today,
+                                    ",".join(post_close_upload_kinds), post_close_upload_shm)
                         try:
-                            self._upload_raw_snapshot_now()
+                            if self._upload_raw_snapshot_now(
+                                kinds=post_close_upload_kinds,
+                                include_shm=post_close_upload_shm,
+                            ):
+                                self._mark_archive_done(post_close_upload_marker)
                         except Exception as exc:
                             logger.error("[native-archive] OSS upload attempt %d failed: %s",
                                          attempt, exc, exc_info=True)
-                        if self._uploaded_today and self._shm_uploaded_today:
+                        if self._archive_marker_done(post_close_upload_marker):
                             logger.info("[native-archive] post-snapshot OSS upload done (attempt %d)",
                                         attempt)
                             break
@@ -2520,7 +2703,7 @@ class NativeEngine:
                                 if self._stopped:
                                     break
                                 time.sleep(1)
-                    if not (self._uploaded_today and self._shm_uploaded_today):
+                    if not self._archive_marker_done(post_close_upload_marker):
                         logger.error("[native-archive] OSS upload gave up after %d attempts "
                                      "(parquet=%s, shm=%s)",
                                      max_attempts, self._uploaded_today, self._shm_uploaded_today)
@@ -2532,13 +2715,15 @@ class NativeEngine:
                 if not archived_lunch:
                     target = now.replace(hour=11, minute=35, second=0, microsecond=0)
                     if target <= now:
-                        target = target + timedelta(days=1)
-                    sleep_sec = max(1, (target - now).total_seconds())
+                        sleep_sec = 60.0
+                    else:
+                        sleep_sec = max(1, (target - now).total_seconds())
                 elif not archived_snapshot:
                     target = now.replace(hour=15, minute=35, second=0, microsecond=0)
                     if target <= now:
-                        target = target + timedelta(days=1)
-                    sleep_sec = max(1, (target - now).total_seconds())
+                        sleep_sec = 60.0
+                    else:
+                        sleep_sec = max(1, (target - now).total_seconds())
                 elif not archived_upload:
                     sleep_sec = 60.0
                 else:
@@ -3100,17 +3285,9 @@ class NativeEngine:
         factor_ms_total = 0.0
         if self._pool is not None:
             try:
-                _diag_t0 = time.perf_counter()
-                _diag_batches = 0
                 for batch_results, batch_errors, build_ms, factor_ms, err in self._pool.imap_unordered(
                     _compute_code_batch_shm, tasks, chunksize=1,
                 ):
-                    _diag_batches += 1
-                    if _diag_batches <= 3 or _diag_batches >= len(tasks) - 2:
-                        logger.info("[diag] batch %d/%d returned at %.0fms (build=%.0fms factor=%.0fms)",
-                                    _diag_batches, len(tasks),
-                                    (time.perf_counter() - _diag_t0) * 1000,
-                                    build_ms, factor_ms)
                     build_ms_total += build_ms
                     factor_ms_total += factor_ms
                     if err:
@@ -3720,8 +3897,14 @@ class NativeEngine:
         try:
             files_by_code = self._scan_shm_files()
             if files_by_code:
-                self._archive_native_incremental(files_by_code)
-                self._check_raw_upload_time(files_by_code)
+                fallback_kinds = self._parse_archive_kinds(
+                    os.environ.get("RAW_ARCHIVE_EXIT_SNAPSHOT_KINDS"),
+                    _DEFAULT_POST_CLOSE_ARCHIVE_KINDS,
+                )
+                if self._archive_native_incremental(files_by_code, kinds=fallback_kinds):
+                    self._check_raw_upload_time(files_by_code)
+                else:
+                    logger.warning("[native] final archive snapshot incomplete, skip upload")
         except Exception as exc:
             logger.warning("[native] final archive/upload failed: %s", exc)
         self._release_pool()

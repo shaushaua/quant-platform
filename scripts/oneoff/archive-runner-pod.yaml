@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: archive-runner-20260708
+  namespace: quant
+  labels:
+    app: archive-runner
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    quant.lianghua.io/combined-engine: "true"
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: quant
+      effect: NoSchedule
+    - key: node.kubernetes.io/disk-pressure
+      operator: Exists
+      effect: NoSchedule
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+  containers:
+    - name: archive-runner
+      image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+      command: ["sleep", "36000"]
+      envFrom:
+        - secretRef:
+            name: quant-secrets
+      env:
+        - name: TZ
+          value: Asia/Shanghai
+        - name: NATIVE_SHM_DIR
+          value: /data/quant/shm
+        - name: COLLECTOR_DISK_OUTPUT
+          value: /data/collector_output
+        - name: FACTOR_OUTPUT_PATH
+          value: /data/factors
+        - name: RAW_DATA_ARCHIVE_ENABLED
+          value: "true"
+        - name: ARCHIVE_SNAPSHOT_MAX_ROWS_PER_CHUNK
+          value: "50000"
+        - name: ARCHIVE_SNAPSHOT_CHUNK_PAUSE_SEC
+          value: "0.5"
+        - name: ARCHIVE_DUCKDB_MEMORY
+          value: "6GB"
+        - name: ARCHIVE_DUCKDB_THREADS
+          value: "2"
+        - name: ARCHIVE_DUCKDB_MAX_TEMP
+          value: "200GB"
+        - name: ARCHIVE_DUPLICATE_STATS_ENABLED
+          value: "false"
+        - name: ARCHIVE_VALIDATE_TIMES_ENABLED
+          value: "true"
+      resources:
+        requests:
+          cpu: "2"
+          memory: 16Gi
+        limits:
+          cpu: "16"
+          memory: 80Gi
+      volumeMounts:
+        - name: factor-output
+          mountPath: /data/factors
+        - name: raw-archive
+          mountPath: /data/collector_output
+        - name: shm-buffers
+          mountPath: /data/quant/shm
+        - name: mdl-backup
+          mountPath: /data/quant/mdl_msg_backup
+  volumes:
+    - name: factor-output
+      hostPath:
+        path: /data/quant/factors
+        type: DirectoryOrCreate
+    - name: raw-archive
+      hostPath:
+        path: /data/quant/collector_output
+        type: DirectoryOrCreate
+    - name: shm-buffers
+      hostPath:
+        path: /data/quant/shm
+        type: DirectoryOrCreate
+    - name: mdl-backup
+      hostPath:
+        path: /data/quant/mdl_msg_backup
+        type: DirectoryOrCreate

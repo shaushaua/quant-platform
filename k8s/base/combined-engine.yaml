@@ -193,6 +193,32 @@ spec:
               value: "15:30"
             - name: COLLECTOR_DISK_OUTPUT
               value: /data/collector_output
+            # 盘后归档按 order -> deal -> tick 顺序串行冻结/上传；tick 不并行抢内存。
+            - name: RAW_ARCHIVE_POST_CLOSE_SNAPSHOT_KINDS
+              value: "order,deal,tick"
+            - name: RAW_ARCHIVE_POST_CLOSE_UPLOAD_KINDS
+              value: "order,deal,tick"
+            - name: RAW_ARCHIVE_POST_CLOSE_UPLOAD_SHM
+              value: "false"
+            - name: RAW_ARCHIVE_EXIT_SNAPSHOT_KINDS
+              value: "order,deal,tick"
+            - name: RAW_ARCHIVE_EXIT_UPLOAD_SHM
+              value: "false"
+            # 控制归档峰值内存：snapshot 小批落盘，DuckDB merge 允许 spill。
+            - name: ARCHIVE_SNAPSHOT_MAX_ROWS_PER_CHUNK
+              value: "100000"
+            - name: ARCHIVE_SNAPSHOT_CHUNK_PAUSE_SEC
+              value: "0.2"
+            - name: ARCHIVE_DUCKDB_MEMORY
+              value: "8GB"
+            - name: ARCHIVE_DUCKDB_THREADS
+              value: "4"
+            - name: ARCHIVE_DUCKDB_MAX_TEMP
+              value: "200GB"
+            - name: ARCHIVE_DUPLICATE_STATS_ENABLED
+              value: "false"
+            - name: ARCHIVE_VALIDATE_TIMES_ENABLED
+              value: "true"
             # --- PML 录制（调试用，默认关闭，避免热路径复制 raw buffer）---
             - name: PML_RECORD_DIR
               value: ""
