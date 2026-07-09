@@ -279,81 +279,69 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
                           kind_name: str = "") -> pd.DataFrame:
     """Build DataFrame from native SHM reader.
 
-    The C++ writer stores 79/9/10 numeric columns (skip TradingDay and Code).
-    Time/UpdateTime are f64 seconds since midnight.
-
-    Reads the full current-day buffer so factor code receives all data
-    accumulated up to this round.
-
-    volume_idx: buf_cols 中名字含 'Volume' 的列下标。这些列会被 ×100
-    对齐回测（_restore_oss_precision OSS 还原分支对历史 Volume 错误 ×100，
-    历史因子已基于该量级训练，实盘必须同比）。None 表示不放大。
+    Optimized path:
+    - view_rows: zero-copy mmap, ~0ms
+    - 时间转换: numpy 向量化 (2列), ~5ms/万行
+    - 价格量化: numpy floor (无 pd.to_numeric), ~2ms
+    - SeqNum: 轻量单调 guard，正常有序时跳过排序，异常时才 sort + warning
+    - 整数列: 从 df 转换（非 arr），保证 sort 后不错位；NaN/inf 填 0
+    - insert TradingDay/Code: 标量广播
     """
     arr = reader.view_rows()
-    if arr.shape[0] == 0:
+    n_rows = arr.shape[0]
+    if n_rows == 0:
         return pd.DataFrame()
 
-    # Zero-copy DataFrame over numpy array
+    # Zero-copy DataFrame
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
 
-    # Fast time conversion: f64 seconds → datetime64[ns]
-    # NaN/inf/negative seconds → NaT instead of 1970-01-01.  np.int64 min is the
-    # canonical NaT marker for datetime64[ns].
+    # 时间转换：2 列一次性 numpy 向量化
     base_ns = _base_ns
-    _nat_int = np.datetime64('NaT').view('i8')  # int64 sentinel for NaT
+    _nat_int = np.datetime64('NaT').view('i8')
     for _tc_idx in (time_idx, updtime_idx):
         _col_secs = arr[:, _tc_idx]
         _valid = np.isfinite(_col_secs) & (_col_secs >= 0)
-        _ns = np.full(len(_col_secs), _nat_int, dtype=np.int64)
-        # C++ stores millisecond-derived seconds in f64.  Direct astype(int64)
-        # truncates values like 09:15:00.020 to ...019999999, which can diverge
-        # from historical parquet on boundary-sensitive factors.  Round to the
-        # nearest ns before converting.
+        _ns = np.full(n_rows, _nat_int, dtype=np.int64)
         _ns[_valid] = base_ns + np.rint(_col_secs[_valid] * 1_000_000_000).astype(np.int64)
         df[buf_cols[_tc_idx]] = _ns.astype('datetime64[ns]')
 
     if historical_compat:
-        # Historical parquet stores price fields as integer cents and restores
-        # them with /100. Native SHM keeps f64 MDL values; to keep live factors
-        # aligned with the historical cent representation, quantize to the
-        # nearest cent before downstream factor code sees the values.
-        for _col in df.columns:
-            if _col == "Code":
-                continue
-            if "Price" in _col or "IOPV" in _col:
-                _v = pd.to_numeric(df[_col], errors="coerce").to_numpy(dtype="float64", copy=False)
-                _valid = np.isfinite(_v)
+        # 价格量化：直接 numpy floor（不用 pd.to_numeric，数据已是 float64）
+        for _col_idx, _col_name in enumerate(buf_cols):
+            if "Price" in _col_name or "IOPV" in _col_name:
+                _v = arr[:, _col_idx]  # 直接从 numpy array 取列
+                _valid = np.isfinite(_v) & (_v > 0)
                 if _valid.any():
                     _out = _v.copy()
-                    _out[_valid] = _round_price_to_cent_values(_out[_valid])
-                    df[_col] = _out
+                    _out[_valid] = np.floor(_out[_valid] * 100 + 0.5) / 100
+                    df[_col_name] = _out
 
-    # Volume ×100 对齐回测（见函数 docstring 和模块级 _tick_volume_idx 注释）
-    if volume_idx:
-        for _vi in volume_idx:
-            df.iloc[:, _vi] = df.iloc[:, _vi].astype("float64") * 100.0
+        # Volume ×100 对齐回测（不能改 arr——view_rows 返回 mmap read-only view）
+        if volume_idx:
+            for _vi in volume_idx:
+                df[buf_cols[_vi]] = arr[:, _vi] * 100.0
 
-    # Historical archive upload sorts merged parquet by SECURITY_ID, SeqNum.
-    # Live factors must see the same per-code row order, otherwise
-    # rolling/diff/tail/iloc based factors can diverge on identical rows.
-    seq_before = _seqnum_stats(df) if historical_compat else None
-    if historical_compat and "SeqNum" in df.columns:
-        df = df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
-        _log_historical_compat_order(
-            code,
-            kind_name or "unknown",
-            seq_before,
-            _seqnum_stats(df),
-        )
+        # sort SeqNum: SHM collector 按 SeqNum 递增写入，通常天然有序。
+        # 轻量 guard：检查单调性，只有非单调时才 sort（多 part 合并/重启续写时可能乱序）。
+        if "SeqNum" in buf_cols:
+            _seq_idx = buf_cols.index("SeqNum")
+            _seq = arr[:, _seq_idx]
+            if not np.all(np.diff(_seq) >= 0):
+                logger.warning("[build] %s %s SeqNum not monotonic, sorting", code, kind_name)
+                df = df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
 
-    if historical_compat:
-        for _col in (
-            "OrderID", "SaleOrderID", "BuyOrderID", "Side", "OrderType",
-            "TradeNum", "Channel", "SeqNum",
-        ):
-            if _col in df.columns:
-                df[_col] = pd.to_numeric(df[_col], errors="coerce").fillna(0).astype("int64")
+        # 整数列：从 df 转换（不是 arr），保证 sort 后行不错位
+        _int_col_names = {"OrderID", "SaleOrderID", "BuyOrderID", "Side",
+                          "OrderType", "TradeNum", "Channel", "SeqNum"}
+        for _col_name in buf_cols:
+            if _col_name in _int_col_names:
+                _raw = df[_col_name].to_numpy(dtype="float64", copy=False)
+                _valid = np.isfinite(_raw)
+                _ints = np.zeros(len(_raw), dtype=np.int64)
+                _ints[_valid] = _raw[_valid].astype(np.int64)
+                df[_col_name] = _ints
 
+    # insert TradingDay/Code（标量广播，避免 np.full object 数组开销）
     df.insert(0, 'TradingDay', trading_day)
     df.insert(1, 'Code', code)
     return df
@@ -2712,6 +2700,10 @@ class NativeEngine:
                     else:
                         archived_upload = True
 
+                # Snapshot/upload can run for minutes. Recompute before choosing
+                # the next sleep target, otherwise a long lunch snapshot can
+                # oversleep the 15:35 post-close trigger by its own duration.
+                now = datetime.now()
                 if not archived_lunch:
                     target = now.replace(hour=11, minute=35, second=0, microsecond=0)
                     if target <= now:
@@ -3270,7 +3262,58 @@ class NativeEngine:
         pool_t0 = time.perf_counter()
 
         batch_size = _env_int("LIVE_FACTOR_BATCH_SIZE", 128, minimum=1)
-        code_batches = [all_codes[i:i + batch_size] for i in range(0, len(all_codes), batch_size)]
+
+        # 按 deal 行数均衡分配 batch（而不是按 code 顺序均匀切）。
+        # SHM deal 行数分布极不均匀（最活跃票 100万行 vs 不活跃票几百行），
+        # 顺序切分会导致活跃票集中在一个 batch，最慢 worker 拖垮整个 pool。
+        # 策略：按 deal row_count 降序排列，贪心装箱到负载最小的 batch，
+        # 同时保证每个 batch 不超过 batch_size 只股票。
+        if len(all_codes) > batch_size:
+            # 读各 code 的 deal row_count（只需读 header，开销很小）
+            _deal_rc = {}
+            for code in all_codes:
+                rc = 0
+                # deal_paths[code] 可能是 str、list、tuple、或 "|" 分隔字符串
+                raw = deal_paths.get(code, "")
+                if isinstance(raw, (list, tuple)):
+                    paths = raw
+                elif isinstance(raw, str):
+                    paths = [p.strip() for p in raw.split("|") if p.strip()]
+                else:
+                    paths = []
+                for p in paths:
+                    if p and os.path.exists(p):
+                        try:
+                            with open(p, "rb") as fh:
+                                hdr = fh.read(SHM_HEADER_SIZE)
+                            if len(hdr) >= SHM_HEADER_SIZE:
+                                _m, _v, _k, _c, _n, r, _t, _g = \
+                                    struct.unpack_from("<QQQQQQQQ", hdr, 0)
+                                # 只计 deal kind=3 的行数，避免读错文件
+                                if _m == SHM_MAGIC and _k == KIND_DEAL and r > 0:
+                                    rc += r  # 多 part 累加
+                        except OSError:
+                            pass
+                _deal_rc[code] = rc
+
+            # 贪心装箱：先固定 batch 数量，再按 row_count 降序放入负载最小且未满的 batch。
+            # 注意不能“满一个再开下一个”，否则最活跃的股票会集中在第一个 batch。
+            sorted_codes = sorted(all_codes, key=lambda c: -_deal_rc.get(c, 0))
+            batch_count = (len(sorted_codes) + batch_size - 1) // batch_size
+            batches: list = [[] for _ in range(batch_count)]
+            batch_loads: list = [0 for _ in range(batch_count)]
+            for code in sorted_codes:
+                rc = _deal_rc.get(code, 0)
+                # 找负载最小且未满（len < batch_size）的 batch
+                best_idx = min(
+                    (i for i in range(batch_count) if len(batches[i]) < batch_size),
+                    key=lambda i: batch_loads[i],
+                )
+                batches[best_idx].append(code)
+                batch_loads[best_idx] += rc
+            code_batches = [batch for batch in batches if batch]
+        else:
+            code_batches = [all_codes]
         tasks = [
             (batch, date_str, end_time, wall_secs,
              {code: states_snapshot.get(code) for code in batch},

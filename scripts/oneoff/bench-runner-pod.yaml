@@ -1,0 +1,80 @@
+# Benchmark runner pod: 隔离在 dev 节点，复用 quant-dev secrets。
+# 用于对比 factor 计算优化前后的 _build_df_from_native + batch 分配性能。
+# 数据来自 OSS（下载今日 SHM tar.zst 解压到 /data/quant/shm）。
+#
+# baseline  = 镜像内置代码（origin/main 36c0f61，无本次优化）
+# candidate = 本地 working tree 改动，用 kubectl cp 覆盖进 pod
+#
+# 用法:
+#   kubectl apply -f scripts/oneoff/bench-runner-pod.yaml -n quant-dev
+#   kubectl exec -n quant-dev bench-runner -- bash
+#   # baseline 跑完后覆盖代码:
+#   kubectl cp quant_platform/live_engine/native_engine.py quant-dev/bench-runner:/app/quant_platform/live_engine/native_engine.py
+#   kubectl cp quant_platform/factor/stock_data_builder.py quant-dev/bench-runner:/app/quant_platform/factor/stock_data_builder.py
+#   # 完事后:
+#   kubectl delete pod bench-runner -n quant-dev
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-runner
+  namespace: quant-dev
+  labels:
+    app: bench-runner
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    quant.lianghua.io/dev: "true"
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: dev
+      effect: NoSchedule
+  containers:
+    - name: bench-runner
+      image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+      command: ["sleep", "36000"]
+      envFrom:
+        - secretRef:
+            name: quant-secrets
+      env:
+        - name: TZ
+          value: Asia/Shanghai
+        - name: NATIVE_SHM_DIR
+          value: /data/quant/shm
+        - name: FACTOR_OUTPUT_PATH
+          value: /data/factors
+        - name: OSS_LOCAL_CACHE_DIR
+          value: /data/oss_cache
+        - name: DAILY_USE_MULTI_CODE
+          value: "true"
+        - name: RAW_DATA_ARCHIVE_ENABLED
+          value: "false"
+      resources:
+        requests:
+          cpu: "1"
+          memory: 4Gi
+        limits:
+          cpu: "10"
+          memory: 20Gi
+      volumeMounts:
+        - name: shm-buffers
+          mountPath: /data/quant/shm
+        - name: factor-output
+          mountPath: /data/factors
+        - name: oss-cache
+          mountPath: /data/oss_cache
+  volumes:
+    - name: shm-buffers
+      hostPath:
+        path: /data/quant/shm
+        type: DirectoryOrCreate
+    - name: factor-output
+      hostPath:
+        path: /data/quant/factors
+        type: DirectoryOrCreate
+    - name: oss-cache
+      hostPath:
+        path: /data/quant/oss_cache
+        type: DirectoryOrCreate

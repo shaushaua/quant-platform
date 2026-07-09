@@ -76,12 +76,12 @@ def build_stock_data(
     order_hist = _maybe_empty_hist(order_hist, fi.get("need_l2_order", False))
 
     # ── 2. market / daily_basic 按股过滤 ──
+    # market_df 和 daily_basic_df 通常是同一个对象，只 filter 一次
     if market_df is not None and not market_df.empty:
         market = _filter_daily_for_code(market_df, code)
     else:
         market = pd.DataFrame()
-
-    if daily_basic_df is not None and not daily_basic_df.empty:
+    if daily_basic_df is not None and daily_basic_df is not market_df and not daily_basic_df.empty:
         daily_basic = _filter_daily_for_code(daily_basic_df, code)
     else:
         daily_basic = market
