@@ -198,12 +198,14 @@ spec:
               value: "order,deal,tick"
             - name: RAW_ARCHIVE_POST_CLOSE_UPLOAD_KINDS
               value: "order,deal,tick"
+            # SHM 原始数据（mmap 二进制）打包上传到 OSS，用于调试重放。
+            # OSS 路径：{year}/{ym}/{date}/{date}_shm.tar.zst
             - name: RAW_ARCHIVE_POST_CLOSE_UPLOAD_SHM
-              value: "false"
+              value: "true"
             - name: RAW_ARCHIVE_EXIT_SNAPSHOT_KINDS
               value: "order,deal,tick"
             - name: RAW_ARCHIVE_EXIT_UPLOAD_SHM
-              value: "false"
+              value: "true"
             # 控制归档峰值内存：snapshot 小批落盘，DuckDB merge 允许 spill。
             - name: ARCHIVE_SNAPSHOT_MAX_ROWS_PER_CHUNK
               value: "100000"

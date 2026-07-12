@@ -1,4 +1,4 @@
-# Prod overlay: 48-core 96GB node
+# Prod overlay: 44-core 196GB node
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -28,5 +28,5 @@ patches:
                     cpu: "2"
                     memory: 32Gi
                   limits:
-                    cpu: "46"
+                    cpu: "44"
                     memory: 160Gi

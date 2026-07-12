@@ -1,0 +1,274 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "161"
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app":"combined-engine"},"name":"combined-engine","namespace":"quant"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"combined-engine"}},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":{"app":"combined-engine"}},"spec":{"containers":[{"env":[{"name":"MDL_USE_LOCAL_CLIENT","value":"true"},{"name":"MDL_IO_THREADS","value":"4"},{"name":"MDL_CALLBACK_MULTITHREAD","value":"true"},{"name":"MDL_SUBS","value":"4.4,4.24,6.28,6.33,6.36"},{"name":"MDL_FLUSH_INTERVAL_MS","value":"10"},{"name":"MDL_BATCH_SIZE","value":"2000"},{"name":"MDL_QUEUE_WARN_SIZE","value":"50000"},{"name":"MDL_QUEUE_HARD_LIMIT","value":"200000"},{"name":"MDL_LOCAL_SPLIT_SUBS","value":"true"},{"name":"MDL_TCP_OUTPUT_BUFFER_MAX","value":"2048000"},{"name":"MDL_TRACK_ORDER_DEAL_STATE","value":"false"},{"name":"MDL_LOG_PATH","value":"/data/quant/mdl_logs/mdl"},{"name":"FACTOR_MODULE","value":"quant_platform.strategies.protected_eillen_intraday_strategy"},{"name":"DAILY_FACTOR_MODULE","value":"quant_platform.strategies.protected_eillen_strategy_v2"},{"name":"DAILY_USE_MULTI_CODE","value":"true"},{"name":"END_TIMES","value":"150000"},{"name":"INFERENCE_MODULE","value":"quant_platform.inference.tree_model_orders"},{"name":"OPEN_POSITION_SIM_MODE","value":"1"},{"name":"OPEN_POSITION_TOTAL_CAPITAL","value":"10000000"},{"name":"OPEN_POSITION_PRECOMPUTE","value":"1"},{"name":"ONE_TIME_CLOSE_ON_STARTUP","value":"0"},{"name":"ONE_TIME_CLOSE_TRIGGER_TIME","value":"09:15"},{"name":"TREE_MODEL_STRATEGY_NAME","value":"tree_model"},{"name":"TREE_MODEL_OSS_CACHE_DIR","value":"/data/factors/oss_cache/tree_model"},{"name":"PORTFOLIO_CONTEXT_MODULE","value":"quant_platform.broker.order_context"},{"name":"COMPUTE_INTERVAL","value":"60"},{"name":"COMPUTE_SCHEDULES","value":"minute,daily,daily_position,open_position,daily_basic_refresh"},{"name":"MINUTE_RUN_INFERENCE","value":"false"},{"name":"DAILY_FACTOR_TRIGGER_TIME","value":"15:10"},{"name":"DAILY_POSITION_TRIGGER_TIME","value":"14:50"},{"name":"OPEN_POSITION_TRIGGER_TIME","value":"09:30"},{"name":"ORDER_GATEWAY_URL","value":"http://172.16.0.47:18080"},{"name":"ORDER_GATEWAY_TOKEN","valueFrom":{"secretKeyRef":{"key":"ORDER_GATEWAY_TOKEN","name":"quant-secrets"}}},{"name":"ORDER_GATEWAY_TIMEOUT","value":"10"},{"name":"ORDER_POSITION_MAX_STALE_SECONDS","value":"15"},{"name":"BROKER_TYPE","value":"atx"},{"name":"BROKER_ACCOUNT_ID","value":"00033770"},{"name":"ORDER_DEFAULT_STRATEGY","value":"quant_platform"},{"name":"ORDER_DEFAULT_PRICE_TYPE","value":"latest"},{"name":"ORDER_ALGO_STRATEGY","value":"vwap"},{"name":"DATA_FLUSH_INTERVAL","value":"0.01"},{"name":"SHM_STORE_BACKEND","value":"native"},{"name":"UNIVERSE","value":""},{"name":"FACTOR_OUTPUT_PATH","value":"/data/factors"},{"name":"IDX_CONS_CODES","value":"000300,000905,000852,000985,932000"},{"name":"DATAYES_TOKEN","valueFrom":{"secretKeyRef":{"key":"DATAYES_TOKEN","name":"quant-secrets"}}},{"name":"TRADING_UNIVERSE_MODULE","value":""},{"name":"FACTOR_WORKERS","value":"6"},{"name":"RAW_DATA_ARCHIVE_ENABLED","value":"true"},{"name":"ARCHIVE_INTERVAL","value":"1800"},{"name":"RAW_DATA_UPLOAD_TIME","value":"15:30"},{"name":"COLLECTOR_DISK_OUTPUT","value":"/data/collector_output"},{"name":"PML_RECORD_DIR","value":""},{"name":"PML_RECORD_SECONDS","value":"0"},{"name":"ENGINE_MODE","value":"native"},{"name":"TZ","value":"Asia/Shanghai"},{"name":"LOG_LEVEL","value":"INFO"},{"name":"PYTHONWARNINGS","value":"ignore::DeprecationWarning"},{"name":"PIPELINE_LOG_DIR","value":"/data/quant/pipeline_logs"},{"name":"PIPELINE_LOG_FALLBACK_DIR","value":"/tmp/quant_pipeline_logs"},{"name":"NATIVE_SHM_DIR","value":"/data/quant/shm"},{"name":"NATIVE_ROWS_PER_STOCK","value":"200000"},{"name":"NATIVE_TICK_ROWS_PER_STOCK","value":"50000"},{"name":"NATIVE_ORDER_ROWS_PER_STOCK","value":"3000000"},{"name":"NATIVE_DEAL_ROWS_PER_STOCK","value":"3000000"},{"name":"NATIVE_MDL_IO_THREADS","value":"4"}],"envFrom":[{"secretRef":{"name":"quant-secrets"}}],"image":"172.24.99.176:5000/quant-platform/combined-engine:latest","name":"combined-engine","resources":{"limits":{"cpu":"8","memory":"14Gi"},"requests":{"cpu":"6","memory":"12Gi"}},"volumeMounts":[{"mountPath":"/data/factors","name":"factor-output"},{"mountPath":"/data/quant/pipeline_logs","name":"pipeline-logs"},{"mountPath":"/data/quant/mdl_logs","name":"mdl-logs"},{"mountPath":"/data/collector_output","name":"raw-archive"},{"mountPath":"/data/quant/shm","name":"shm-buffers"},{"mountPath":"/data/quant/mdl_msg_backup","name":"mdl-backup"}]}],"dnsPolicy":"ClusterFirstWithHostNet","hostNetwork":true,"nodeSelector":{"quant.lianghua.io/combined-engine":"true"},"tolerations":[{"effect":"NoSchedule","key":"dedicated","operator":"Equal","value":"quant"},{"effect":"NoSchedule","key":"node.kubernetes.io/disk-pressure","operator":"Exists"},{"effect":"NoExecute","key":"node.kubernetes.io/not-ready","operator":"Exists"},{"effect":"NoExecute","key":"node.kubernetes.io/unreachable","operator":"Exists"}],"volumes":[{"hostPath":{"path":"/data/quant/factors","type":"DirectoryOrCreate"},"name":"factor-output"},{"hostPath":{"path":"/data/quant/pipeline_logs","type":"DirectoryOrCreate"},"name":"pipeline-logs"},{"hostPath":{"path":"/data/quant/mdl_logs","type":"DirectoryOrCreate"},"name":"mdl-logs"},{"hostPath":{"path":"/data/quant/collector_output","type":"DirectoryOrCreate"},"name":"raw-archive"},{"hostPath":{"path":"/data/quant/shm","type":"DirectoryOrCreate"},"name":"shm-buffers"},{"hostPath":{"path":"/data/quant/mdl_msg_backup","type":"DirectoryOrCreate"},"name":"mdl-backup"}]}}}}
+  creationTimestamp: "2026-05-28T17:48:50Z"
+  generation: 220
+  labels:
+    app: combined-engine
+  name: combined-engine
+  namespace: quant
+  resourceVersion: "8584439319"
+  uid: eac80a1c-04ae-4fe7-bc43-869f6cc10afa
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: combined-engine
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: "2026-07-03T15:56:35+08:00"
+      labels:
+        app: combined-engine
+    spec:
+      containers:
+      - env:
+        - name: MDL_USE_LOCAL_CLIENT
+          value: "true"
+        - name: MDL_IO_THREADS
+          value: "4"
+        - name: MDL_CALLBACK_MULTITHREAD
+          value: "true"
+        - name: MDL_SUBS
+          value: 4.4,4.24,6.28,6.33,6.36
+        - name: MDL_FLUSH_INTERVAL_MS
+          value: "10"
+        - name: MDL_BATCH_SIZE
+          value: "2000"
+        - name: MDL_QUEUE_WARN_SIZE
+          value: "50000"
+        - name: MDL_QUEUE_HARD_LIMIT
+          value: "200000"
+        - name: MDL_LOCAL_SPLIT_SUBS
+          value: "true"
+        - name: MDL_TCP_OUTPUT_BUFFER_MAX
+          value: "2048000"
+        - name: MDL_TRACK_ORDER_DEAL_STATE
+          value: "false"
+        - name: MDL_LOG_PATH
+          value: /data/quant/mdl_logs/mdl
+        - name: FACTOR_MODULE
+          value: quant_platform.strategies.protected_eillen_intraday_strategy
+        - name: DAILY_FACTOR_MODULE
+          value: quant_platform.strategies.protected_eillen_strategy_v2
+        - name: DAILY_USE_MULTI_CODE
+          value: "true"
+        - name: END_TIMES
+          value: "150000"
+        - name: INFERENCE_MODULE
+          value: quant_platform.inference.tree_model_orders
+        - name: OPEN_POSITION_SIM_MODE
+          value: "1"
+        - name: OPEN_POSITION_TOTAL_CAPITAL
+          value: "10000000"
+        - name: OPEN_POSITION_PRECOMPUTE
+          value: "1"
+        - name: ONE_TIME_CLOSE_ON_STARTUP
+          value: "0"
+        - name: ONE_TIME_CLOSE_TRIGGER_TIME
+          value: "09:15"
+        - name: TREE_MODEL_STRATEGY_NAME
+          value: tree_model
+        - name: TREE_MODEL_OSS_CACHE_DIR
+          value: /data/factors/oss_cache/tree_model
+        - name: PORTFOLIO_CONTEXT_MODULE
+          value: quant_platform.broker.order_context
+        - name: COMPUTE_INTERVAL
+          value: "60"
+        - name: COMPUTE_SCHEDULES
+          value: minute,daily,daily_position,open_position,daily_basic_refresh
+        - name: MINUTE_RUN_INFERENCE
+          value: "false"
+        - name: DAILY_FACTOR_TRIGGER_TIME
+          value: "15:10"
+        - name: DAILY_POSITION_TRIGGER_TIME
+          value: "14:50"
+        - name: OPEN_POSITION_TRIGGER_TIME
+          value: "09:30"
+        - name: ORDER_GATEWAY_URL
+          value: http://172.16.0.47:18080
+        - name: ORDER_GATEWAY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: ORDER_GATEWAY_TOKEN
+              name: quant-secrets
+        - name: ORDER_GATEWAY_TIMEOUT
+          value: "10"
+        - name: ORDER_POSITION_MAX_STALE_SECONDS
+          value: "15"
+        - name: BROKER_TYPE
+          value: atx
+        - name: BROKER_ACCOUNT_ID
+          value: "00033770"
+        - name: ORDER_DEFAULT_STRATEGY
+          value: quant_platform
+        - name: ORDER_DEFAULT_PRICE_TYPE
+          value: latest
+        - name: ORDER_ALGO_STRATEGY
+          value: vwap
+        - name: DATA_FLUSH_INTERVAL
+          value: "0.01"
+        - name: SHM_STORE_BACKEND
+          value: native
+        - name: UNIVERSE
+        - name: FACTOR_OUTPUT_PATH
+          value: /data/factors
+        - name: IDX_CONS_CODES
+          value: 000300,000905,000852,000985,932000
+        - name: DATAYES_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: DATAYES_TOKEN
+              name: quant-secrets
+        - name: TRADING_UNIVERSE_MODULE
+        - name: FACTOR_WORKERS
+          value: "44"
+        - name: RAW_DATA_ARCHIVE_ENABLED
+          value: "true"
+        - name: ARCHIVE_INTERVAL
+          value: "1800"
+        - name: RAW_DATA_UPLOAD_TIME
+          value: "15:30"
+        - name: COLLECTOR_DISK_OUTPUT
+          value: /data/collector_output
+        - name: PML_RECORD_DIR
+        - name: PML_RECORD_SECONDS
+          value: "0"
+        - name: ENGINE_MODE
+          value: native
+        - name: TZ
+          value: Asia/Shanghai
+        - name: LOG_LEVEL
+          value: INFO
+        - name: PYTHONWARNINGS
+          value: ignore::DeprecationWarning
+        - name: PIPELINE_LOG_DIR
+          value: /data/quant/pipeline_logs
+        - name: PIPELINE_LOG_FALLBACK_DIR
+          value: /tmp/quant_pipeline_logs
+        - name: NATIVE_SHM_DIR
+          value: /data/quant/shm
+        - name: NATIVE_ROWS_PER_STOCK
+          value: "200000"
+        - name: NATIVE_TICK_ROWS_PER_STOCK
+          value: "50000"
+        - name: NATIVE_ORDER_ROWS_PER_STOCK
+          value: "3000000"
+        - name: NATIVE_DEAL_ROWS_PER_STOCK
+          value: "3000000"
+        - name: NATIVE_MDL_IO_THREADS
+          value: "4"
+        - name: USE_PERSISTENT_POOL
+          value: "true"
+        - name: RAW_ARCHIVE_POST_CLOSE_UPLOAD_SHM
+          value: "true"
+        - name: RAW_ARCHIVE_POST_CLOSE_SNAPSHOT_KINDS
+          value: order,deal,tick
+        - name: RAW_ARCHIVE_POST_CLOSE_UPLOAD_KINDS
+          value: order,deal,tick
+        - name: RAW_ARCHIVE_EXIT_SNAPSHOT_KINDS
+          value: order,deal,tick
+        - name: RAW_ARCHIVE_EXIT_UPLOAD_SHM
+          value: "true"
+        envFrom:
+        - secretRef:
+            name: quant-secrets
+        image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+        imagePullPolicy: Always
+        name: combined-engine
+        resources:
+          limits:
+            cpu: "44"
+            memory: 160Gi
+          requests:
+            cpu: "8"
+            memory: 16Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data/factors
+          name: factor-output
+        - mountPath: /data/quant/pipeline_logs
+          name: pipeline-logs
+        - mountPath: /data/quant/mdl_logs
+          name: mdl-logs
+        - mountPath: /data/collector_output
+          name: raw-archive
+        - mountPath: /data/quant/shm
+          name: shm-buffers
+        - mountPath: /data/quant/mdl_msg_backup
+          name: mdl-backup
+      dnsPolicy: ClusterFirstWithHostNet
+      hostNetwork: true
+      nodeSelector:
+        quant.lianghua.io/combined-engine: "true"
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated
+        operator: Equal
+        value: quant
+      - effect: NoSchedule
+        key: node.kubernetes.io/disk-pressure
+        operator: Exists
+      - effect: NoExecute
+        key: node.kubernetes.io/not-ready
+        operator: Exists
+      - effect: NoExecute
+        key: node.kubernetes.io/unreachable
+        operator: Exists
+      volumes:
+      - hostPath:
+          path: /data/quant/factors
+          type: DirectoryOrCreate
+        name: factor-output
+      - hostPath:
+          path: /data/quant/pipeline_logs
+          type: DirectoryOrCreate
+        name: pipeline-logs
+      - hostPath:
+          path: /data/quant/mdl_logs
+          type: DirectoryOrCreate
+        name: mdl-logs
+      - hostPath:
+          path: /data/quant/collector_output
+          type: DirectoryOrCreate
+        name: raw-archive
+      - hostPath:
+          path: /data/quant/shm
+          type: DirectoryOrCreate
+        name: shm-buffers
+      - hostPath:
+          path: /data/quant/mdl_msg_backup
+          type: DirectoryOrCreate
+        name: mdl-backup
+status:
+  conditions:
+  - lastTransitionTime: "2026-07-07T00:51:37Z"
+    lastUpdateTime: "2026-07-07T02:16:30Z"
+    message: ReplicaSet "combined-engine-86c79b4c85" has successfully progressed.
+    reason: NewReplicaSetAvailable
+    status: "True"
+    type: Progressing
+  - lastTransitionTime: "2026-07-10T09:03:44Z"
+    lastUpdateTime: "2026-07-10T09:03:44Z"
+    message: Deployment does not have minimum availability.
+    reason: MinimumReplicasUnavailable
+    status: "False"
+    type: Available
+  observedGeneration: 220
+  replicas: 1
+  terminatingReplicas: 0
+  unavailableReplicas: 1
+  updatedReplicas: 1
