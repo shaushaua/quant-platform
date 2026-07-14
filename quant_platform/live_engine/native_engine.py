@@ -286,13 +286,22 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
     - 整数列: int32 替代 int64（实测 OrderID max≈4600万 << 21亿上限），
               跳过逐列 isfinite，NaN 后置批量修正
     - 价格量化: 只用 >0 mask（跳过 isfinite）
-    - SeqNum: 首尾检查 O(1)（替代 np.diff O(N)），逆序才回退完整检查 + sort
+    - SeqNum: 完整单调性检查，异常时在 DataFrame 构造前稳定排序整行
     - insert TradingDay/Code: 标量广播
     """
     arr = reader.view_rows()
     n_rows = arr.shape[0]
     if n_rows == 0:
         return pd.DataFrame()
+
+    # 必须在 DataFrame 及派生列构造前排序整行，否则后续从 arr 回填的
+    # 整数列会与已经写入 df 的时间、价格和成交量错位。
+    if historical_compat and "SeqNum" in buf_cols and n_rows > 1:
+        _seq_idx = buf_cols.index("SeqNum")
+        _seq = arr[:, _seq_idx]
+        if not np.all(_seq[1:] >= _seq[:-1]):
+            logger.warning("[build] %s %s SeqNum not monotonic, sorting", code, kind_name)
+            arr = arr[np.argsort(_seq, kind="mergesort")]
 
     # Zero-copy DataFrame
     df = pd.DataFrame(arr, columns=buf_cols, copy=False)
@@ -321,19 +330,6 @@ def _build_df_from_native(reader: NativeShmReader, columns: list,
         if volume_idx:
             for _vi in volume_idx:
                 df[buf_cols[_vi]] = arr[:, _vi] * 100.0
-
-        # SeqNum 单调性 guard：只查首尾（O(1)），乱序才做完整 diff + sort。
-        # 实盘 collector 按 SeqNum 递增写入，首尾有序则整体基本有序；
-        # 多 part 合并/重启续写时首尾会逆序，此时回退到完整检查。
-        if "SeqNum" in buf_cols:
-            _seq_idx = buf_cols.index("SeqNum")
-            _seq = arr[:, _seq_idx]
-            _need_sort = False
-            if n_rows > 1 and _seq[-1] < _seq[0]:
-                _need_sort = True
-            if _need_sort and not np.all(np.diff(_seq) >= 0):
-                logger.warning("[build] %s %s SeqNum not monotonic, sorting", code, kind_name)
-                df = df.sort_values("SeqNum", kind="mergesort").reset_index(drop=True)
 
         # 整数列：int32 替代 int64（实测 OrderID max≈4600万 << int32 上限 21亿），
         # 跳过逐列 isfinite，NaN 后置批量修正。
@@ -1089,11 +1085,14 @@ class NativeEngine:
     def _filter_st_codes(self, codes: list) -> list:
         """过滤 ST/*ST/退市股票，不参与因子计算。
 
-        判定规则：market_df.SEC_SHORT_NAME 含 "ST"（含 *ST）或 "退"。
-        market_df 缓存为实例属性，只需扫描一次 ST 集合。
+        判定规则：当天 daily_basic 的 SEC_SHORT_NAME 含 "ST"（含 *ST）或 "退"。
+        必须用当天数据（_daily_basic_df），而非历史窗口 _market_df——
+        摘帽的股票当天 SEC_SHORT_NAME 已不含 ST，但历史快照里还有，
+        用 _market_df 会误排摘帽股。
         all_codes 格式 "000001.XSHE"，取前 6 位匹配 _ID_QI_PAD。
         """
-        mdf = self._market_df
+        # 优先用当天 daily_basic；若为空（首日加载/数据延迟）回退到 _market_df
+        mdf = self._daily_basic_df if self._daily_basic_df is not None and not self._daily_basic_df.empty else self._market_df
         if mdf is None or mdf.empty:
             return codes
         name_col = None

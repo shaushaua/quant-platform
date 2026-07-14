@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -89,13 +90,35 @@ KEEP_ZERO_POSITIONS = False
 ALLOW_MISSING_FEATURES = False
 INCLUDE_DEBUG_COLS = False
 USE_OPTIMIZER = True
-OPTIMIZER_MAX_TURNOVER = 0.35
-OPTIMIZER_MAX_WEIGHT = 0.01
-OPTIMIZER_CASH_RATIO = 0.0
-OPTIMIZER_TRANS_COST = 0.0003
-OPTIMIZER_STYLE_EXPOSURE_TOL = 0.30
-OPTIMIZER_INDUSTRY_EXPOSURE_TOL = 0.30
-OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT = 0.30
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float from env, falling back to default on parse error."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# Optimizer parameters — overridable via env vars so tuning doesn't require
+# a rebuild. Key knobs for the infeasible-on-rebalance issue:
+#   - MAX_TURNOVER: how much the target portfolio can differ from current.
+#     When current holdings are normalized to sum=1.0 by the C extension
+#     (regardless of actual cash), the optimizer sees gross=1.0 and a tight
+#     turnover budget leaves no room to adjust → infeasible.
+#   - CASH_RATIO: explicit allowance to hold cash (reduces target gross).
+OPTIMIZER_MAX_TURNOVER = _env_float("OPTIMIZER_MAX_TURNOVER", 0.35)
+OPTIMIZER_MAX_WEIGHT = _env_float("OPTIMIZER_MAX_WEIGHT", 0.01)
+OPTIMIZER_CASH_RATIO = _env_float("OPTIMIZER_CASH_RATIO", 0.0)
+OPTIMIZER_TRANS_COST = _env_float("OPTIMIZER_TRANS_COST", 0.0003)
+OPTIMIZER_STYLE_EXPOSURE_TOL = _env_float("OPTIMIZER_STYLE_EXPOSURE_TOL", 0.30)
+OPTIMIZER_INDUSTRY_EXPOSURE_TOL = _env_float("OPTIMIZER_INDUSTRY_EXPOSURE_TOL", 0.30)
+OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT = _env_float(
+    "OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT", 0.30
+)
 MORNING_SIGNAL_CUTOFF = "093000"
 POSITION_OUTPUT: Optional[Path] = None
 
@@ -638,6 +661,34 @@ def inference(
     )
     all_codes = pd.Index(daily_basic["ID_QI"].dropna().astype(str).unique()).sort_values()
     current_weight = extract_current_position_weights(portfolio_context, all_codes)
+
+    # extract_current_position_weights normalizes holdings to sum=1.0
+    # (qty*price / Σ qty*price), so the optimizer always thinks we are 100%
+    # invested regardless of actual cash. This makes rebalancing infeasible
+    # whenever there is uninvested cash — e.g. 100-share rounding loss on
+    # small accounts, or right after a deposit.
+    #
+    # Rescale current_weight by the true invested fraction so the optimizer
+    # sees actual gross exposure. Safe because the optimizer already accepts
+    # sum(current_weight) < 1.0 (proven by 9:30 fresh-open path where
+    # current gross=0.0 succeeds).
+    if portfolio_context is not None:
+        _acct = getattr(portfolio_context, "account", None)
+        if _acct is not None and not _acct.empty:
+            _ta = pd.to_numeric(_acct["total_asset"].iloc[0], errors="coerce") \
+                if "total_asset" in _acct.columns else float("nan")
+            _mv = pd.to_numeric(_acct["market_value"].iloc[0], errors="coerce") \
+                if "market_value" in _acct.columns else float("nan")
+            if math.isfinite(_ta) and _ta > 0 and math.isfinite(_mv) and _mv >= 0:
+                invested_frac = min(_mv / _ta, 1.0)
+                current_weight = current_weight * invested_frac
+                _cw_sum = float(pd.Series(current_weight).sum())
+                print(
+                    f"[tree-infer] rescaled current_weight by invested_frac="
+                    f"{invested_frac:.4f} (market_value={_mv:.0f} / total_asset={_ta:.0f})"
+                    f" → current gross={_cw_sum:.4f}",
+                    flush=True,
+                )
     benchmark_weight = normalize_benchmark_weights(last_index_csi_all)
     exposure_frame = build_optimizer_exposure_frame(daily_basic, signal_date)
     model_path = (
@@ -733,10 +784,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-missing-features", action="store_true")
     parser.add_argument("--include-debug-cols", action="store_true")
     parser.add_argument("--no-optimizer", action="store_true")
-    parser.add_argument("--optimizer-max-turnover", type=float, default=0.35)
-    parser.add_argument("--optimizer-max-weight", type=float, default=0.01)
-    parser.add_argument("--optimizer-cash-ratio", type=float, default=0.0)
-    parser.add_argument("--optimizer-trans-cost", type=float, default=0.0003)
+    parser.add_argument("--optimizer-max-turnover", type=float, default=OPTIMIZER_MAX_TURNOVER)
+    parser.add_argument("--optimizer-max-weight", type=float, default=OPTIMIZER_MAX_WEIGHT)
+    parser.add_argument("--optimizer-cash-ratio", type=float, default=OPTIMIZER_CASH_RATIO)
+    parser.add_argument("--optimizer-trans-cost", type=float, default=OPTIMIZER_TRANS_COST)
     return parser.parse_args()
 
 
