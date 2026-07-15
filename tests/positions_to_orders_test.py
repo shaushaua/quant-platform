@@ -129,6 +129,58 @@ def test_positions_to_orders_missing_price_target_holding_is_not_liquidated():
     assert orders.empty
 
 
+def test_positions_to_orders_reports_missing_price_for_held_target():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{
+            "total_asset": 100_000.0,
+            "available_cash": 99_000.0,
+            "market_value": 1_000.0,
+        }]),
+        positions=pd.DataFrame([{
+            "code": "600000.SH",
+            "current_volume": 100,
+            "available_volume": 100,
+            "last_price": 0.0,
+        }]),
+        meta={"latest_prices": {"000001.XSHE": 10.0}},
+    )
+    diagnostics = {}
+
+    orders = positions_to_orders(
+        pd.DataFrame([
+            {"code": "000001", "position": 0.10},
+            {"code": "600000", "position": 0.20},
+        ]),
+        ctx,
+        diagnostics=diagnostics,
+    )
+
+    assert orders["code"].tolist() == ["000001"]
+    assert diagnostics["missing_price_codes"] == ["600000"]
+
+
+def test_positions_to_orders_empty_zero_lot_has_no_missing_price():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{
+            "total_asset": 100_000.0,
+            "available_cash": 100_000.0,
+            "market_value": 0.0,
+        }]),
+        positions=pd.DataFrame(),
+        meta={"latest_prices": {"000001.XSHE": 10.0}},
+    )
+    diagnostics = {}
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.00001}]),
+        ctx,
+        diagnostics=diagnostics,
+    )
+
+    assert orders.empty
+    assert diagnostics["missing_price_codes"] == []
+
+
 def test_positions_to_orders_missing_target_prices_still_liquidates_exits():
     ctx = PortfolioContext(
         account=pd.DataFrame([{

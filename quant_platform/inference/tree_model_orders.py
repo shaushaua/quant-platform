@@ -151,6 +151,7 @@ def targets_to_orders(
     end_time: str,
     daily_basic_df: Optional[pd.DataFrame] = None,
     portfolio_context=None,
+    diagnostics: Optional[dict] = None,
 ) -> pd.DataFrame:
     """Stage 2: target weights → order rows.
 
@@ -182,6 +183,7 @@ def targets_to_orders(
         price_type=os.environ.get("TREE_MODEL_PRICE_TYPE", "latest"),
         strategy=STRATEGY_NAME,
         note=f"{STRATEGY_NAME}_{date_str}_{end_time}",
+        diagnostics=diagnostics,
     )
 
     logger.info(

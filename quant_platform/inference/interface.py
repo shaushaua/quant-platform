@@ -298,6 +298,7 @@ def positions_to_orders(
     note: str = "",
     total_capital_override: Optional[float] = None,
     delta_mode: str = "auto",
+    diagnostics: Optional[dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """Convert position-fraction output to order rows ready for order-gateway.
 
@@ -342,6 +343,9 @@ def positions_to_orders(
         daily_basic_df: Unused (kept for signature compatibility).
         price_type, strategy, note: Order row metadata.
         total_capital_override: Force a specific capital amount.
+        diagnostics: Optional mutable mapping populated with price-resolution
+            details. ``missing_price_codes`` contains normalized six-digit
+            target codes that had no realtime or broker fallback price.
 
     Returns:
         DataFrame with columns [code, side, volume, price_type, price, strategy, note]
@@ -349,6 +353,10 @@ def positions_to_orders(
     """
     import math
     import os
+
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics["missing_price_codes"] = []
 
     if positions_df is None or positions_df.empty:
         return pd.DataFrame()
@@ -466,6 +474,12 @@ def positions_to_orders(
                 )
                 prices = prices.where(prices > 0, filled)
     df["_price"] = prices.astype(float)
+    missing_price_codes = sorted(set(
+        df.loc[df["_price"] <= 0, "_code6"].astype(str)
+    ))
+    if diagnostics is not None:
+        diagnostics["missing_price_codes"] = missing_price_codes
+        diagnostics["target_code_count"] = int(df["_code6"].nunique())
     dropped = (df["_price"] <= 0).sum()
     if dropped > 0:
         logger.warning(

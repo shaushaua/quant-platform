@@ -120,6 +120,21 @@ def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
     return value
 
 
+def _env_float(name: str, default: float, minimum: Optional[float] = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("[native] invalid %s=%r, fallback to %s", name, raw, default)
+        return default
+    if not np.isfinite(value) or (minimum is not None and value < minimum):
+        logger.warning("[native] invalid %s=%r, fallback to %s", name, raw, default)
+        return default
+    return value
+
+
 def _seqnum_stats(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if df.empty or "SeqNum" not in df.columns:
         return None
@@ -1602,6 +1617,43 @@ class NativeEngine:
                 continue
             if p and float(p) > 0:
                 out[code] = float(p)
+        return out
+
+    def _snapshot_target_prices_from_shm(self, target_codes: set[str]) -> dict:
+        """Read latest prices for target codes directly from tick mmap files.
+
+        Open-position retries cannot rely only on ``self._states``: newly
+        created 9:30 SHM files are not added there until the next minute-state
+        sync. This read-only path does not touch state offsets, so it can run
+        alongside the minute schedule without replaying factor data.
+        """
+        if not target_codes:
+            return {}
+
+        wanted = {str(code).split(".")[0].zfill(6) for code in target_codes}
+        out: dict = {}
+        for code, kinds in self._scan_shm_files().items():
+            code6 = str(code).split(".")[0].zfill(6)
+            if code6 not in wanted:
+                continue
+            tick_path = kinds.get(KIND_TICK)
+            if not tick_path:
+                continue
+            reader = None
+            try:
+                reader = NativeShmReader(tick_path)
+                arr = reader.view_rows()
+                if arr.shape[0] == 0:
+                    continue
+                prices = arr[:, _tick_buf_cols.index("CurrentPrice")]
+                valid = prices[np.isfinite(prices) & (prices > 0)]
+                if valid.size:
+                    out[code] = float(valid[-1])
+            except Exception as exc:
+                logger.debug("[open_position] target price read failed %s: %s", code, exc)
+            finally:
+                if reader is not None:
+                    reader.close()
         return out
 
     @staticmethod
@@ -3133,34 +3185,83 @@ class NativeEngine:
                 logger.info("[open_position] %s using precomputed targets: %d rows",
                             schedule.name, len(cached_targets))
                 positions_df = None
-                try:
-                    portfolio_context = None
-                    if self.portfolio_context_fn is not None:
-                        portfolio_context = self.portfolio_context_fn(date_str, end_time_label)
-                    if portfolio_context is not None:
-                        lp = self._snapshot_latest_prices()
-                        if lp:
-                            portfolio_context.meta["latest_prices"] = lp
-                    import importlib as _il
-                    tm = _il.import_module(
-                        os.environ.get("INFERENCE_MODULE",
-                                       "quant_platform.inference.tree_model_orders"))
-                    targets_to_orders = getattr(tm, "targets_to_orders", None)
-                    if targets_to_orders is None:
-                        # 老版本 inference 模块没有拆分接口 → 用 inference_fn 全跑
-                        logger.warning(
-                            "[open_position] inference module lacks targets_to_orders, "
-                            "precompute cache unusable; falling back")
-                    else:
+
+                # At 9:30:00 the collector creates SHM files lazily, so some
+                # target codes have no price yet. positions_to_orders reports
+                # the exact missing-price set; do not infer it from output rows
+                # because valid zero-delta/zero-lot targets produce no order.
+                max_retries = _env_int("OPEN_POSITION_PRICE_RETRIES", 5, minimum=1)
+                retry_delay = _env_float(
+                    "OPEN_POSITION_PRICE_RETRY_DELAY", 2.0, minimum=0.0)
+                target_code_set = {
+                    str(code).split(".")[0].zfill(6)
+                    for code in cached_targets["code"].astype(str)
+                }
+                conversion_succeeded = False
+                for attempt in range(max_retries):
+                    try:
+                        portfolio_context = None
+                        if self.portfolio_context_fn is not None:
+                            portfolio_context = self.portfolio_context_fn(date_str, end_time_label)
+                        if portfolio_context is not None:
+                            lp = self._snapshot_latest_prices()
+                            resolved_codes = {
+                                str(code).split(".")[0].zfill(6) for code in lp
+                            }
+                            unresolved_codes = target_code_set - resolved_codes
+                            if unresolved_codes:
+                                lp.update(self._snapshot_target_prices_from_shm(
+                                    unresolved_codes))
+                            if lp:
+                                portfolio_context.meta["latest_prices"] = lp
+                        import importlib as _il
+                        tm = _il.import_module(
+                            os.environ.get("INFERENCE_MODULE",
+                                           "quant_platform.inference.tree_model_orders"))
+                        targets_to_orders = getattr(tm, "targets_to_orders", None)
+                        if targets_to_orders is None:
+                            # 老版本 inference 模块没有拆分接口 → 用 inference_fn 全跑
+                            logger.warning(
+                                "[open_position] inference module lacks targets_to_orders, "
+                                "precompute cache unusable; falling back")
+                            break
+                        diagnostics: dict = {}
                         positions_df = targets_to_orders(
                             cached_targets, date_str, end_time_label,
                             daily_basic_df=self._daily_basic_df,
                             portfolio_context=portfolio_context,
+                            diagnostics=diagnostics,
                         )
-                except Exception as exc:
-                    logger.error("[open_position] targets_to_orders failed: %s",
-                                 exc, exc_info=True)
-                    positions_df = None
+                        conversion_succeeded = True
+                    except Exception as exc:
+                        logger.error("[open_position] targets_to_orders failed: %s",
+                                     exc, exc_info=True)
+                        positions_df = None
+                        break
+
+                    missing_price_codes = set(
+                        diagnostics.get("missing_price_codes", [])
+                    )
+                    if not missing_price_codes:
+                        if attempt > 0:
+                            logger.info(
+                                "[open_position] price retry %d/%d succeeded: "
+                                "all target prices resolved",
+                                attempt + 1, max_retries)
+                        break
+
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            "[open_position] price retry %d/%d: %d target codes "
+                            "still lack tick price (e.g. %s), waiting %.0fs",
+                            attempt + 1, max_retries, len(missing_price_codes),
+                            ",".join(sorted(missing_price_codes)[:5]), retry_delay)
+                        time.sleep(retry_delay)
+                    else:
+                        logger.warning(
+                            "[open_position] price retries exhausted after %d attempts: "
+                            "%d target codes still missing tick price",
+                            max_retries, len(missing_price_codes))
 
                 if positions_df is not None and not positions_df.empty:
                     # 写一份 _positions.csv 保持兼容（监控/对账依赖）
@@ -3182,6 +3283,13 @@ class NativeEngine:
                                          len(positions_df))
                     else:
                         _push_to_order_gateway(positions_df, date_str, end_time_label)
+                    return
+                if conversion_succeeded:
+                    # Empty can be a valid zero-delta/zero-lot result. Re-running
+                    # heavy inference cannot create missing market prices.
+                    logger.warning(
+                        "[open_position] target conversion produced no orders; "
+                        "skip heavy inference fallback")
                     return
                 # targets_to_orders 失败 → 继续走 fallback
                 logger.warning("[open_position] targets_to_orders returned empty, falling back")
