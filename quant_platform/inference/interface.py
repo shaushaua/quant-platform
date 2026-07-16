@@ -703,7 +703,7 @@ def positions_to_orders(
     df = df[df["side"] != ""]
 
     out = pd.DataFrame({
-        "code": df["code"].astype(str),
+        "code": df["_code6"].astype(str),
         "side": df["side"],
         "volume": df["volume"].astype(int),
         "price_type": price_type,

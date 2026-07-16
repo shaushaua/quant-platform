@@ -83,6 +83,9 @@ spec:
               value: "150000"
             - name: INFERENCE_MODULE
               value: "quant_platform.inference.tree_model_orders"
+            # 恢复树模型原始换手约束；大额入金建仓阶段曾临时放宽为 1.0。
+            - name: OPTIMIZER_MAX_TURNOVER
+              value: "0.35"
             # --- 实盘资金：通过 order-gateway /v1/balance 接口取真实总资产 ---
             # portfolio_context_fn 调 _fetch_balance(ORDER_GATEWAY_URL, BROKER_ACCOUNT_ID)
             # → positions_to_orders 用 account.total_asset 做 position sizing。
