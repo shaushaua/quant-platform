@@ -659,6 +659,45 @@ def inference(
         end_time=end_time,
         morning_cutoff=MORNING_SIGNAL_CUTOFF,
     )
+    # ST/*ST/退市股票不参与调仓：必须在候选池入口剔除，否则优化器仍会选到 ST
+    # （native_engine._filter_st_codes 只作用于分钟因子计算，不作用于 inference）。
+    # 判定规则与 _filter_st_codes 一致：当天 daily_basic 的 SEC_SHORT_NAME 含
+    # "ST"（含 *ST）或 "退"。用当天数据，避免历史快照误排已摘帽股。
+    #
+    # 这是第二层（兜底）：第一层是 trading_universe 模块（Pod 启动时调用一次，
+    # 把 ST 排除出 universe），见 quant_platform/inference/trading_universe.py。
+    # 这里再过滤一次是为了：
+    #   1. 即使没配 TRADING_UNIVERSE_MODULE，inference 也能独立保证无 ST
+    #   2. 防止 Pod 启动后盘中 ST 状态变化（摘帽/戴帽）导致的遗漏
+    _st_name_col = next(
+        (c for c in ("SEC_SHORT_NAME", "SEC_NAME", "name") if c in daily_basic.columns),
+        None,
+    )
+    _st_id_col = "_ID_QI_PAD" if "_ID_QI_PAD" in daily_basic.columns else (
+        "ID_QI" if "ID_QI" in daily_basic.columns else None
+    )
+    if _st_name_col is not None and _st_id_col is not None and not daily_basic.empty:
+        _today_rows = daily_basic[daily_basic["trade_date"].astype(str) == date_str]
+        if _today_rows.empty:
+            _latest_trade_date = daily_basic["trade_date"].dropna().astype(str).max()
+            _today_rows = daily_basic[daily_basic["trade_date"].astype(str) == _latest_trade_date]
+        _names = _today_rows[_st_name_col].astype(str).str.upper()
+        _st_mask = _names.str.contains("ST", na=False) | _names.str.contains("退", na=False)
+        if _st_mask.any():
+            _st_codes = set(
+                _today_rows.loc[_st_mask, _st_id_col]
+                .astype(str)
+                .str.split(".")
+                .str[0]
+                .str.zfill(6)
+            )
+            _before_rows = len(daily_basic)
+            daily_basic = daily_basic.loc[~daily_basic["ID_QI"].astype(str).isin(_st_codes)].copy()
+            print(
+                f"[tree-infer] ST/退市过滤: 排除 {len(_st_codes)} 只 "
+                f"({date_str} 当前名称含 ST/退)，daily_basic {_before_rows} → {len(daily_basic)} 行",
+                flush=True,
+            )
     all_codes = pd.Index(daily_basic["ID_QI"].dropna().astype(str).unique()).sort_values()
     current_weight = extract_current_position_weights(portfolio_context, all_codes)
 

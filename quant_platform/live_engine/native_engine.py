@@ -4321,6 +4321,14 @@ def _push_to_order_gateway_http(orders_df: pd.DataFrame, date_str: str, end_time
 
 
 def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
+    # 50/50 分流：有效订单序号偶数走 VWAP，奇数走 TWAP。两者执行窗口均为 60s
+    # （由 gateway atx_order_window_seconds 控制）。当前 gateway 只支持
+    # vwap/twap，row/env 里的其他 algo_strategy 都按未设置处理。
+    split_algo_enabled = str(os.environ.get("ORDER_ALGO_SPLIT_VWAP_TWAP", "")).strip() not in ("", "0", "false", "False")
+    default_algo = os.environ.get("ORDER_ALGO_STRATEGY", "").strip().lower()
+    if default_algo not in {"", "vwap", "twap"}:
+        logger.warning("[order-gateway] ignore unsupported ORDER_ALGO_STRATEGY=%r", default_algo)
+        default_algo = ""
     orders = []
     for _, row in orders_df.iterrows():
         code = _order_symbol(row.get("symbol", row.get("code", "")))
@@ -4349,6 +4357,22 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
                          code, side, price_raw)
             continue
 
+        algo_param = row.get("algo_param", row.get("atx_algo_param", ""))
+        # 执行算法策略名 → Gateway 侧自动 resolveAlgoStrategy()
+        # 优先级 row.algo_strategy(vwap/twap only) > 50/50 分流(启用时) > env ORDER_ALGO_STRATEGY
+        # > gateway ATX_DEFAULT_ORD_TYPE
+        algo_strategy = row.get("algo_strategy", "")
+        algo_strategy = str(algo_strategy).strip().lower() if algo_strategy not in {"", None} and not pd.isna(algo_strategy) else ""
+        if algo_strategy and algo_strategy not in {"vwap", "twap"}:
+            logger.warning("[order-gateway] ignore unsupported row algo_strategy=%r code=%s", algo_strategy, code)
+            algo_strategy = ""
+        if not algo_strategy:
+            if split_algo_enabled:
+                # 只按有效订单序号分流，避免无效行 continue 后比例偏移。
+                algo_strategy = "vwap" if (len(orders) % 2 == 0) else "twap"
+            else:
+                algo_strategy = default_algo
+
         explicit_id = str(row.get("order_id", "") or "")
         if explicit_id:
             order_id = explicit_id
@@ -4361,8 +4385,8 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
             content = "|".join([
                 date_str, end_time, code, side, str(int(volume)),
                 price_type, f"{price:.6f}", strategy,
-                str(row.get("algo_strategy", "") or ""),
-                str(row.get("algo_param", "") or ""),
+                algo_strategy,
+                str(algo_param or ""),
             ])
             order_id = f"{strategy}_" + hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
         order = {
@@ -4375,22 +4399,20 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
             "strategy": strategy,
             "note": note,
         }
-        algo_param = row.get("algo_param", row.get("atx_algo_param", ""))
         if algo_param not in {"", None} and not pd.isna(algo_param):
             order["algo_param"] = str(algo_param)
-        # 执行算法策略名 → Gateway 侧自动 resolveAlgoStrategy()
-        # 优先级行 row.algo_strategy > env ORDER_ALGO_STRATEGY > gateway ATX_DEFAULT_ORD_TYPE
-        algo_strategy = row.get("algo_strategy", "")
-        if algo_strategy in {"", None} or pd.isna(algo_strategy):
-            algo_strategy = os.environ.get("ORDER_ALGO_STRATEGY", "").strip().lower()
         if algo_strategy:
-            order["algo_strategy"] = str(algo_strategy)
-        # POV 执行算法参数
+            order["algo_strategy"] = algo_strategy
+        # 执行算法参数（gateway 侧按 vwap/twap 解释支持的字段）
         for field in ("max_percent", "up_limit", "down_limit"):
             val = row.get(field)
             if val not in {"", None, 0} and not pd.isna(val):
                 order[field] = float(val)
         orders.append(order)
+    if split_algo_enabled:
+        n_vwap = sum(1 for o in orders if str(o.get("algo_strategy", "")).lower() == "vwap")
+        n_twap = sum(1 for o in orders if str(o.get("algo_strategy", "")).lower() == "twap")
+        logger.info("[order-gateway] algo split: vwap=%d twap=%d total=%d", n_vwap, n_twap, len(orders))
     return orders
 
 
