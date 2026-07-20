@@ -23,6 +23,18 @@ patches:
                     value: "true"
                   - name: FACTOR_WORKERS
                     value: "44"
+                  # --- 实盘路由（base 默认是模拟盘，prod 必须覆盖）---
+                  # 不覆盖的话 kubectl apply -k overlays/prod 会把实盘打成模拟盘。
+                  - name: ORDER_GATEWAY_URL
+                    value: "http://172.24.99.176:8080"
+                  - name: BROKER_ACCOUNT_ID
+                    value: "501000119118"
+                  # --- ST/退市过滤：Pod 启动时调 trading_universe() 排除 ST ---
+                  - name: TRADING_UNIVERSE_MODULE
+                    value: "quant_platform.inference.trading_universe"
+                  # --- 订单算法 50/50 分流：偶数 VWAP / 奇数 TWAP ---
+                  - name: ORDER_ALGO_SPLIT_VWAP_TWAP
+                    value: "1"
                 resources:
                   requests:
                     cpu: "2"
