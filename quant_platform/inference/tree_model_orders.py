@@ -124,6 +124,13 @@ def inference_targets(
     Returns a normalized positions DataFrame with `code` and `position` columns
     suitable for ``targets_to_orders``. Returns empty DataFrame on failure.
     """
+    # ST 过滤必须在 _prepare_daily_basic_for_tree 之前执行：后者会删除
+    # SEC_SHORT_NAME 列（编译模型只接受数值列），而 ST 判定依赖该列。
+    # 否则过滤拿不到名称列 → 静默跳过 → ST 股票进入候选池被优化器选中。
+    if daily_basic_df is not None and not daily_basic_df.empty:
+        from .tree_model_inference import filter_st_stocks_from_daily_basic
+        daily_basic_df = filter_st_stocks_from_daily_basic(daily_basic_df, date_str)
+
     daily_basic_df = _prepare_daily_basic_for_tree(daily_basic_df, "stage 1")
 
     positions = _tree.inference(

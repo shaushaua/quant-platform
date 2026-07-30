@@ -3270,8 +3270,11 @@ class NativeEngine:
                             pos_file = self.output_path / f"{date_str}_{end_time_label}_positions.csv"
                             _compact_output_copy(positions_df).to_csv(pos_file, index=False)
                             logger.info("[open_position] wrote %s", pos_file)
-                    except Exception:
-                        pass
+                        # 上传持仓到 OSS（持久化，方便回溯对账）
+                        _upload_to_oss(_compact_output_copy(positions_df),
+                                       date_str, end_time_label, category="positions")
+                    except Exception as exc:
+                        logger.warning("[open_position] positions upload failed: %s", exc)
                     if self._order_queue is not None:
                         try:
                             self._order_queue.put_nowait(
@@ -3852,6 +3855,12 @@ class NativeEngine:
                     _compact_output_copy(positions_df).to_csv(pos_file, index=False)
                     logger.info("[%s] wrote %d positions to %s",
                                 log_tag, len(positions_df), pos_file)
+                # 上传持仓到 OSS（持久化，方便回溯对账）
+                try:
+                    _upload_to_oss(_compact_output_copy(positions_df),
+                                   date_str, label, category="positions")
+                except Exception as exc:
+                    logger.warning("[%s] positions upload failed: %s", log_tag, exc)
         except Exception as exc:
             logger.error("[%s] inference failed: %s", log_tag, exc, exc_info=True)
             positions_df = None

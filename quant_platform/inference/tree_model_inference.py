@@ -59,6 +59,75 @@ except ModuleNotFoundError:
         resolve_signal_date,
     )
 
+
+def filter_st_stocks_from_daily_basic(daily_basic, date_str: str = ""):
+    """从 daily_basic 中剔除 ST/*ST/退市股票。
+
+    判定规则与 native_engine._filter_st_codes 一致：当天快照的 SEC_SHORT_NAME
+    含 "ST"（含 *ST）或 "退"。必须在 _prepare_daily_basic_for_tree 删除
+    SEC_SHORT_NAME 列【之前】调用，否则无法判定 ST 状态。
+
+    这是 inference 层的兜底过滤。trading_universe 模块是第一层。
+    """
+    import pandas as _pd
+
+    if daily_basic is None or daily_basic.empty:
+        return daily_basic
+
+    _st_name_col = next(
+        (c for c in ("SEC_SHORT_NAME", "SEC_NAME", "name") if c in daily_basic.columns),
+        None,
+    )
+    _st_id_col = "_ID_QI_PAD" if "_ID_QI_PAD" in daily_basic.columns else (
+        "ID_QI" if "ID_QI" in daily_basic.columns else None
+    )
+    if _st_name_col is None or _st_id_col is None:
+        return daily_basic
+
+    # 选定日期的快照（避免多日窗口里历史名称误排已摘帽股）
+    _today_rows = daily_basic
+    if "trade_date" in daily_basic.columns:
+        if date_str:
+            _today_rows = daily_basic[daily_basic["trade_date"].astype(str) == date_str]
+        if _today_rows.empty:
+            _latest = daily_basic["trade_date"].dropna().astype(str).max()
+            _today_rows = daily_basic[daily_basic["trade_date"].astype(str) == _latest]
+
+    _names = _today_rows[_st_name_col].astype(str).str.upper()
+    _st_mask = _names.str.contains("ST", na=False) | _names.str.contains("退", na=False)
+    if not _st_mask.any():
+        return daily_basic
+
+    # 归一化 ST 代码到 6 位纯数字（与 ID_QI 列格式一致）
+    _st_codes = set(
+        _today_rows.loc[_st_mask, _st_id_col]
+        .astype(str)
+        .str.split(".")
+        .str[0]
+        .str.zfill(6)
+    )
+    # 同时匹配纯数字和带后缀的 ID_QI（兼容不同数据源格式）
+    _st_patterns = set()
+    for c in _st_codes:
+        _st_patterns.add(c)
+        _st_patterns.add(c + ".SH")
+        _st_patterns.add(c + ".SZ")
+        _st_patterns.add(c + ".BJ")
+        _st_patterns.add(c + ".XSHG")
+        _st_patterns.add(c + ".XSHE")
+    _before = len(daily_basic)
+    _id_norm = daily_basic["ID_QI"].astype(str)
+    # 用纯数字匹配（ID_QI 大多数是纯数字格式）
+    _id_6digit = _id_norm.str.split(".").str[0].str.zfill(6)
+    daily_basic = daily_basic.loc[~_id_6digit.isin(_st_codes)].copy()
+    print(
+        f"[tree-infer] ST/退市过滤: 排除 {len(_st_codes)} 只 "
+        f"({date_str or 'latest'} 当前名称含 ST/退)，daily_basic {_before} → {len(daily_basic)} 行",
+        flush=True,
+    )
+    return daily_basic
+
+
 DEFAULT_OUTPUT = Path("artifacts/tree_model_positions.csv")
 OSS_ENDPOINT = "https://oss-cn-hangzhou.aliyuncs.com"
 OSS_DATA_BUCKET = "quant-mdl-data"
@@ -669,35 +738,7 @@ def inference(
     # 这里再过滤一次是为了：
     #   1. 即使没配 TRADING_UNIVERSE_MODULE，inference 也能独立保证无 ST
     #   2. 防止 Pod 启动后盘中 ST 状态变化（摘帽/戴帽）导致的遗漏
-    _st_name_col = next(
-        (c for c in ("SEC_SHORT_NAME", "SEC_NAME", "name") if c in daily_basic.columns),
-        None,
-    )
-    _st_id_col = "_ID_QI_PAD" if "_ID_QI_PAD" in daily_basic.columns else (
-        "ID_QI" if "ID_QI" in daily_basic.columns else None
-    )
-    if _st_name_col is not None and _st_id_col is not None and not daily_basic.empty:
-        _today_rows = daily_basic[daily_basic["trade_date"].astype(str) == date_str]
-        if _today_rows.empty:
-            _latest_trade_date = daily_basic["trade_date"].dropna().astype(str).max()
-            _today_rows = daily_basic[daily_basic["trade_date"].astype(str) == _latest_trade_date]
-        _names = _today_rows[_st_name_col].astype(str).str.upper()
-        _st_mask = _names.str.contains("ST", na=False) | _names.str.contains("退", na=False)
-        if _st_mask.any():
-            _st_codes = set(
-                _today_rows.loc[_st_mask, _st_id_col]
-                .astype(str)
-                .str.split(".")
-                .str[0]
-                .str.zfill(6)
-            )
-            _before_rows = len(daily_basic)
-            daily_basic = daily_basic.loc[~daily_basic["ID_QI"].astype(str).isin(_st_codes)].copy()
-            print(
-                f"[tree-infer] ST/退市过滤: 排除 {len(_st_codes)} 只 "
-                f"({date_str} 当前名称含 ST/退)，daily_basic {_before_rows} → {len(daily_basic)} 行",
-                flush=True,
-            )
+    daily_basic = filter_st_stocks_from_daily_basic(daily_basic, date_str)
     all_codes = pd.Index(daily_basic["ID_QI"].dropna().astype(str).unique()).sort_values()
     current_weight = extract_current_position_weights(portfolio_context, all_codes)
 

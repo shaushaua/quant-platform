@@ -161,6 +161,24 @@ def trading_universe(
         f"(排除 {len(st_set)} 只 ST/退市)"
     )
 
+    # 手动黑名单（环境变量 TRADING_UNIVERSE_EXCLUDE_CODES，逗号分隔的 6 位代码）。
+    # 用于临时排除高风险票（如连板妖股），无需改代码即可通过 k8s env 调整。
+    import os as _os
+    _exclude_raw = _os.environ.get("TRADING_UNIVERSE_EXCLUDE_CODES", "").strip()
+    if _exclude_raw:
+        _exclude_set = {
+            c.strip().split(".")[0].zfill(6)
+            for c in _exclude_raw.split(",")
+            if c.strip()
+        }
+        _before = len(filtered)
+        filtered = [c for c in filtered if c not in _exclude_set]
+        if len(filtered) < _before:
+            print(
+                f"[trading-universe] 手动黑名单排除 {len(_exclude_set)} 只: "
+                f"{','.join(sorted(_exclude_set))} → {len(filtered)} 只"
+            )
+
     # 转成 "000001.SZ" / "600000.SH" 格式，与 INFERENCE_INTERFACE.md 示例一致。
     # 0/3 开头 → SZ，6 开头 → SH，8/4 开头（北交所）→ BJ。
     def _to_symbol(code6: str) -> str:

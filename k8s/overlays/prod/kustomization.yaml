@@ -32,6 +32,9 @@ patches:
                   # --- ST/退市过滤：Pod 启动时调 trading_universe() 排除 ST ---
                   - name: TRADING_UNIVERSE_MODULE
                     value: "quant_platform.inference.trading_universe"
+                  # --- 手动黑名单：临时排除高风险票（8 连板妖股等）---
+                  - name: TRADING_UNIVERSE_EXCLUDE_CODES
+                    value: "603221"
                   # --- 订单算法 50/50 分流：偶数 VWAP / 奇数 TWAP ---
                   - name: ORDER_ALGO_SPLIT_VWAP_TWAP
                     value: "1"
