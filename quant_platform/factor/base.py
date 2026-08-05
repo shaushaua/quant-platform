@@ -107,6 +107,8 @@ class StockState:
     high: float = 0.0
     low: float = float('inf')
     pre_close: float = 0.0
+    high_limit: float = 0.0   # 涨停价(交易所公布)
+    low_limit: float = 0.0    # 跌停价(交易所公布)
 
     # --- 买卖盘（最新快照）---
     ask1: float = 0.0

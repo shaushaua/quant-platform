@@ -345,7 +345,8 @@ def positions_to_orders(
         total_capital_override: Force a specific capital amount.
         diagnostics: Optional mutable mapping populated with price-resolution
             details. ``missing_price_codes`` contains normalized six-digit
-            target codes that had no realtime or broker fallback price.
+            target codes that had no realtime or broker fallback price;
+            ``limit_up_buy_codes`` contains unheld buys removed at high limit.
 
     Returns:
         DataFrame with columns [code, side, volume, price_type, price, strategy, note]
@@ -357,6 +358,7 @@ def positions_to_orders(
     if diagnostics is not None:
         diagnostics.clear()
         diagnostics["missing_price_codes"] = []
+        diagnostics["limit_up_buy_codes"] = []
 
     if positions_df is None or positions_df.empty:
         return pd.DataFrame()
@@ -701,6 +703,67 @@ def positions_to_orders(
         lambda w: "buy" if w > 0 else ("sell" if w < 0 else "")
     )
     df = df[df["side"] != ""]
+
+    # Only block a new position when the stock is confirmed at its published
+    # high-limit price. Existing-position adjustments, sells, and stocks whose
+    # limit price is unavailable continue through normal order calculation.
+    limit_up_buy_codes: list[str] = []
+    if portfolio_context is not None and not df.empty:
+        limit_prices = (portfolio_context.meta or {}).get("limit_prices") or {}
+        high_limit_by_code: dict[str, float] = {}
+        for key, value in limit_prices.items():
+            try:
+                high_limit = value[0] if isinstance(value, (list, tuple)) else value
+                high_limit = float(high_limit)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if high_limit > 0:
+                high_limit_by_code[_norm_code6(key)] = high_limit
+
+        positions = getattr(portfolio_context, "positions", None)
+        held_codes: set[str] = set()
+        if positions is not None and not positions.empty and "code" in positions.columns:
+            held_code_series = positions["code"].astype(str).map(_norm_code6)
+            held_volume_col = next(
+                (c for c in (
+                    "current_volume", "volume", "total_qty", "qty", "quantity",
+                    "position_volume",
+                ) if c in positions.columns),
+                None,
+            )
+            if held_volume_col is None:
+                # A position row without a quantity field is treated as held so
+                # the limit-up guard does not become stricter on incomplete data.
+                held_codes = set(held_code_series)
+            else:
+                held_volumes = pd.to_numeric(
+                    positions[held_volume_col], errors="coerce"
+                ).fillna(0.0)
+                held_codes = set(held_code_series[held_volumes > 0])
+
+        high_limits = df["_code6"].map(high_limit_by_code).fillna(0.0)
+        if high_limit_by_code:
+            at_high_limit = (
+                (df["side"] == "buy")
+                & (high_limits > 0)
+                & (df["_price"] >= high_limits - 1e-6)
+                & (~df["_code6"].isin(held_codes))
+            )
+            if at_high_limit.any():
+                limit_up_buy_codes = sorted(
+                    set(df.loc[at_high_limit, "_code6"].astype(str))
+                )
+                logger.info(
+                    "positions_to_orders: dropped %d unheld limit-up buy orders: %s",
+                    int(at_high_limit.sum()),
+                    ",".join(limit_up_buy_codes[:10]),
+                )
+                df = df[~at_high_limit]
+
+    if diagnostics is not None:
+        diagnostics["limit_up_buy_codes"] = limit_up_buy_codes
+    if df.empty:
+        return pd.DataFrame()
 
     out = pd.DataFrame({
         "code": df["_code6"].astype(str),

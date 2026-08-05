@@ -581,6 +581,8 @@ class NativeEngine:
         self.trading_day: str = ""
         self._pool: Optional[multiprocessing.Pool] = None
         self._daily_cache: Optional[DailyBasicCache] = None
+        self._daily_limit_prices: Dict[str, Tuple[float, float]] = {}
+        self._open_position_limit_prices_ready = False
         self._idx_cons_cache: Optional[IdxConsCache] = None
         self._idx_cons_df: pd.DataFrame = pd.DataFrame()
         self._trading_universe_df: Optional[pd.DataFrame] = None
@@ -811,6 +813,65 @@ class NativeEngine:
             "[native] daily_basic: %d stocks, market: %d entries, market_count=%d",
             len(self._daily_basic_df), len(self._market_df), market_count,
         )
+
+    def _load_daily_limit_prices(self) -> bool:
+        """Load exact daily limit prices from MySQL ``mkt_limit`` once.
+
+        Shanghai L2 tick messages may report HighLimitPrice/LowLimitPrice as
+        zero. The daily table is the authoritative fallback and already
+        accounts for ST, ChiNext/STAR, IPO and other board-specific rules.
+        Realtime tick limit fields are used only when this table has no value.
+        """
+        self._daily_limit_prices = {}
+        self._open_position_limit_prices_ready = False
+        loader = getattr(self._daily_cache, "loader", None)
+        if loader is None or not self.trading_day:
+            logger.warning("[native] daily limit prices unavailable: loader/day missing")
+            return False
+        try:
+            prices = loader.get_limit_prices(self.trading_day)
+            for code, item in prices.items():
+                high_limit = float(getattr(item, "high_limit", 0.0) or 0.0)
+                low_limit = float(getattr(item, "low_limit", 0.0) or 0.0)
+                if high_limit > 0 or low_limit > 0:
+                    self._daily_limit_prices[str(code)] = (high_limit, low_limit)
+            logger.info(
+                "[native] loaded daily limit prices: trading_day=%s codes=%d",
+                self.trading_day, len(self._daily_limit_prices),
+            )
+            self._open_position_limit_prices_ready = bool(self._daily_limit_prices)
+            return self._open_position_limit_prices_ready
+        except Exception as exc:
+            logger.error("[native] daily limit price load failed: %s", exc)
+            return False
+
+    def _ensure_open_position_limit_prices(self) -> bool:
+        """Ensure limit prices are ready during the startup precompute phase."""
+        if self._open_position_limit_prices_ready and self._daily_limit_prices:
+            return True
+        retries = _env_int("OPEN_POSITION_LIMIT_PRICE_LOAD_RETRIES", 3, minimum=1)
+        delay = _env_float(
+            "OPEN_POSITION_LIMIT_PRICE_LOAD_RETRY_DELAY", 2.0, minimum=0.0)
+        for attempt in range(retries):
+            if self._load_daily_limit_prices():
+                if attempt > 0:
+                    logger.info(
+                        "[precompute] daily limit prices ready after retry %d/%d",
+                        attempt + 1, retries,
+                    )
+                return True
+            if attempt < retries - 1:
+                logger.warning(
+                    "[precompute] daily limit prices unavailable, retry %d/%d in %.0fs",
+                    attempt + 1, retries, delay,
+                )
+                time.sleep(delay)
+        logger.error(
+            "[precompute] daily limit prices unavailable after %d attempts; "
+            "codes without a limit threshold will continue without limit-up filtering",
+            retries,
+        )
+        return False
 
     def _one_time_close_on_startup(self) -> None:
         """Flatten all broker holdings once per trading day.
@@ -1610,7 +1671,7 @@ class NativeEngine:
         """
         out: dict = {}
         # GIL makes dict() copy atomic-ish; iteration then runs on private copy
-        for code, st in dict(self._states).items():
+        for code, st in dict(getattr(self, "_states", {})).items():
             try:
                 p = getattr(st, "latest_price", 0.0)
             except Exception:
@@ -1619,13 +1680,58 @@ class NativeEngine:
                 out[code] = float(p)
         return out
 
-    def _snapshot_target_prices_from_shm(self, target_codes: set[str]) -> dict:
-        """Read latest prices for target codes directly from tick mmap files.
+    def _snapshot_pre_close_prices(self) -> dict:
+        """Snapshot {code: pre_close} from in-memory states.
+
+        Used together with latest_prices to compute limit-up/down prices for
+        order filtering. Returns {} if states are empty.
+        """
+        out: dict = {}
+        for code, st in dict(getattr(self, "_states", {})).items():
+            try:
+                pc = getattr(st, "pre_close", 0.0)
+            except Exception:
+                continue
+            if pc and float(pc) > 0:
+                out[code] = float(pc)
+        return out
+
+    def _snapshot_limit_prices(self) -> dict:
+        """Snapshot {code: (high_limit, low_limit)} from in-memory states.
+
+        Uses the daily ``mkt_limit`` cache as the authoritative source. The
+        exchange-published values stored in StockState only fill missing daily
+        values; no board-type estimation is performed.
+        """
+        out: dict = dict(getattr(self, "_daily_limit_prices", {}))
+        for code, st in dict(getattr(self, "_states", {})).items():
+            try:
+                hl = getattr(st, "high_limit", 0.0)
+                ll = getattr(st, "low_limit", 0.0)
+            except Exception:
+                continue
+            if hl > 0 or ll > 0:
+                old_hl, old_ll = out.get(code, (0.0, 0.0))
+                out[code] = (
+                    float(old_hl) if old_hl > 0 else float(hl),
+                    float(old_ll) if old_ll > 0 else float(ll),
+                )
+        return out
+
+    def _snapshot_target_prices_from_shm(
+        self,
+        target_codes: set[str],
+        limit_prices: Optional[dict] = None,
+    ) -> dict:
+        """Read latest prices and optional limit prices from tick mmap files.
 
         Open-position retries cannot rely only on ``self._states``: newly
         created 9:30 SHM files are not added there until the next minute-state
         sync. This read-only path does not touch state offsets, so it can run
-        alongside the minute schedule without replaying factor data.
+        alongside the minute schedule without replaying factor data. When
+        ``limit_prices`` is provided, it is populated from the same latest tick
+        row so a newly-created SHM file cannot bypass limit-up filtering while
+        ``self._states`` is still catching up.
         """
         if not target_codes:
             return {}
@@ -1649,6 +1755,11 @@ class NativeEngine:
                 valid = prices[np.isfinite(prices) & (prices > 0)]
                 if valid.size:
                     out[code] = float(valid[-1])
+                if limit_prices is not None:
+                    high_limit = float(arr[-1, _tick_buf_cols.index("HighLimitPrice")])
+                    low_limit = float(arr[-1, _tick_buf_cols.index("LowLimitPrice")])
+                    if high_limit > 0 or low_limit > 0:
+                        limit_prices[code] = (high_limit, low_limit)
             except Exception as exc:
                 logger.debug("[open_position] target price read failed %s: %s", code, exc)
             finally:
@@ -1675,6 +1786,12 @@ class NativeEngine:
         pre_close = float(arr[-1, 5])
         if pre_close > 0:
             state.pre_close = pre_close
+        high_limit = float(arr[-1, 9])   # HighLimitPrice
+        if high_limit > 0:
+            state.high_limit = high_limit
+        low_limit = float(arr[-1, 10])   # LowLimitPrice
+        if low_limit > 0:
+            state.low_limit = low_limit
         ask1 = float(arr[-1, 17])
         if ask1 > 0:
             state.ask1 = ask1
@@ -2920,6 +3037,16 @@ class NativeEngine:
                 logger.warning("[precompute] trading_day empty, skip")
                 return
 
+            # Prepare exact daily limit prices here, well before 9:30. This
+            # thread is independent from minute factor computation, so MySQL
+            # retry latency cannot block the minute schedule. The 9:30 path
+            # only reads the resulting in-memory cache.
+            if not self._ensure_open_position_limit_prices():
+                logger.warning(
+                    "[precompute] continuing target inference without complete "
+                    "daily limits; only confirmed unheld limit-up buys will be filtered"
+                )
+
             # 仅当 inference 模块暴露了拆分接口时才走快路径
             inference_module = os.environ.get(
                 "INFERENCE_MODULE", "quant_platform.inference.tree_model_orders")
@@ -3209,11 +3336,21 @@ class NativeEngine:
                                 str(code).split(".")[0].zfill(6) for code in lp
                             }
                             unresolved_codes = target_code_set - resolved_codes
+                            late_limit_prices: dict = {}
                             if unresolved_codes:
                                 lp.update(self._snapshot_target_prices_from_shm(
-                                    unresolved_codes))
+                                    unresolved_codes, late_limit_prices))
                             if lp:
                                 portfolio_context.meta["latest_prices"] = lp
+                                lp2 = self._snapshot_limit_prices()
+                                for code, (high_limit, low_limit) in late_limit_prices.items():
+                                    old_hl, old_ll = lp2.get(code, (0.0, 0.0))
+                                    lp2[code] = (
+                                        old_hl if old_hl > 0 else high_limit,
+                                        old_ll if old_ll > 0 else low_limit,
+                                    )
+                                if lp2:
+                                    portfolio_context.meta["limit_prices"] = lp2
                         import importlib as _il
                         tm = _il.import_module(
                             os.environ.get("INFERENCE_MODULE",
@@ -3225,6 +3362,7 @@ class NativeEngine:
                                 "[open_position] inference module lacks targets_to_orders, "
                                 "precompute cache unusable; falling back")
                             break
+
                         diagnostics: dict = {}
                         positions_df = targets_to_orders(
                             cached_targets, date_str, end_time_label,
@@ -3801,6 +3939,9 @@ class NativeEngine:
             # inside the child.
             if portfolio_context is not None and pre_fork_latest_prices:
                 portfolio_context.meta["latest_prices"] = pre_fork_latest_prices
+                pre_fork_limit_prices = self._snapshot_limit_prices()
+                if pre_fork_limit_prices:
+                    portfolio_context.meta["limit_prices"] = pre_fork_limit_prices
                 # Intraday ATX DBF lacks market_value/last_price (only populated
                 # after EOD settlement). Backfill from SHM latest_prices so
                 # inference paths that need current weights don't crash or
@@ -3896,6 +4037,10 @@ class NativeEngine:
 
         # Load daily basic
         self._load_daily_basic()
+
+        # Load authoritative daily high/low limits. Tick supplies the current
+        # price; its limit fields are only a fallback for missing daily rows.
+        self._load_daily_limit_prices()
 
         # Load index constituents
         self._load_idx_cons()
@@ -4330,9 +4475,9 @@ def _push_to_order_gateway_http(orders_df: pd.DataFrame, date_str: str, end_time
 
 
 def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
-    # 50/50 分流：有效订单序号偶数走 VWAP，奇数走 TWAP。两者执行窗口均为 60s
-    # （由 gateway atx_order_window_seconds 控制）。当前 gateway 只支持
-    # vwap/twap，row/env 里的其他 algo_strategy 都按未设置处理。
+    # 默认使用 ORDER_ALGO_STRATEGY（生产配置为 VWAP）。仅显式开启
+    # ORDER_ALGO_SPLIT_VWAP_TWAP 时才按有效订单序号做 VWAP/TWAP 分流。
+    # 执行窗口由 gateway atx_order_window_seconds 控制。
     split_algo_enabled = str(os.environ.get("ORDER_ALGO_SPLIT_VWAP_TWAP", "")).strip() not in ("", "0", "false", "False")
     default_algo = os.environ.get("ORDER_ALGO_STRATEGY", "").strip().lower()
     if default_algo not in {"", "vwap", "twap"}:

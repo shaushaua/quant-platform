@@ -222,3 +222,159 @@ def test_positions_to_orders_missing_target_prices_still_liquidates_exits():
     assert sell_orders.iloc[0]["volume"] == 100
     assert sell_orders.iloc[1]["code"] == "600000"
     assert sell_orders.iloc[1]["volume"] == 500
+
+
+def test_positions_to_orders_drops_buy_at_exchange_high_limit():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame(),
+        meta={
+            "latest_prices": {"000001.XSHE": 11.0},
+            "limit_prices": {"000001.XSHE": (11.0, 9.0)},
+        },
+    )
+    diagnostics = {}
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.10}]),
+        ctx,
+        diagnostics=diagnostics,
+    )
+
+    assert orders.empty
+    assert diagnostics["limit_up_buy_codes"] == ["000001"]
+
+
+def test_positions_to_orders_keeps_buy_below_exchange_high_limit():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame(),
+        meta={
+            "latest_prices": {"000001.XSHE": 10.99},
+            "limit_prices": {"000001.XSHE": (11.0, 9.0)},
+        },
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.10}]),
+        ctx,
+    )
+
+    assert len(orders) == 1
+    assert orders.iloc[0]["side"] == "buy"
+
+
+def test_positions_to_orders_keeps_sell_at_exchange_high_limit():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame([{
+            "code": "000001.SZ",
+            "current_volume": 1000,
+            "available_volume": 1000,
+            "last_price": 11.0,
+        }]),
+        meta={
+            "latest_prices": {"000001.XSHE": 11.0},
+            "limit_prices": {"000001.XSHE": (11.0, 9.0)},
+        },
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.0}]),
+        ctx,
+    )
+
+    assert len(orders) == 1
+    assert orders.iloc[0]["side"] == "sell"
+    assert orders.iloc[0]["volume"] == 1000
+
+
+def test_positions_to_orders_keeps_held_buy_at_exchange_high_limit():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame([{
+            "code": "000001.SZ",
+            "current_volume": 100,
+            "available_volume": 100,
+            "last_price": 11.0,
+        }]),
+        meta={
+            "latest_prices": {"000001.XSHE": 11.0},
+            "limit_prices": {"000001.XSHE": (11.0, 9.0)},
+        },
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "000001", "position": 0.10}]),
+        ctx,
+    )
+
+    assert len(orders) == 1
+    assert orders.iloc[0]["side"] == "buy"
+
+
+def test_positions_to_orders_keeps_unheld_buy_with_unknown_limit_price():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame(),
+        meta={
+            "latest_prices": {"600000.XSHG": 10.0},
+            "limit_prices": {},
+        },
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "600000", "position": 0.10}]),
+        ctx,
+    )
+
+    assert len(orders) == 1
+    assert orders.iloc[0]["side"] == "buy"
+
+
+def test_positions_to_orders_keeps_sell_with_unknown_limit_price():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame([{
+            "code": "600000.SH",
+            "current_volume": 1000,
+            "available_volume": 1000,
+            "last_price": 10.0,
+        }]),
+        meta={
+            "latest_prices": {"600000.XSHG": 10.0},
+            "limit_prices": {},
+        },
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "600000", "position": 0.0}]),
+        ctx,
+    )
+
+    assert len(orders) == 1
+    assert orders.iloc[0]["side"] == "sell"
+
+
+def test_positions_to_orders_keeps_held_buy_with_unknown_limit_price():
+    ctx = PortfolioContext(
+        account=pd.DataFrame([{"total_asset": 100_000.0}]),
+        positions=pd.DataFrame([{
+            "code": "600000.SH",
+            "current_volume": 100,
+            "available_volume": 100,
+            "last_price": 10.0,
+        }]),
+        meta={
+            "latest_prices": {"600000.XSHG": 10.0},
+            "limit_prices": {},
+        },
+    )
+
+    orders = positions_to_orders(
+        pd.DataFrame([{"code": "600000", "position": 0.10}]),
+        ctx,
+    )
+
+    assert len(orders) == 1
+    assert orders.iloc[0]["side"] == "buy"
