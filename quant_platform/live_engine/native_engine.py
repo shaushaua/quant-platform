@@ -26,6 +26,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import re
 import resource
 import shutil
 import signal
@@ -71,6 +72,14 @@ from .pipeline_logger import get_streaming_logger
 from .schedule import ComputationSchedule, build_schedules_from_env
 
 logger = logging.getLogger(__name__)
+
+# Execution policy is owned by the engine. The gateway translates this value
+# to the broker protocol but does not choose or override the algorithm.
+ORDER_EXECUTION_ALGO = "vwap"
+# Preserve the legacy idempotency-key component even though price_type is no
+# longer sent to the gateway. This prevents a same-day retry across versions
+# from producing a different order_id and bypassing gateway deduplication.
+ORDER_ID_EXECUTION_MODE = "market"
 
 # Module-level globals: set before fork, inherited by child processes via COW
 _factor_fn: Optional[Callable] = None
@@ -604,16 +613,12 @@ class NativeEngine:
         self._order_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._prev_valid_rate: Optional[float] = None
-        # open_position 预计算缓存：8:50 启动时异步跑树模型推理，
-        # 把 target positions 缓存到内存 + 磁盘。9:30 schedule 触发时
-        # 优先消费这份缓存，跳过 _tree.inference（重），只跑
-        # positions_to_orders（轻，需要实时 tick 价）。
+        # open_position target cache, calculated and consumed inside the 9:30
+        # trigger. It is never populated during startup.
         self._open_position_cache: Optional[pd.DataFrame] = None
         self._open_position_cache_lock = threading.Lock()
-        # Generation counter：fallback 路径失效 cache 时 +1。预计算线程在写入
-        # 内存/磁盘前必须重新检查 generation 是否变化 —— 变化说明它中途被
-        # 失效了（fallback 已经走了 inline 推理），不能落盘否则下次重触发
-        # 会读到陈旧 target 重复下单。
+        # Generation counter: invalidation increments it so a stale calculation
+        # cannot publish targets that a later trigger might consume twice.
         self._open_position_cache_generation: int = 0
         self._schedules: list = []  # List[ComputationSchedule]
         self._last_codes: List[str] = []
@@ -846,7 +851,7 @@ class NativeEngine:
             return False
 
     def _ensure_open_position_limit_prices(self) -> bool:
-        """Ensure limit prices are ready during the startup precompute phase."""
+        """Ensure limit prices are ready before open-position target conversion."""
         if self._open_position_limit_prices_ready and self._daily_limit_prices:
             return True
         retries = _env_int("OPEN_POSITION_LIMIT_PRICE_LOAD_RETRIES", 3, minimum=1)
@@ -856,18 +861,18 @@ class NativeEngine:
             if self._load_daily_limit_prices():
                 if attempt > 0:
                     logger.info(
-                        "[precompute] daily limit prices ready after retry %d/%d",
+                        "[limit-prices] daily limits ready after retry %d/%d",
                         attempt + 1, retries,
                     )
                 return True
             if attempt < retries - 1:
                 logger.warning(
-                    "[precompute] daily limit prices unavailable, retry %d/%d in %.0fs",
+                    "[limit-prices] daily limits unavailable, retry %d/%d in %.0fs",
                     attempt + 1, retries, delay,
                 )
                 time.sleep(delay)
         logger.error(
-            "[precompute] daily limit prices unavailable after %d attempts; "
+            "[limit-prices] daily limits unavailable after %d attempts; "
             "codes without a limit threshold will continue without limit-up filtering",
             retries,
         )
@@ -1746,6 +1751,8 @@ class NativeEngine:
             if not tick_path:
                 continue
             reader = None
+            arr = None
+            prices = None
             try:
                 reader = NativeShmReader(tick_path)
                 arr = reader.view_rows()
@@ -1763,6 +1770,12 @@ class NativeEngine:
             except Exception as exc:
                 logger.debug("[open_position] target price read failed %s: %s", code, exc)
             finally:
+                # view_rows() is a zero-copy np.frombuffer view over mmap.
+                # Drop every exported view before closing the reader; otherwise
+                # a late-price SHM read raises BufferError and aborts conversion
+                # of the already-precomputed targets.
+                prices = None
+                arr = None
                 if reader is not None:
                     reader.close()
         return out
@@ -2978,8 +2991,7 @@ class NativeEngine:
         a second schedule fire cannot replay the same targets and
         double-dispatch orders.
 
-        Returns None when both caches are empty — caller should fall back to
-        inline inference.
+        Returns None when both caches are empty; the 9:30 caller fails closed.
         """
         with self._open_position_cache_lock:
             if self._open_position_cache is not None:
@@ -3005,25 +3017,22 @@ class NativeEngine:
                     logger.warning("[open_position] disk cache read failed %s: %s", p, exc)
         return None
 
-    def _precompute_open_position_targets(self) -> None:
-        """启动时异步跑树模型推理，把 target positions 缓存到内存 + 文件。
+    def _calculate_open_position_targets(self) -> None:
+        """Run target inference and publish a one-shot memory/disk cache.
 
-        9:30 schedule 会优先消费这份缓存，跳过 _tree.inference（重），只跑
-        positions_to_orders（轻，需要实时 tick 价）。
+        Invoked synchronously at 9:30, then immediately consumed and converted
+        using refreshed realtime tick prices.
 
         设计要点：
-        - 树模型推理的输入只有 T-1 daily_basic / T-1 factors / 静态指数成分 /
-          broker T-1 持仓，**完全不依赖实时 tick 价格**，所以 8:50 跑出的
-          target weights 与 9:30 现场跑的等价。
-        - portfolio_context 在 8:50 拿到的是 T-1 收市持仓，与 9:30 现场再查
-          broker 的差异极小（隔夜无变化），可接受。
-        - 任何失败都打告警日志后 return；9:30 会自动 fallback 到 inline
-          inference，行为同改造前。
+        - Stage 1 uses T-1 daily data/factors and the current broker holdings.
+        - Stage 2 refreshes realtime ticks after target inference, then retries
+          only target codes whose prices are still missing.
+        - 任何失败都打告警日志后 fail closed；不再回退到旧的合并推理路径，
+          避免绕过持仓校验和逐票行情重试。
         """
         t0 = time.time()
-        # 捕获启动时的 generation。fallback 路径会 bump 这个值；写入前必须
-        # 重新检查，若变化则放弃写入 —— 防止晚到的预计算结果在被失效后又把
-        # 陈旧 target 写回，下次重触发时被读到重复下单。
+        # Capture the generation and verify it again before publishing so an
+        # invalidated calculation cannot restore stale targets.
         with self._open_position_cache_lock:
             my_generation = self._open_position_cache_generation
 
@@ -3034,16 +3043,14 @@ class NativeEngine:
         try:
             date_str = self.trading_day
             if not date_str:
-                logger.warning("[precompute] trading_day empty, skip")
+                logger.warning("[open-position-targets] trading_day empty, skip")
                 return
 
-            # Prepare exact daily limit prices here, well before 9:30. This
-            # thread is independent from minute factor computation, so MySQL
-            # retry latency cannot block the minute schedule. The 9:30 path
-            # only reads the resulting in-memory cache.
+            # Ensure exact daily limits before target calculation. This runs on
+            # the open-position lock, independently from minute factor compute.
             if not self._ensure_open_position_limit_prices():
                 logger.warning(
-                    "[precompute] continuing target inference without complete "
+                    "[open-position-targets] continuing target inference without complete "
                     "daily limits; only confirmed unheld limit-up buys will be filtered"
                 )
 
@@ -3055,32 +3062,29 @@ class NativeEngine:
                 tm = importlib.import_module(inference_module)
                 targets_fn = getattr(tm, "inference_targets", None)
             except Exception as exc:
-                logger.warning("[precompute] cannot import %s: %s", inference_module, exc)
+                logger.warning("[open-position-targets] cannot import %s: %s", inference_module, exc)
                 targets_fn = None
             if targets_fn is None:
                 logger.warning(
-                    "[precompute] %s has no inference_targets; precompute disabled",
+                    "[open-position-targets] %s has no inference_targets; split inference unavailable",
                     inference_module)
                 return
 
             prev = self._prev_day_factors
             if prev is None or prev.empty:
-                logger.warning("[precompute] prev_day_factors empty, skip")
+                logger.warning("[open-position-targets] prev_day_factors empty, skip")
                 return
 
             daily_basic_df = self._daily_basic_df
             tu_df = (self._trading_universe_df
                      if self._trading_universe_df is not None else None)
 
-            # portfolio_context：8:50 拿到 T-1 收市持仓。失败不阻断 —— 模型
-            # 内部会按"空持仓"处理，9:30 现场再调 portfolio_context_fn 拿最新
-            # 持仓喂给 positions_to_orders 做delta。
-            portfolio_context = None
-            if self.portfolio_context_fn is not None:
-                try:
-                    portfolio_context = self.portfolio_context_fn(date_str, "093000")
-                except Exception as exc:
-                    logger.error("[precompute] portfolio_context failed: %s", exc)
+            # At 9:30 this is the live account snapshot used by the optimizer.
+            # Conversion fetches it again after inference for current delta sizing.
+            portfolio_context = self._load_open_position_portfolio_context(
+                date_str, "093000", "target inference")
+            if portfolio_context is None:
+                return
 
             # 计算 idx_comp（与 _write_results 行 1724-1727 等价）
             idx_comp_df = None
@@ -3098,9 +3102,9 @@ class NativeEngine:
                     idx_cons_cache=self._idx_cons_cache,
                 )
             except Exception as exc:
-                logger.warning("[precompute] idx_comp failed (continue without): %s", exc)
+                logger.warning("[open-position-targets] idx_comp failed (continue without): %s", exc)
 
-            logger.info("[precompute] starting tree_model inference for date=%s (gen=%d)",
+            logger.info("[open-position-targets] starting tree_model inference for date=%s (gen=%d)",
                         date_str, my_generation)
             positions = targets_fn(
                 date_str=date_str,
@@ -3115,15 +3119,14 @@ class NativeEngine:
 
             if positions is None or positions.empty:
                 logger.error(
-                    "[precompute] targets empty, will fallback at 9:30 (date=%s)", date_str)
+                    "[open-position-targets] targets empty, fail closed (date=%s)", date_str)
                 return
 
-            # 重型推理可能耗时数十秒。完成后再检查 generation —— 期间若 fallback
-            # 已走（invalidate 被 bump），必须放弃写入，否则下次重触发会读到陈旧
-            # target 重复下单。
+            # Heavy inference can take tens of seconds. Re-check generation so
+            # invalidation during the run prevents stale target publication.
             if _invalidated():
                 logger.warning(
-                    "[precompute] cache invalidated during inference (gen moved from %d), "
+                    "[open-position-targets] cache invalidated during inference (gen moved from %d), "
                     "dropping %d rows to avoid stale-cache replay",
                     my_generation, len(positions))
                 return
@@ -3145,14 +3148,14 @@ class NativeEngine:
                 if tmp_path is not None:
                     positions.to_csv(tmp_path, index=False)
             except Exception as exc:
-                logger.warning("[precompute] tmp cache write failed: %s", exc)
+                logger.warning("[open-position-targets] tmp cache write failed: %s", exc)
                 tmp_path = None  # 写盘失败仍允许写内存（pop 时由 mark-consumed 兜底）
 
             # 关键段：再次检查 generation → 原子 replace → 写内存。
             with self._open_position_cache_lock:
                 if self._open_position_cache_generation != my_generation:
                     logger.warning(
-                        "[precompute] generation changed before publish (gen=%d → %d), "
+                        "[open-position-targets] generation changed before publish (gen=%d → %d), "
                         "dropping disk and memory write",
                         my_generation, self._open_position_cache_generation)
                     if tmp_path is not None and tmp_path.exists():
@@ -3165,9 +3168,9 @@ class NativeEngine:
                 if tmp_path is not None and tmp_path.exists():
                     try:
                         tmp_path.replace(cache_path)
-                        logger.info("[precompute] published disk cache: %s", cache_path)
+                        logger.info("[open-position-targets] published disk cache: %s", cache_path)
                     except Exception as exc:
-                        logger.warning("[precompute] rename tmp→cache failed: %s", exc)
+                        logger.warning("[open-position-targets] rename tmp→cache failed: %s", exc)
                         try:
                             tmp_path.unlink()
                         except Exception:
@@ -3175,21 +3178,59 @@ class NativeEngine:
                 self._open_position_cache = positions
 
             logger.info(
-                "[precompute] open_position targets ready: %d rows in %.1fs",
+                "[open-position-targets] targets ready: %d rows in %.1fs",
                 len(positions), time.time() - t0,
             )
         except Exception as exc:
-            logger.error("[precompute] failed: %s", exc, exc_info=True)
+            logger.error("[open-position-targets] failed: %s", exc, exc_info=True)
+
+    def _load_open_position_portfolio_context(
+        self,
+        date_str: str,
+        end_time: str,
+        purpose: str,
+    ):
+        """Fetch a verified live holdings snapshot, retrying before fail-closed."""
+        retries = _env_int("OPEN_POSITION_CONTEXT_RETRIES", 3, minimum=1)
+        delay = _env_float("OPEN_POSITION_CONTEXT_RETRY_DELAY", 1.0, minimum=0.0)
+        if self.portfolio_context_fn is None:
+            logger.error("[open_position] portfolio_context_fn unavailable for %s", purpose)
+            return None
+
+        for attempt in range(retries):
+            try:
+                context = self.portfolio_context_fn(date_str, end_time)
+            except Exception as exc:
+                logger.error(
+                    "[open_position] holdings fetch failed for %s (%d/%d): %s",
+                    purpose, attempt + 1, retries, exc)
+                context = None
+
+            meta = getattr(context, "meta", None) if context is not None else None
+            if isinstance(meta, dict) and meta.get("positions_usable") is True:
+                return context
+
+            if context is not None:
+                logger.error(
+                    "[open_position] holdings unusable for %s (%d/%d): stale=%s source=%s",
+                    purpose, attempt + 1, retries,
+                    (meta or {}).get("positions_stale"),
+                    (meta or {}).get("source_kind", ""),
+                )
+            if attempt < retries - 1:
+                time.sleep(delay)
+
+        logger.error(
+            "[open_position] holdings unavailable after %d attempts for %s; "
+            "fail closed without target calculation or orders",
+            retries, purpose)
+        return None
 
     def _invalidate_open_position_targets(self) -> None:
-        """Drop in-memory + on-disk precompute cache and bump generation.
+        """Drop the in-memory/on-disk target cache and bump its generation.
 
-        Called from the fallback path once we decide to do inline inference.
-        Bumps a generation counter so any in-flight precompute thread, which
-        captured the generation at start, can detect invalidation and refuse
-        to write its result back — otherwise a late-finishing precompute
-        could resurrect a stale target that the next schedule fire would
-        consume, causing duplicate orders.
+        A generation counter prevents a stale calculation from publishing after
+        invalidation and being consumed by a later trigger.
 
         Safe to call multiple times.
         """
@@ -3305,13 +3346,27 @@ class NativeEngine:
             date_str = self.trading_day
             end_time_label = schedule.result_label or "093000"
 
-            # 快路径：消费启动时预计算好的 target weights，只跑 positions_to_orders
-            # （轻量，需要 9:30 实时 tick 价）。预计算 miss 则走下方 fallback。
+            # Always discard stale persisted targets and calculate from the
+            # current 9:30 account snapshot. Realtime ticks are refreshed after
+            # model inference during conversion below. The open-position lock is
+            # independent from minute factor computation.
+            self._invalidate_open_position_targets()
+            logger.info("[open_position] calculating targets at 9:30")
+            self._calculate_open_position_targets()
             cached_targets = self._pop_open_position_targets()
+
             if cached_targets is not None and not cached_targets.empty:
-                logger.info("[open_position] %s using precomputed targets: %d rows",
-                            schedule.name, len(cached_targets))
+                logger.info(
+                    "[open_position] %s using 9:30-calculated targets: %d rows",
+                    schedule.name,
+                    len(cached_targets),
+                )
                 positions_df = None
+
+                portfolio_context = self._load_open_position_portfolio_context(
+                    date_str, end_time_label, "order conversion")
+                if portfolio_context is None:
+                    return
 
                 # At 9:30:00 the collector creates SHM files lazily, so some
                 # target codes have no price yet. positions_to_orders reports
@@ -3327,30 +3382,26 @@ class NativeEngine:
                 conversion_succeeded = False
                 for attempt in range(max_retries):
                     try:
-                        portfolio_context = None
-                        if self.portfolio_context_fn is not None:
-                            portfolio_context = self.portfolio_context_fn(date_str, end_time_label)
-                        if portfolio_context is not None:
-                            lp = self._snapshot_latest_prices()
-                            resolved_codes = {
-                                str(code).split(".")[0].zfill(6) for code in lp
-                            }
-                            unresolved_codes = target_code_set - resolved_codes
-                            late_limit_prices: dict = {}
-                            if unresolved_codes:
-                                lp.update(self._snapshot_target_prices_from_shm(
-                                    unresolved_codes, late_limit_prices))
-                            if lp:
-                                portfolio_context.meta["latest_prices"] = lp
-                                lp2 = self._snapshot_limit_prices()
-                                for code, (high_limit, low_limit) in late_limit_prices.items():
-                                    old_hl, old_ll = lp2.get(code, (0.0, 0.0))
-                                    lp2[code] = (
-                                        old_hl if old_hl > 0 else high_limit,
-                                        old_ll if old_ll > 0 else low_limit,
-                                    )
-                                if lp2:
-                                    portfolio_context.meta["limit_prices"] = lp2
+                        lp = self._snapshot_latest_prices()
+                        resolved_codes = {
+                            str(code).split(".")[0].zfill(6) for code in lp
+                        }
+                        unresolved_codes = target_code_set - resolved_codes
+                        late_limit_prices: dict = {}
+                        if unresolved_codes:
+                            lp.update(self._snapshot_target_prices_from_shm(
+                                unresolved_codes, late_limit_prices))
+                        if lp:
+                            portfolio_context.meta["latest_prices"] = lp
+                            lp2 = self._snapshot_limit_prices()
+                            for code, (high_limit, low_limit) in late_limit_prices.items():
+                                old_hl, old_ll = lp2.get(code, (0.0, 0.0))
+                                lp2[code] = (
+                                    old_hl if old_hl > 0 else high_limit,
+                                    old_ll if old_ll > 0 else low_limit,
+                                )
+                            if lp2:
+                                portfolio_context.meta["limit_prices"] = lp2
                         import importlib as _il
                         tm = _il.import_module(
                             os.environ.get("INFERENCE_MODULE",
@@ -3432,23 +3483,13 @@ class NativeEngine:
                         "[open_position] target conversion produced no orders; "
                         "skip heavy inference fallback")
                     return
-                # targets_to_orders 失败 → 继续走 fallback
-                logger.warning("[open_position] targets_to_orders returned empty, falling back")
-
-            # fallback: 预计算 miss 或失败 → 退回原同步推理路径
-            prev = self._prev_day_factors
-            if prev is None or prev.empty:
-                logger.error("[open_position] prev_day_factors empty, skip %s",
-                             schedule.name)
+                logger.error(
+                    "[open_position] target conversion failed; fail closed without legacy fallback")
                 return
-            logger.info("[open_position] %s cache miss, inline inference with prev_day_factors: %d rows",
-                        schedule.name, len(prev))
-            # 清理可能晚到的预计算结果：fallback 一旦走了，磁盘 + 内存 cache
-            # 都不能再被消费（否则下次 open_position 重复触发时会读到陈旧
-            # target 重复下单；mark_run 已防重复，但再加一层主动清理更安全）。
-            self._invalidate_open_position_targets()
-            results = prev.to_dict("records")
-            self._write_results(results, date_str, "", schedule=schedule)
+
+            logger.error(
+                "[open_position] 9:30 target calculation produced no usable targets; "
+                "fail closed without legacy fallback")
             return
 
         # daily_result and daily_position are triggered by time_trigger (precise
@@ -4156,38 +4197,10 @@ class NativeEngine:
             self._post_close_daily_done.set()
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
-        # open_position 推理前置：pod 启动后异步跑树模型，把 target weights
-        # 缓存到内存 + 磁盘。9:30 schedule 触发时优先消费缓存，跳过重的
-        # 树模型推理，只跑轻量的 positions_to_orders（需要实时 tick）。
-        # daily_position (14:50) 不受影响 —— 走的是 use_daily_factor_module
-        # 主路径，不读这份 cache。
-        #
-        # ⚠️ 安全前提：tree_model_inference 默认 USE_OPTIMIZER=True，target
-        # positions 会受 portfolio_context.positions（current_weight）影响。
-        # 启用预计算前必须确认：从 pod 启动到 9:30 之间 broker 持仓不变。
-        # 适用场景：隔夜 rebalance 策略、ONE_TIME_CLOSE_ON_STARTUP=0、无其他
-        # schedule 在窗口内发单。否则 8:50 算出的 target 与 9:30 实际状态不符。
-        # 默认 OFF，需要显式设 OPEN_POSITION_PRECOMPUTE=1 开启。
-        precompute_enabled = _env_bool("OPEN_POSITION_PRECOMPUTE", False)
-        if (precompute_enabled
-                and self.inference_fn is not None
-                and self._prev_day_factors is not None
-                and not self._prev_day_factors.empty):
-            logger.info("[native] launching open_position precompute (OPEN_POSITION_PRECOMPUTE=1)")
-            threading.Thread(
-                target=self._precompute_open_position_targets,
-                name="open-position-precompute",
-                daemon=True,
-            ).start()
-        else:
-            logger.info(
-                "[native] precompute disabled (OPEN_POSITION_PRECOMPUTE=%s, "
-                "inference_fn=%s prev_day_factors=%s)",
-                "1" if precompute_enabled else "0",
-                bool(self.inference_fn),
-                bool(self._prev_day_factors is not None
-                     and not self._prev_day_factors.empty),
-            )
+        # open_position targets are intentionally not calculated at startup.
+        # The 9:30 trigger reads the current holdings, runs the model, then
+        # refreshes realtime ticks for limit-up checks and order sizing.
+        logger.info("[native] open_position target calculation deferred to 9:30")
 
         # One-shot flatten at startup (sim reset; guarded by env + date flag)
         self._one_time_close_on_startup()
@@ -4475,14 +4488,9 @@ def _push_to_order_gateway_http(orders_df: pd.DataFrame, date_str: str, end_time
 
 
 def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time: str) -> List[dict]:
-    # 默认使用 ORDER_ALGO_STRATEGY（生产配置为 VWAP）。仅显式开启
-    # ORDER_ALGO_SPLIT_VWAP_TWAP 时才按有效订单序号做 VWAP/TWAP 分流。
-    # 执行窗口由 gateway atx_order_window_seconds 控制。
-    split_algo_enabled = str(os.environ.get("ORDER_ALGO_SPLIT_VWAP_TWAP", "")).strip() not in ("", "0", "false", "False")
-    default_algo = os.environ.get("ORDER_ALGO_STRATEGY", "").strip().lower()
-    if default_algo not in {"", "vwap", "twap"}:
-        logger.warning("[order-gateway] ignore unsupported ORDER_ALGO_STRATEGY=%r", default_algo)
-        default_algo = ""
+    # The engine owns execution routing. Model rows, environment variables and
+    # the retired split flag cannot change the selected algorithm.
+    algo_strategy = ORDER_EXECUTION_ALGO
     orders = []
     for _, row in orders_df.iterrows():
         code = _order_symbol(row.get("symbol", row.get("code", "")))
@@ -4490,56 +4498,42 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
         side = _order_side(row)
         if not code or volume <= 0 or not side:
             continue
-        price_type = _order_price_type(row)
-        price_raw = _order_price(row, price_type)
-        if price_type == "limit" and not price_raw:
-            logger.error("[order-gateway] skip %s %s: limit order requires price", code, side)
-            continue
+        # Realtime price metadata remains in orders_df for sizing and limit-up
+        # checks, but it is not part of the gateway request. VWAP receives only
+        # quantity and algorithm parameters, matching the ATX protocol.
         strategy = str(row.get("strategy", "") or os.environ.get("ORDER_DEFAULT_STRATEGY", "quant_platform"))
         note = str(row.get("note", "") or row.get("remark", "") or
                    f"{strategy}_{date_str}{end_time}_{code}_{side}")
-        try:
-            price = float(price_raw) if price_raw not in {"", None} else 0.0
-        except Exception:
-            price = 0.0
-
-        # Minimal pre-trade sanity checks (position/capital validation stays in
-        # the gateway, which holds live account state).
-        #  - limit orders must carry a positive price
-        if price_type == "limit" and price <= 0:
-            logger.error("[order-gateway] skip %s %s: limit order price must be > 0 (got %s)",
-                         code, side, price_raw)
-            continue
 
         algo_param = row.get("algo_param", row.get("atx_algo_param", ""))
-        # 执行算法策略名 → Gateway 侧自动 resolveAlgoStrategy()
-        # 优先级 row.algo_strategy(vwap/twap only) > 50/50 分流(启用时) > env ORDER_ALGO_STRATEGY
-        # > gateway ATX_DEFAULT_ORD_TYPE
-        algo_strategy = row.get("algo_strategy", "")
-        algo_strategy = str(algo_strategy).strip().lower() if algo_strategy not in {"", None} and not pd.isna(algo_strategy) else ""
-        if algo_strategy and algo_strategy not in {"vwap", "twap"}:
-            logger.warning("[order-gateway] ignore unsupported row algo_strategy=%r code=%s", algo_strategy, code)
-            algo_strategy = ""
-        if not algo_strategy:
-            if split_algo_enabled:
-                # 只按有效订单序号分流，避免无效行 continue 后比例偏移。
-                algo_strategy = "vwap" if (len(orders) % 2 == 0) else "twap"
-            else:
-                algo_strategy = default_algo
-
+        if algo_param not in {"", None} and not pd.isna(algo_param):
+            raw_algo_param = str(algo_param).strip()
+            fields = [part.strip() for part in re.split(r"[:;,&|]", raw_algo_param)]
+            safe_fields = [
+                part for part in fields
+                if part and not (
+                    "=" in part
+                    and part.split("=", 1)[0].strip().lower() == "price"
+                )
+            ]
+            if len(safe_fields) != len([part for part in fields if part]):
+                logger.warning(
+                    "[order-gateway] stripped execution price from algo_param: code=%s",
+                    code)
+                algo_param = ":".join(safe_fields)
         explicit_id = str(row.get("order_id", "") or "")
         if explicit_id:
             order_id = explicit_id
         else:
             # Stable idempotent id derived from order content. The same logical
             # order yields the same id across retries/re-runs so the gateway can
-            # deduplicate. Includes price/strategy/algo so that two orders with
-            # identical code+side+volume but different price/strategy are NOT
-            # collapsed into one id (which the gateway would wrongly dedup).
+            # deduplicate. Includes strategy/algo so orders assigned to different
+            # execution strategies are not collapsed by gateway idempotency.
+            # Execution price is intentionally absent and therefore excluded
+            # from the idempotency key as well.
             content = "|".join([
                 date_str, end_time, code, side, str(int(volume)),
-                price_type, f"{price:.6f}", strategy,
-                algo_strategy,
+                ORDER_ID_EXECUTION_MODE, strategy, algo_strategy,
                 str(algo_param or ""),
             ])
             order_id = f"{strategy}_" + hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
@@ -4548,8 +4542,6 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
             "symbol": code,
             "side": side,
             "volume": int(volume),
-            "price_type": price_type,
-            "price": price,
             "strategy": strategy,
             "note": note,
         }
@@ -4563,10 +4555,9 @@ def _build_order_gateway_orders(orders_df: pd.DataFrame, date_str: str, end_time
             if val not in {"", None, 0} and not pd.isna(val):
                 order[field] = float(val)
         orders.append(order)
-    if split_algo_enabled:
-        n_vwap = sum(1 for o in orders if str(o.get("algo_strategy", "")).lower() == "vwap")
-        n_twap = sum(1 for o in orders if str(o.get("algo_strategy", "")).lower() == "twap")
-        logger.info("[order-gateway] algo split: vwap=%d twap=%d total=%d", n_vwap, n_twap, len(orders))
+    logger.info(
+        "[order-gateway] engine execution algo=%s: total=%d",
+        algo_strategy, len(orders))
     return orders
 
 
@@ -4606,33 +4597,6 @@ def _order_side(row: pd.Series) -> str:
     if side in {"sell", "s", "short", "2", "24", "卖", "卖出"}:
         return "sell"
     return ""
-
-
-def _order_price_type(row: pd.Series) -> str:
-    raw = row.get("price_type", row.get("quote_type", ""))
-    value = str(raw or os.environ.get("ORDER_DEFAULT_PRICE_TYPE", "latest")).strip()
-    mapping = {
-        "1": "latest",
-        "6": "latest",
-        "latest": "latest",
-        "market": "latest",
-        "last": "latest",
-        "3": "limit",
-        "0": "limit",
-        "limit": "limit",
-        "fixed": "limit",
-    }
-    return mapping.get(value.lower(), value)
-
-
-def _order_price(row: pd.Series, price_type: str) -> str:
-    raw = row.get("order_price", row.get("limit_price", row.get("price", "")))
-    if raw == "" or pd.isna(raw):
-        return "0" if price_type == "latest" else ""
-    try:
-        return f"{float(raw):.4f}".rstrip("0").rstrip(".")
-    except Exception:
-        return str(raw).strip()
 
 
 def _result_codes(result_df: pd.DataFrame) -> List[str]:

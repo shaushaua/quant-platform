@@ -5,7 +5,9 @@ MySQL数据加载器
 
 参考 deeptrade/dataconv/repository.go 的实现
 表结构:
-- mkt_limit: 涨跌停价格 (code, trade_date, high_limit, low_limit, pre_close)
+- mkt_limit: 涨跌停价格
+  (TICKER_SYMBOL, EXCHANGE_CD, TRADE_DATE, LIMIT_UP_PRICE,
+   LIMIT_DOWN_PRICE, PRE_CLOSE_PRICE)
 """
 
 import os
@@ -130,24 +132,23 @@ class MySQLLoader:
         try:
             with self._conn.cursor() as cursor:
                 sql = """
-                    SELECT code, trade_date, high_limit, low_limit, pre_close
+                    SELECT TICKER_SYMBOL, EXCHANGE_CD, TRADE_DATE,
+                           LIMIT_UP_PRICE, LIMIT_DOWN_PRICE, PRE_CLOSE_PRICE
                     FROM mkt_limit
-                    WHERE trade_date = %s
+                    WHERE TRADE_DATE = %s
                 """
                 cursor.execute(sql, (trade_date,))
                 rows = cursor.fetchall()
 
                 result = {}
                 for row in rows:
-                    code = row[0]
-                    # 转换代码格式 (000001 -> 000001.XSHE)
-                    code = self._format_code(code)
+                    code = self._format_code(row[0], row[1])
                     result[code] = LimitPrice(
                         code=code,
-                        trade_date=row[1],
-                        high_limit=float(row[2]) if row[2] else 0.0,
-                        low_limit=float(row[3]) if row[3] else 0.0,
-                        pre_close=float(row[4]) if row[4] else 0.0,
+                        trade_date=row[2],
+                        high_limit=float(row[3]) if row[3] else 0.0,
+                        low_limit=float(row[4]) if row[4] else 0.0,
+                        pre_close=float(row[5]) if row[5] else 0.0,
                     )
 
                 logger.info(f"获取涨跌停价格: {trade_date}, {len(result)} 条")
@@ -173,27 +174,39 @@ class MySQLLoader:
             trade_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
         # 标准化代码格式
-        raw_code = code.split('.')[0]
+        code_parts = str(code).strip().upper().split('.', 1)
+        raw_code = code_parts[0].zfill(6)
+        exchange_cd = None
+        if len(code_parts) == 2:
+            exchange_cd = {
+                "SH": "XSHG",
+                "SZ": "XSHE",
+            }.get(code_parts[1], code_parts[1])
 
         self._ensure_connection()
 
         try:
             with self._conn.cursor() as cursor:
                 sql = """
-                    SELECT code, trade_date, high_limit, low_limit, pre_close
+                    SELECT TICKER_SYMBOL, EXCHANGE_CD, TRADE_DATE,
+                           LIMIT_UP_PRICE, LIMIT_DOWN_PRICE, PRE_CLOSE_PRICE
                     FROM mkt_limit
-                    WHERE code = %s AND trade_date = %s
+                    WHERE TICKER_SYMBOL = %s AND TRADE_DATE = %s
                 """
-                cursor.execute(sql, (raw_code, trade_date))
+                params = [raw_code, trade_date]
+                if exchange_cd:
+                    sql += " AND EXCHANGE_CD = %s"
+                    params.append(exchange_cd)
+                cursor.execute(sql, tuple(params))
                 row = cursor.fetchone()
 
                 if row:
                     return LimitPrice(
-                        code=self._format_code(row[0]),
-                        trade_date=row[1],
-                        high_limit=float(row[2]) if row[2] else 0.0,
-                        low_limit=float(row[3]) if row[3] else 0.0,
-                        pre_close=float(row[4]) if row[4] else 0.0,
+                        code=self._format_code(row[0], row[1]),
+                        trade_date=row[2],
+                        high_limit=float(row[3]) if row[3] else 0.0,
+                        low_limit=float(row[4]) if row[4] else 0.0,
+                        pre_close=float(row[5]) if row[5] else 0.0,
                     )
                 return None
 
@@ -223,14 +236,14 @@ class MySQLLoader:
         try:
             with self._conn.cursor() as cursor:
                 sql = """
-                    SELECT DISTINCT code
+                    SELECT DISTINCT TICKER_SYMBOL, EXCHANGE_CD
                     FROM mkt_limit
-                    WHERE trade_date = %s
+                    WHERE TRADE_DATE = %s
                 """
                 cursor.execute(sql, (trade_date,))
                 rows = cursor.fetchall()
 
-                codes = [self._format_code(row[0]) for row in rows]
+                codes = [self._format_code(row[0], row[1]) for row in rows]
                 logger.info(f"获取股票列表: {trade_date}, {len(codes)} 只")
                 return codes
 
@@ -353,17 +366,22 @@ class MySQLLoader:
 
     # ==================== 辅助方法 ====================
 
-    def _format_code(self, raw_code: str) -> str:
+    def _format_code(self, raw_code: str, exchange_cd: str = None) -> str:
         """
         格式化股票代码为标准格式
 
         Args:
             raw_code: 原始代码 (如 000001, 600000)
+            exchange_cd: 数据库交易所代码 (如 XSHE, XSHG)
 
         Returns:
             标准格式 (如 000001.XSHE, 600000.XSHG)
         """
         code = str(raw_code).zfill(6)
+        exchange = str(exchange_cd or "").strip().upper()
+        exchange = {"SH": "XSHG", "SZ": "XSHE"}.get(exchange, exchange)
+        if exchange in {"XSHG", "XSHE"}:
+            return f"{code}.{exchange}"
         if code.startswith(('6', '9')):
             return f"{code}.XSHG"
         else:

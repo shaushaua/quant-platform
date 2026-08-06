@@ -35,9 +35,6 @@ patches:
                   # --- 手动黑名单：临时排除高风险票（8 连板妖股等）---
                   - name: TRADING_UNIVERSE_EXCLUDE_CODES
                     value: "603221"
-                  # --- 订单算法固定 VWAP；关闭 VWAP/TWAP 50/50 分流 ---
-                  - name: ORDER_ALGO_SPLIT_VWAP_TWAP
-                    value: "0"
                 resources:
                   requests:
                     cpu: "2"

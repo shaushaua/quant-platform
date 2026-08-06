@@ -1,4 +1,5 @@
 import queue
+import mmap
 import sys
 from types import SimpleNamespace
 
@@ -44,6 +45,44 @@ def test_snapshot_target_prices_reads_late_tick_files(monkeypatch):
     prices = engine._snapshot_target_prices_from_shm(
         {"600000"}, limit_prices
     )
+
+    assert prices == {"600000.XSHG": 10.5}
+    assert limit_prices == {"600000.XSHG": (11.0, 9.0)}
+    assert closed == ["target.tick"]
+
+
+def test_snapshot_target_prices_releases_mmap_views_before_close(monkeypatch):
+    closed = []
+
+    class MmapBackedReader:
+        def __init__(self, path):
+            self.path = path
+            self._mmap = mmap.mmap(-1, 79 * 8)
+            row = native_engine_module.np.frombuffer(
+                self._mmap, dtype=native_engine_module.np.float64
+            ).reshape(1, 79)
+            row[0, 2] = 10.5
+            row[0, 9] = 11.0
+            row[0, 10] = 9.0
+            del row
+
+        def view_rows(self):
+            return native_engine_module.np.frombuffer(
+                self._mmap, dtype=native_engine_module.np.float64
+            ).reshape(1, 79)
+
+        def close(self):
+            self._mmap.close()
+            closed.append(self.path)
+
+    monkeypatch.setattr(native_engine_module, "NativeShmReader", MmapBackedReader)
+    engine = NativeEngine.__new__(NativeEngine)
+    engine._scan_shm_files = lambda: {
+        "600000.XSHG": {native_engine_module.KIND_TICK: "target.tick"},
+    }
+
+    limit_prices = {}
+    prices = engine._snapshot_target_prices_from_shm({"600000"}, limit_prices)
 
     assert prices == {"600000.XSHG": 10.5}
     assert limit_prices == {"600000.XSHG": (11.0, 9.0)}
@@ -136,12 +175,19 @@ def test_open_position_retries_only_for_reported_missing_prices(monkeypatch):
     engine = NativeEngine.__new__(NativeEngine)
     engine.trading_day = "20260715"
     engine._open_position_limit_prices_ready = True
-    engine._pop_open_position_targets = lambda: pd.DataFrame([
-        {"code": "000001", "position": 0.1},
-        {"code": "600000", "position": 0.2},
-    ])
+    engine._open_position_cache = None
+    engine._open_position_cache_lock = native_engine_module.threading.Lock()
+    engine._open_position_cache_generation = 0
+
+    def calculate_targets():
+        engine._open_position_cache = pd.DataFrame([
+            {"code": "000001", "position": 0.1},
+            {"code": "600000", "position": 0.2},
+        ])
+
+    engine._calculate_open_position_targets = calculate_targets
     engine.portfolio_context_fn = lambda *_: SimpleNamespace(
-        positions=pd.DataFrame(), meta={})
+        positions=pd.DataFrame(), meta={"positions_usable": True})
     engine._snapshot_latest_prices = lambda: {}
     shm_reads = []
 
@@ -169,3 +215,158 @@ def test_open_position_retries_only_for_reported_missing_prices(monkeypatch):
     assert shm_reads == [{"000001", "600000"}, {"000001", "600000"}]
     assert orders["code"].tolist() == ["000001", "600000"]
     assert (date_str, end_time) == ("20260715", "093000")
+
+
+def test_open_position_calculates_targets_at_trigger(monkeypatch):
+    module_name = "tests.fake_trigger_time_inference"
+
+    def targets_to_orders(*args, diagnostics=None, **kwargs):
+        diagnostics["missing_price_codes"] = []
+        return pd.DataFrame([{
+            "code": "000001",
+            "side": "buy",
+            "volume": 100,
+        }])
+
+    monkeypatch.setitem(
+        sys.modules,
+        module_name,
+        SimpleNamespace(targets_to_orders=targets_to_orders),
+    )
+    monkeypatch.setenv("INFERENCE_MODULE", module_name)
+    engine = NativeEngine.__new__(NativeEngine)
+    engine.trading_day = "20260807"
+    engine._open_position_cache = None
+    engine._open_position_cache_lock = native_engine_module.threading.Lock()
+    engine._open_position_cache_generation = 0
+    engine.output_path = None
+    calculated = []
+
+    def calculate_targets():
+        calculated.append(True)
+        engine._open_position_cache = pd.DataFrame([{
+            "code": "000001",
+            "position": 0.1,
+        }])
+
+    engine._calculate_open_position_targets = calculate_targets
+    engine.portfolio_context_fn = lambda *_: SimpleNamespace(
+        positions=pd.DataFrame(), meta={"positions_usable": True}
+    )
+    engine._snapshot_latest_prices = lambda: {"000001.XSHE": 10.0}
+    engine._snapshot_limit_prices = lambda: {}
+    engine._snapshot_target_prices_from_shm = lambda *_args, **_kwargs: {}
+    engine._daily_basic_df = pd.DataFrame()
+    engine._order_queue = queue.Queue()
+
+    schedule = SimpleNamespace(
+        name="open_position",
+        result_label="093000",
+        skip_factor_compute=True,
+        is_daily_result=False,
+    )
+    engine._compute_and_output_locked(schedule)
+
+    orders, date_str, end_time = engine._order_queue.get_nowait()
+    assert calculated == [True]
+    assert orders["code"].tolist() == ["000001"]
+    assert (date_str, end_time) == ("20260807", "093000")
+
+
+def test_open_position_fails_closed_when_holdings_are_unusable(monkeypatch):
+    module_name = "tests.fake_unusable_holdings_inference"
+    conversion_calls = []
+
+    def targets_to_orders(*args, **kwargs):
+        conversion_calls.append(True)
+        return pd.DataFrame([{"code": "000001", "side": "buy", "volume": 100}])
+
+    monkeypatch.setitem(
+        sys.modules, module_name, SimpleNamespace(targets_to_orders=targets_to_orders)
+    )
+    monkeypatch.setenv("INFERENCE_MODULE", module_name)
+    monkeypatch.setenv("OPEN_POSITION_CONTEXT_RETRIES", "1")
+
+    engine = NativeEngine.__new__(NativeEngine)
+    engine.trading_day = "20260807"
+    engine._open_position_cache = None
+    engine._open_position_cache_lock = native_engine_module.threading.Lock()
+    engine._open_position_cache_generation = 0
+    engine.output_path = None
+    engine._calculate_open_position_targets = lambda: setattr(
+        engine,
+        "_open_position_cache",
+        pd.DataFrame([{"code": "000001", "position": 0.1}]),
+    )
+    engine.portfolio_context_fn = lambda *_: SimpleNamespace(
+        positions=pd.DataFrame(),
+        meta={"positions_usable": False, "positions_stale": True},
+    )
+    engine._daily_basic_df = pd.DataFrame()
+    engine._order_queue = queue.Queue()
+
+    schedule = SimpleNamespace(
+        name="open_position",
+        result_label="093000",
+        skip_factor_compute=True,
+        is_daily_result=False,
+    )
+    engine._compute_and_output_locked(schedule)
+
+    assert conversion_calls == []
+    assert engine._order_queue.empty()
+
+
+def test_target_inference_fails_closed_when_holdings_are_unusable(monkeypatch):
+    module_name = "tests.fake_target_holdings_inference"
+    target_calls = []
+
+    def inference_targets(**kwargs):
+        target_calls.append(kwargs)
+        return pd.DataFrame([{"code": "000001", "position": 0.1}])
+
+    monkeypatch.setitem(
+        sys.modules, module_name, SimpleNamespace(inference_targets=inference_targets)
+    )
+    monkeypatch.setenv("INFERENCE_MODULE", module_name)
+    monkeypatch.setenv("OPEN_POSITION_CONTEXT_RETRIES", "1")
+
+    engine = NativeEngine.__new__(NativeEngine)
+    engine.trading_day = "20260807"
+    engine._open_position_cache = None
+    engine._open_position_cache_lock = native_engine_module.threading.Lock()
+    engine._open_position_cache_generation = 0
+    engine._ensure_open_position_limit_prices = lambda: True
+    engine._prev_day_factors = pd.DataFrame([{"ID_QI": "000001", "factor": 1.0}])
+    engine._daily_basic_df = pd.DataFrame()
+    engine._trading_universe_df = None
+    engine.portfolio_context_fn = lambda *_: SimpleNamespace(
+        positions=pd.DataFrame(), meta={"positions_usable": False}
+    )
+
+    engine._calculate_open_position_targets()
+
+    assert target_calls == []
+    assert engine._open_position_cache is None
+
+
+def test_open_position_does_not_use_legacy_fallback_when_targets_fail():
+    engine = NativeEngine.__new__(NativeEngine)
+    engine.trading_day = "20260807"
+    engine._open_position_cache = None
+    engine._open_position_cache_lock = native_engine_module.threading.Lock()
+    engine._open_position_cache_generation = 0
+    engine.output_path = None
+    engine._calculate_open_position_targets = lambda: None
+    fallback_calls = []
+    engine._write_results = lambda *args, **kwargs: fallback_calls.append(True)
+
+    schedule = SimpleNamespace(
+        name="open_position",
+        result_label="093000",
+        skip_factor_compute=True,
+        is_daily_result=False,
+    )
+    engine._compute_and_output_locked(schedule)
+
+    assert fallback_calls == []
