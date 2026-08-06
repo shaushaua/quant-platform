@@ -613,8 +613,8 @@ class NativeEngine:
         self._order_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._prev_valid_rate: Optional[float] = None
-        # open_position target cache, calculated and consumed inside the 9:30
-        # trigger. It is never populated during startup.
+        # open_position target cache, normally calculated after the 9:25 call
+        # auction and consumed by the 9:30 order trigger.
         self._open_position_cache: Optional[pd.DataFrame] = None
         self._open_position_cache_lock = threading.Lock()
         # Generation counter: invalidation increments it so a stale calculation
@@ -1779,6 +1779,129 @@ class NativeEngine:
                 if reader is not None:
                     reader.close()
         return out
+
+    def _filter_open_position_limit_up_universe(
+        self,
+        trading_universe_df: Optional[pd.DataFrame],
+        daily_basic_df: Optional[pd.DataFrame],
+        portfolio_context,
+    ) -> Optional[pd.DataFrame]:
+        """Remove confirmed unheld limit-up stocks before target inference."""
+        if trading_universe_df is not None and not trading_universe_df.empty:
+            source = trading_universe_df
+            code_col = "ID_QI" if "ID_QI" in source.columns else "code"
+            candidate_codes = {
+                str(code).split(".")[0].zfill(6)
+                for code in source[code_col].dropna().astype(str)
+            }
+        else:
+            source = None
+            candidate_codes: set[str] = set()
+            if daily_basic_df is not None and not daily_basic_df.empty:
+                daily = daily_basic_df
+                if "trade_date" in daily.columns:
+                    trade_dates = daily["trade_date"].dropna().astype(str)
+                    if self.trading_day:
+                        current = daily[daily["trade_date"].astype(str) == self.trading_day]
+                    else:
+                        current = pd.DataFrame()
+                    if not current.empty:
+                        daily = current
+                    elif not trade_dates.empty:
+                        latest_date = trade_dates.max()
+                        daily = daily[daily["trade_date"].astype(str) == latest_date]
+                code_col = "ID_QI" if "ID_QI" in daily.columns else "code"
+                if code_col in daily.columns:
+                    candidate_codes = {
+                        str(code).split(".")[0].zfill(6)
+                        for code in daily[code_col].dropna().astype(str)
+                    }
+        if not candidate_codes:
+            logger.warning(
+                "[open-position-targets] cannot build candidate universe for pre-model limit-up filter")
+            return trading_universe_df
+
+        held_codes: set[str] = set()
+        positions = getattr(portfolio_context, "positions", None)
+        if positions is not None and not positions.empty and "code" in positions.columns:
+            held_series = positions["code"].astype(str).map(
+                lambda code: code.split(".")[0].zfill(6))
+            volume_col = next(
+                (col for col in (
+                    "current_volume", "volume", "total_qty", "qty", "quantity",
+                    "position_volume",
+                ) if col in positions.columns),
+                None,
+            )
+            if volume_col is None:
+                held_codes = set(held_series)
+            else:
+                volumes = pd.to_numeric(
+                    positions[volume_col], errors="coerce").fillna(0.0)
+                held_codes = set(held_series[volumes > 0])
+
+        limit_prices = self._snapshot_limit_prices()
+        high_limit_by_code = {
+            str(code).split(".")[0].zfill(6): float(values[0])
+            for code, values in limit_prices.items()
+            if values and float(values[0] or 0.0) > 0
+        }
+        required_price_codes = (
+            candidate_codes - held_codes
+        ) & set(high_limit_by_code)
+
+        # Pre-model filtering is deliberately non-blocking. Use whatever opening
+        # prices are already visible; a missing price means "not confirmed at
+        # limit-up" and the stock remains eligible for model calculation.
+        latest_prices = self._snapshot_latest_prices()
+        price_by_code = {
+            str(code).split(".")[0].zfill(6): float(price)
+            for code, price in latest_prices.items()
+            if price and float(price) > 0
+        }
+        missing_codes = required_price_codes - set(price_by_code)
+        if missing_codes:
+            late_limits: dict = {}
+            latest_prices.update(self._snapshot_target_prices_from_shm(
+                missing_codes, late_limits))
+            for code, values in late_limits.items():
+                code6 = str(code).split(".")[0].zfill(6)
+                high_limit = float(values[0] or 0.0)
+                if high_limit > 0 and code6 not in high_limit_by_code:
+                    high_limit_by_code[code6] = high_limit
+            price_by_code = {
+                str(code).split(".")[0].zfill(6): float(price)
+                for code, price in latest_prices.items()
+                if price and float(price) > 0
+            }
+            missing_codes = required_price_codes - set(price_by_code)
+
+        limit_up_codes = {
+            code for code in required_price_codes
+            if price_by_code.get(code, 0.0) >= high_limit_by_code[code] - 1e-6
+        }
+        portfolio_context.meta["latest_prices"] = latest_prices
+        portfolio_context.meta["limit_prices"] = limit_prices
+        if missing_codes:
+            logger.info(
+                "[open-position-targets] pre-model prices unavailable for %d candidates; "
+                "treat as not confirmed limit-up and keep them in the universe",
+                len(missing_codes))
+        if not limit_up_codes:
+            logger.info(
+                "[open-position-targets] pre-model limit-up filter: 0/%d excluded",
+                len(candidate_codes))
+            return trading_universe_df
+
+        filtered_codes = sorted(candidate_codes - limit_up_codes)
+        logger.info(
+            "[open-position-targets] pre-model limit-up filter: excluded %d unheld stocks: %s",
+            len(limit_up_codes), ",".join(sorted(limit_up_codes)[:20]))
+        if source is not None:
+            normalized = source[code_col].astype(str).map(
+                lambda code: code.split(".")[0].zfill(6))
+            return source.loc[~normalized.isin(limit_up_codes)].copy()
+        return build_trading_universe_df(filtered_codes, daily_basic_df)
 
     @staticmethod
     def _update_tick_vectorized(state: StockState, arr: np.ndarray) -> None:
@@ -3017,13 +3140,15 @@ class NativeEngine:
                     logger.warning("[open_position] disk cache read failed %s: %s", p, exc)
         return None
 
-    def _calculate_open_position_targets(self) -> None:
+    def _calculate_open_position_targets(self, end_time: str = "093000") -> None:
         """Run target inference and publish a one-shot memory/disk cache.
 
-        Invoked synchronously at 9:30, then immediately consumed and converted
-        using refreshed realtime tick prices.
+        Normally invoked after the 9:25 call auction and consumed at 9:30.
+        If the precompute cache is missing, 9:30 invokes it synchronously.
 
         设计要点：
+        - Before Stage 1, use currently available opening ticks to remove
+          confirmed unheld limit-up stocks without waiting for missing prices.
         - Stage 1 uses T-1 daily data/factors and the current broker holdings.
         - Stage 2 refreshes realtime ticks after target inference, then retries
           only target codes whose prices are still missing.
@@ -3079,19 +3204,21 @@ class NativeEngine:
             tu_df = (self._trading_universe_df
                      if self._trading_universe_df is not None else None)
 
-            # At 9:30 this is the live account snapshot used by the optimizer.
+            # This live account snapshot is used by the optimizer.
             # Conversion fetches it again after inference for current delta sizing.
             portfolio_context = self._load_open_position_portfolio_context(
-                date_str, "093000", "target inference")
+                date_str, end_time, "target inference")
             if portfolio_context is None:
                 return
+            tu_df = self._filter_open_position_limit_up_universe(
+                tu_df, daily_basic_df, portfolio_context)
 
             # 计算 idx_comp（与 _write_results 行 1724-1727 等价）
             idx_comp_df = None
             try:
                 universe_extra = {
                     "date": date_str,
-                    "end_time": "093000",
+                    "end_time": end_time,
                     "codes": _result_codes(prev) if hasattr(prev, "columns") else [],
                     "factor_result": prev,
                     "idx_cons_df": self._idx_cons_df,
@@ -3108,7 +3235,7 @@ class NativeEngine:
                         date_str, my_generation)
             positions = targets_fn(
                 date_str=date_str,
-                end_time="093000",
+                end_time=end_time,
                 prev_day_factors_df=prev,
                 intraday_factors_df=prev,  # open_position 用 prev_day 当 intraday
                 daily_basic_df=daily_basic_df,
@@ -3318,7 +3445,8 @@ class NativeEngine:
 
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
         lock = (self._daily_position_lock
-                if (schedule is not None and schedule.name == "open_position")
+                if (schedule is not None and schedule.name in {
+                    "open_position", "open_position_precompute"})
                 else self._compute_lock)
         try:
             with lock:
@@ -3341,23 +3469,31 @@ class NativeEngine:
             schedule is not None and getattr(schedule, 'use_daily_factor_module', False))
         is_daily_worker = use_daily_module  # worker call signature: daily=single-code, minute=batch
 
+        if schedule is not None and schedule.name == "open_position_precompute":
+            end_time_label = schedule.result_label or "092500"
+            self._invalidate_open_position_targets()
+            logger.info(
+                "[open_position] precomputing targets from call-auction data at %s",
+                end_time_label)
+            self._calculate_open_position_targets(end_time_label)
+            return
+
         # open_position: skip factor compute entirely, use prev_day_factors directly
         if schedule is not None and getattr(schedule, 'skip_factor_compute', False):
             date_str = self.trading_day
             end_time_label = schedule.result_label or "093000"
 
-            # Always discard stale persisted targets and calculate from the
-            # current 9:30 account snapshot. Realtime ticks are refreshed after
-            # model inference during conversion below. The open-position lock is
-            # independent from minute factor computation.
-            self._invalidate_open_position_targets()
-            logger.info("[open_position] calculating targets at 9:30")
-            self._calculate_open_position_targets()
             cached_targets = self._pop_open_position_targets()
+            if cached_targets is None or cached_targets.empty:
+                logger.warning(
+                    "[open_position] call-auction target cache missing; calculating at 9:30")
+                self._invalidate_open_position_targets()
+                self._calculate_open_position_targets(end_time_label)
+                cached_targets = self._pop_open_position_targets()
 
             if cached_targets is not None and not cached_targets.empty:
                 logger.info(
-                    "[open_position] %s using 9:30-calculated targets: %d rows",
+                    "[open_position] %s using cached targets: %d rows",
                     schedule.name,
                     len(cached_targets),
                 )
@@ -4197,10 +4333,9 @@ class NativeEngine:
             self._post_close_daily_done.set()
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
-        # open_position targets are intentionally not calculated at startup.
-        # The 9:30 trigger reads the current holdings, runs the model, then
-        # refreshes realtime ticks for limit-up checks and order sizing.
-        logger.info("[native] open_position target calculation deferred to 9:30")
+        logger.info(
+            "[native] open_position targets use call-auction precompute when scheduled; "
+            "9:30 falls back to synchronous split inference if cache is missing")
 
         # One-shot flatten at startup (sim reset; guarded by env + date flag)
         self._one_time_close_on_startup()

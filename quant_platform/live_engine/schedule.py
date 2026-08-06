@@ -57,6 +57,7 @@ class ComputationSchedule:
 
     # time_trigger mode
     trigger_times: Optional[List[Tuple[int, int]]] = None  # [(15, 10)]
+    trigger_deadline: Optional[Tuple[int, int]] = None     # optional exclusive HH:MM deadline
 
     # behavior flags
     run_inference: bool = True
@@ -94,6 +95,10 @@ class ComputationSchedule:
             # long minute compute); as long as the loop samples any later time
             # in the same trading_day, the daily run still fires once.
             now_sec = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+            if self.trigger_deadline is not None:
+                dh, dm = self.trigger_deadline
+                if now_sec >= dh * 3600 + dm * 60:
+                    return False
             for th, tm in (self.trigger_times or []):
                 if now_sec >= th * 3600 + tm * 60:
                     return True
@@ -199,6 +204,24 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             run_inference=True,
             is_daily_result=False,
             use_daily_factor_module=False,
+            result_label=f"{t[0]:02d}{t[1]:02d}00",
+            skip_factor_compute=True,
+        ))
+
+    if "open_position_precompute" in enabled:
+        t = _parse_trigger_time(
+            os.environ.get("OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME", "09:25"),
+            (9, 25), "OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME")
+        open_t = _parse_trigger_time(
+            os.environ.get("OPEN_POSITION_TRIGGER_TIME", "09:30"),
+            (9, 30), "OPEN_POSITION_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="open_position_precompute",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            trigger_deadline=open_t,
+            run_inference=True,
+            is_daily_result=False,
             result_label=f"{t[0]:02d}{t[1]:02d}00",
             skip_factor_compute=True,
         ))

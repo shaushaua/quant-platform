@@ -10,8 +10,9 @@ This module exposes three entry points:
 
 - ``inference_targets`` — Stage 1: 树模型推理 → target positions (weights).
   Only depends on T-1 daily_basic / factors / static index composition /
-  current broker holdings. Production runs this at the 9:30 trigger so the
-  account snapshot and subsequent realtime-price conversion share one cycle.
+  current broker holdings. Production normally runs this after the 9:25 call
+  auction, after the engine removes confirmed unheld limit-up stocks from the
+  trading universe; 9:30 is the cache-miss fallback.
 
 - ``targets_to_orders`` — Stage 2: target weights → order rows.
   Uses realtime tick price from ``portfolio_context.meta['latest_prices']``
@@ -119,7 +120,7 @@ def inference_targets(
     """Stage 1: 树模型推理 → target positions (weights).
 
     Heavy step (loads .so, runs full-market prediction). Production invokes it
-    at 9:30 before refreshing ticks for Stage 2 order conversion.
+    after the engine's non-blocking call-auction tick/limit-up universe filter.
 
     Returns a normalized positions DataFrame with `code` and `position` columns
     suitable for ``targets_to_orders``. Returns empty DataFrame on failure.
