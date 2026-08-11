@@ -640,8 +640,8 @@ class NativeEngine:
         self._stopped = False
         self._archive_thread: Optional[threading.Thread] = None
         self._compute_lock = threading.Lock()
-        self._daily_position_lock = threading.Lock()
         self._compute_running = False
+        self._open_position_running = threading.Event()
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
         # _cached_shm_files was removed — SHM files are created lazily by the
@@ -3105,7 +3105,7 @@ class NativeEngine:
                 pass
 
     def _pop_open_position_targets(self) -> Optional[pd.DataFrame]:
-        """One-shot consume of the precomputed open_position targets.
+        """One-shot consume of the current open_position targets.
 
         Returns the cached DataFrame and clears BOTH the in-memory slot and
         the on-disk cache file (rename to .consumed.csv). If memory is empty
@@ -3143,8 +3143,7 @@ class NativeEngine:
     def _calculate_open_position_targets(self, end_time: str = "093000") -> None:
         """Run target inference and publish a one-shot memory/disk cache.
 
-        Normally invoked after the 9:25 call auction and consumed at 9:30.
-        If the precompute cache is missing, 9:30 invokes it synchronously.
+        Invoked synchronously by the 9:30 open-position schedule.
 
         设计要点：
         - Before Stage 1, use currently available opening ticks to remove
@@ -3267,7 +3266,7 @@ class NativeEngine:
             if self.output_path is not None:
                 cache_path = self.output_path / f"{date_str}_open_position_targets.csv"
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                # 用 pid+threadid+ts 命名避免多个 precompute 实例撞名
+                # 用 pid+threadid+ts 命名避免多个计算实例撞名
                 tmp_path = cache_path.with_name(
                     f"{cache_path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{int(time.time()*1000)}"
                 )
@@ -3370,7 +3369,7 @@ class NativeEngine:
             if p.exists():
                 try:
                     p.unlink()
-                    logger.info("[open_position] removed stale precompute cache (gen=%d): %s",
+                    logger.info("[open_position] removed stale target cache (gen=%d): %s",
                                 gen, p)
                 except Exception as exc:
                     logger.warning("[open_position] cache unlink failed %s: %s", p, exc)
@@ -3444,16 +3443,20 @@ class NativeEngine:
                          td, exc, exc_info=True)
 
     def _compute_and_output(self, schedule: Optional[ComputationSchedule] = None) -> None:
-        lock = (self._daily_position_lock
-                if (schedule is not None and schedule.name in {
-                    "open_position", "open_position_precompute"})
-                else self._compute_lock)
+        is_open_position = schedule is not None and schedule.name == "open_position"
+        if is_open_position:
+            # Set before waiting for a possibly still-running 9:29 minute job.
+            # The scheduler will not enqueue 9:31 (or later) minute work until
+            # the complete target calculation and order conversion have ended.
+            self._open_position_running.set()
         try:
-            with lock:
+            with self._compute_lock:
                 self._compute_and_output_locked(schedule)
         except Exception as exc:
             logger.error("[combined] background compute failed: %s", exc, exc_info=True)
         finally:
+            if is_open_position:
+                self._open_position_running.clear()
             if schedule is not None and schedule.name == "daily":
                 self._post_close_daily_done.set()
                 logger.info("[native-archive] post-close daily calculation marked done")
@@ -3463,33 +3466,33 @@ class NativeEngine:
             if schedule is None or schedule.name == "minute":
                 self._compute_running = False
 
+    def _minute_compute_blocked(self) -> bool:
+        """Return whether minute work would overlap another factor calculation."""
+        return self._compute_running or self._open_position_running.is_set()
+
     def _compute_and_output_locked(self, schedule: Optional[ComputationSchedule] = None) -> None:
         is_daily = schedule is not None and schedule.is_daily_result
         use_daily_module = is_daily or (
             schedule is not None and getattr(schedule, 'use_daily_factor_module', False))
         is_daily_worker = use_daily_module  # worker call signature: daily=single-code, minute=batch
 
-        if schedule is not None and schedule.name == "open_position_precompute":
-            end_time_label = schedule.result_label or "092500"
-            self._invalidate_open_position_targets()
-            logger.info(
-                "[open_position] precomputing targets from call-auction data at %s",
-                end_time_label)
-            self._calculate_open_position_targets(end_time_label)
-            return
-
         # open_position: skip factor compute entirely, use prev_day_factors directly
         if schedule is not None and getattr(schedule, 'skip_factor_compute', False):
             date_str = self.trading_day
             end_time_label = schedule.result_label or "093000"
 
+            # Always calculate from the 9:30 market snapshot. Never consume a
+            # target cache left by an older image or an interrupted earlier run;
+            # limit-up filtering must happen immediately before model inference.
+            self._invalidate_open_position_targets()
+            logger.info(
+                "[open_position] calculating targets from 9:30 market data at %s",
+                end_time_label)
+            self._calculate_open_position_targets(end_time_label)
             cached_targets = self._pop_open_position_targets()
             if cached_targets is None or cached_targets.empty:
-                logger.warning(
-                    "[open_position] call-auction target cache missing; calculating at 9:30")
-                self._invalidate_open_position_targets()
-                self._calculate_open_position_targets(end_time_label)
-                cached_targets = self._pop_open_position_targets()
+                logger.error(
+                    "[open_position] 9:30 target calculation produced no targets; fail closed")
 
             if cached_targets is not None and not cached_targets.empty:
                 logger.info(
@@ -3547,7 +3550,7 @@ class NativeEngine:
                             # 老版本 inference 模块没有拆分接口 → 用 inference_fn 全跑
                             logger.warning(
                                 "[open_position] inference module lacks targets_to_orders, "
-                                "precompute cache unusable; falling back")
+                                "target conversion unavailable; falling back")
                             break
 
                         diagnostics: dict = {}
@@ -4334,8 +4337,8 @@ class NativeEngine:
         logger.info("[native] schedules: %s", [s.name for s in self._schedules])
 
         logger.info(
-            "[native] open_position targets use call-auction precompute when scheduled; "
-            "9:30 falls back to synchronous split inference if cache is missing")
+            "[native] open_position targets are calculated synchronously at 9:30 "
+            "before realtime order conversion")
 
         # One-shot flatten at startup (sim reset; guarded by env + date flag)
         self._one_time_close_on_startup()
@@ -4356,7 +4359,7 @@ class NativeEngine:
                 now_dt = datetime.now()
                 for schedule in self._schedules:
                     if schedule.should_run(now, now_dt, self.trading_day):
-                        if schedule.name == "minute" and self._compute_running:
+                        if schedule.name == "minute" and self._minute_compute_blocked():
                             continue
                         if schedule.name == "minute":
                             self._compute_running = True

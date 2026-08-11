@@ -96,8 +96,7 @@ spec:
             #   value: "1"
             # - name: OPEN_POSITION_TOTAL_CAPITAL
             #   value: "10000000"
-            # --- 09:25 集合竞价后预计算目标；09:30 刷新实时价并下单 ---
-            # 预计算缺失时，09:30 使用同一拆分推理路径现场补算。
+            # --- 09:30 用开盘行情过滤涨停票、计算目标并下单 ---
             # --- 一次性清仓：模拟盘启动时把 broker 持仓全平 ---
             # 启用后 pod 起来 spawn daemon thread,等到 09:15 拉持仓并全推 sell。
             # 幂等：/data/factors/{trading_day}_close_done.flag 写后不再重试。
@@ -116,8 +115,11 @@ spec:
               value: "quant_platform.broker.order_context"
             - name: COMPUTE_INTERVAL
               value: "60"
+            # 9:30 只运行开盘日频调仓，避免与分钟因子争抢 CPU。
+            - name: MINUTE_SKIP_TIMES
+              value: "09:30"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position,open_position_precompute,open_position,daily_basic_refresh"
+              value: "minute,daily,daily_position,open_position,daily_basic_refresh"
             # 临时关闭分钟级下单：minute 继续算因子+同步 tick，但不推单
             # 想恢复分钟下单把这个改成 true 即可
             - name: MINUTE_RUN_INFERENCE
@@ -126,11 +128,12 @@ spec:
               value: "15:10"
             - name: DAILY_POSITION_TRIGGER_TIME
               value: "14:50"
-            # --- 集合竞价预计算 + 9:30 开盘下单 ---
+            # --- 9:30 开盘计算目标并下单 ---
             - name: OPEN_POSITION_TRIGGER_TIME
               value: "09:30"
-            - name: OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME
-              value: "09:25"
+            # 09:35 起禁止补触发，避免 Pod 盘中重启后重复调仓。
+            - name: OPEN_POSITION_TRIGGER_DEADLINE
+              value: "09:35"
             # --- Order gateway ---
             - name: ORDER_GATEWAY_URL
               value: "http://172.16.0.47:18080"

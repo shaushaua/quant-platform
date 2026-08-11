@@ -1,6 +1,7 @@
 import queue
 import mmap
 import sys
+import threading
 from types import SimpleNamespace
 
 import pandas as pd
@@ -8,6 +9,51 @@ import pandas as pd
 import quant_platform.live_engine.native_engine as native_engine_module
 from quant_platform.factor.base import StockState
 from quant_platform.live_engine.native_engine import NativeEngine
+
+
+def test_open_position_blocks_minute_compute_until_complete():
+    engine = NativeEngine.__new__(NativeEngine)
+    engine._compute_lock = threading.Lock()
+    engine._compute_running = False
+    engine._open_position_running = threading.Event()
+    engine._post_close_daily_done = threading.Event()
+    observed = []
+    engine._compute_and_output_locked = lambda _schedule: observed.append(
+        engine._minute_compute_blocked()
+    )
+    schedule = SimpleNamespace(name="open_position")
+
+    engine._compute_and_output(schedule)
+
+    assert observed == [True]
+    assert engine._minute_compute_blocked() is False
+
+
+def test_open_position_waits_for_active_minute_without_reopening_minute_gate():
+    engine = NativeEngine.__new__(NativeEngine)
+    engine._compute_lock = threading.Lock()
+    engine._compute_running = True
+    engine._open_position_running = threading.Event()
+    engine._post_close_daily_done = threading.Event()
+    observed = []
+    engine._compute_and_output_locked = lambda _schedule: observed.append(True)
+    schedule = SimpleNamespace(name="open_position")
+
+    engine._compute_lock.acquire()
+    worker = threading.Thread(target=engine._compute_and_output, args=(schedule,))
+    try:
+        worker.start()
+        assert engine._open_position_running.wait(timeout=1.0) is True
+        assert engine._minute_compute_blocked() is True
+        assert observed == []
+    finally:
+        engine._compute_running = False
+        engine._compute_lock.release()
+        worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert observed == [True]
+    assert engine._minute_compute_blocked() is False
 
 
 def test_snapshot_target_prices_reads_late_tick_files(monkeypatch):
@@ -278,8 +324,9 @@ def test_open_position_calculates_targets_at_trigger(monkeypatch):
 
     def targets_to_orders(*args, diagnostics=None, **kwargs):
         diagnostics["missing_price_codes"] = []
+        targets = args[0]
         return pd.DataFrame([{
-            "code": "000001",
+            "code": targets.iloc[0]["code"],
             "side": "buy",
             "volume": 100,
         }])
@@ -329,33 +376,14 @@ def test_open_position_calculates_targets_at_trigger(monkeypatch):
     assert (date_str, end_time) == ("20260807", "093000")
 
 
-def test_open_position_precompute_runs_model_without_dispatching_orders():
-    engine = NativeEngine.__new__(NativeEngine)
-    invalidated = []
-    calculated = []
-    engine._invalidate_open_position_targets = lambda: invalidated.append(True)
-    engine._calculate_open_position_targets = lambda end_time: calculated.append(end_time)
-
-    schedule = SimpleNamespace(
-        name="open_position_precompute",
-        result_label="092500",
-        skip_factor_compute=True,
-        is_daily_result=False,
-        use_daily_factor_module=False,
-    )
-    engine._compute_and_output_locked(schedule)
-
-    assert invalidated == [True]
-    assert calculated == ["092500"]
-
-
-def test_open_position_consumes_precomputed_targets_without_recalculating(monkeypatch):
+def test_open_position_recalculates_instead_of_consuming_stale_targets(monkeypatch):
     module_name = "tests.fake_cached_target_inference"
 
     def targets_to_orders(*args, diagnostics=None, **kwargs):
         diagnostics["missing_price_codes"] = []
+        targets = args[0]
         return pd.DataFrame([{
-            "code": "000001",
+            "code": targets.iloc[0]["code"],
             "side": "buy",
             "volume": 100,
         }])
@@ -373,11 +401,19 @@ def test_open_position_consumes_precomputed_targets_without_recalculating(monkey
     engine._open_position_cache_lock = native_engine_module.threading.Lock()
     engine._open_position_cache_generation = 0
     engine.output_path = None
-    engine._calculate_open_position_targets = lambda *_args: (_ for _ in ()).throw(
-        AssertionError("9:30 recalculated despite a valid precompute cache"))
+    calculated = []
+
+    def calculate_targets(end_time):
+        calculated.append(end_time)
+        engine._open_position_cache = pd.DataFrame([{
+            "code": "600000",
+            "position": 0.2,
+        }])
+
+    engine._calculate_open_position_targets = calculate_targets
     engine.portfolio_context_fn = lambda *_: SimpleNamespace(
         positions=pd.DataFrame(), meta={"positions_usable": True})
-    engine._snapshot_latest_prices = lambda: {"000001.XSHE": 10.0}
+    engine._snapshot_latest_prices = lambda: {"600000.XSHG": 10.0}
     engine._snapshot_limit_prices = lambda: {}
     engine._snapshot_target_prices_from_shm = lambda *_args, **_kwargs: {}
     engine._daily_basic_df = pd.DataFrame()
@@ -392,7 +428,8 @@ def test_open_position_consumes_precomputed_targets_without_recalculating(monkey
     engine._compute_and_output_locked(schedule)
 
     orders, _, _ = engine._order_queue.get_nowait()
-    assert orders["code"].tolist() == ["000001"]
+    assert calculated == ["093000"]
+    assert orders["code"].tolist() == ["600000"]
 
 
 def test_open_position_fails_closed_when_holdings_are_unusable(monkeypatch):

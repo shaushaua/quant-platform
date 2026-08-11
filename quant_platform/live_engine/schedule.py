@@ -11,7 +11,7 @@ The factor_calculation function is the same regardless of schedule.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import logging
 import os
 
@@ -54,6 +54,7 @@ class ComputationSchedule:
     interval_seconds: int = 60
     active_hours: Tuple[Tuple[int, int], Tuple[int, int]] = ((9, 15), (15, 5))
     active_sessions: Optional[List[Tuple[Tuple[int, int], Tuple[int, int]]]] = None
+    excluded_minutes: Set[Tuple[int, int]] = field(default_factory=set)
 
     # time_trigger mode
     trigger_times: Optional[List[Tuple[int, int]]] = None  # [(15, 10)]
@@ -77,6 +78,8 @@ class ComputationSchedule:
             if now_ts - self._last_run_ts < self.interval_seconds:
                 return False
             h, m = now_dt.hour, now_dt.minute
+            if (h, m) in self.excluded_minutes:
+                return False
             now_min = h * 60 + m
             if self.active_sessions:
                 return any(
@@ -139,6 +142,7 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
     Env vars:
         COMPUTE_SCHEDULES:          comma-separated names, default "minute"
         COMPUTE_INTERVAL:           minute interval seconds, default 60
+        MINUTE_SKIP_TIMES:          comma-separated HH:MM values, default empty
         DAILY_FACTOR_TRIGGER_TIME:  HH:MM, default "15:10"
 
     factor_info override:
@@ -157,12 +161,30 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
         minute_run_inference = os.environ.get("MINUTE_RUN_INFERENCE", "true").lower() in {
             "1", "true", "yes", "y", "on"
         }
+        excluded_minutes: Set[Tuple[int, int]] = set()
+        for raw in os.environ.get("MINUTE_SKIP_TIMES", "").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split(":")
+            try:
+                h, m = int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                logger.warning(
+                    "[schedule] ignoring malformed MINUTE_SKIP_TIMES value: %r", raw)
+                continue
+            if not (0 <= h < 24 and 0 <= m < 60):
+                logger.warning(
+                    "[schedule] ignoring out-of-range MINUTE_SKIP_TIMES value: %r", raw)
+                continue
+            excluded_minutes.add((h, m))
         schedules.append(ComputationSchedule(
             name="minute",
             schedule_type="interval",
             interval_seconds=interval,
             active_hours=((9, 15), (15, 0)),
             active_sessions=[((9, 15), (11, 30)), ((13, 0), (15, 0))],
+            excluded_minutes=excluded_minutes,
             run_inference=minute_run_inference,
             is_daily_result=False,
         ))
@@ -197,31 +219,17 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
         t = _parse_trigger_time(
             os.environ.get("OPEN_POSITION_TRIGGER_TIME", "09:30"),
             (9, 30), "OPEN_POSITION_TRIGGER_TIME")
+        deadline = _parse_trigger_time(
+            os.environ.get("OPEN_POSITION_TRIGGER_DEADLINE", "09:35"),
+            (9, 35), "OPEN_POSITION_TRIGGER_DEADLINE")
         schedules.append(ComputationSchedule(
             name="open_position",
             schedule_type="time_trigger",
             trigger_times=[t],
+            trigger_deadline=deadline,
             run_inference=True,
             is_daily_result=False,
             use_daily_factor_module=False,
-            result_label=f"{t[0]:02d}{t[1]:02d}00",
-            skip_factor_compute=True,
-        ))
-
-    if "open_position_precompute" in enabled:
-        t = _parse_trigger_time(
-            os.environ.get("OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME", "09:25"),
-            (9, 25), "OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME")
-        open_t = _parse_trigger_time(
-            os.environ.get("OPEN_POSITION_TRIGGER_TIME", "09:30"),
-            (9, 30), "OPEN_POSITION_TRIGGER_TIME")
-        schedules.append(ComputationSchedule(
-            name="open_position_precompute",
-            schedule_type="time_trigger",
-            trigger_times=[t],
-            trigger_deadline=open_t,
-            run_inference=True,
-            is_daily_result=False,
             result_label=f"{t[0]:02d}{t[1]:02d}00",
             skip_factor_compute=True,
         ))
