@@ -4215,10 +4215,10 @@ class NativeEngine:
                 portfolio_context = self._load_open_position_portfolio_context(
                     date_str, rt_end_time, "target inference",
                     log_tag=log_tag,
-                    retries_override=1,
+                    retries_override=2,
                     delay_override=0.0,
                     request_timeout=_env_float(
-                        "DAILY_POSITION_CONTEXT_TIMEOUT", 1.0, minimum=0.1),
+                        "DAILY_POSITION_CONTEXT_TIMEOUT", 2.0, minimum=0.1),
                 )
                 if portfolio_context is None:
                     return None

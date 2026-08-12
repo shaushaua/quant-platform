@@ -420,7 +420,7 @@ def test_daily_position_fails_closed_when_holdings_are_unusable(monkeypatch):
     assert inference_calls == []
 
 
-def test_daily_position_uses_single_short_holdings_request(monkeypatch):
+def test_daily_position_uses_two_bounded_holdings_requests(monkeypatch):
     engine = NativeEngine.__new__(NativeEngine)
     requests = []
 
@@ -431,18 +431,18 @@ def test_daily_position_uses_single_short_holdings_request(monkeypatch):
 
     engine.portfolio_context_fn = portfolio_context
     monkeypatch.setenv("OPEN_POSITION_CONTEXT_RETRIES", "3")
-    monkeypatch.setenv("DAILY_POSITION_CONTEXT_TIMEOUT", "1.25")
+    monkeypatch.setenv("DAILY_POSITION_CONTEXT_TIMEOUT", "2.0")
 
     context = engine._load_open_position_portfolio_context(
         "20260812", "145000", "target inference",
         log_tag="daily_position",
-        retries_override=1,
+        retries_override=2,
         delay_override=0.0,
-        request_timeout=1.25,
+        request_timeout=2.0,
     )
 
     assert context is None
-    assert requests == [1.25]
+    assert requests == [2.0, 2.0]
 
 
 def test_precompute_limit_prices_retries_until_ready(monkeypatch):
