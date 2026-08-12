@@ -21,6 +21,7 @@ import copy
 import gc
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import multiprocessing
@@ -37,6 +38,7 @@ import tarfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1780,11 +1782,73 @@ class NativeEngine:
                     reader.close()
         return out
 
+    def _snapshot_target_prices_from_external(self, target_codes: set[str]) -> dict:
+        """Fetch missing target prices from Tencent as a last-resort fallback.
+
+        SHM remains authoritative. This path is called only for target codes
+        that still have no usable in-memory or SHM price during order sizing.
+        Quotes must carry today's trading date so stale/pre-open responses are
+        never used to calculate live order quantities.
+        """
+        if not target_codes or not _env_bool("OPEN_POSITION_EXTERNAL_QUOTE_FALLBACK", True):
+            return {}
+
+        code6s = sorted({str(code).split(".")[0].zfill(6) for code in target_codes})
+        symbols = [
+            ("sh" if code.startswith(("5", "6", "9")) else "sz") + code
+            for code in code6s
+        ]
+        url = "http://qt.gtimg.cn/q=" + urllib.parse.quote(",".join(symbols), safe=",")
+        timeout = _env_float("OPEN_POSITION_EXTERNAL_QUOTE_TIMEOUT", 1.0, minimum=0.1)
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("gbk", errors="replace")
+        except Exception as exc:
+            logger.warning("[open_position] Tencent quote fallback failed: %s", exc)
+            return {}
+
+        today = self.trading_day or date.today().strftime("%Y%m%d")
+        wanted = set(code6s)
+        out: dict = {}
+        for line in body.splitlines():
+            if "=" not in line:
+                continue
+            raw = line.split("=", 1)[1].strip().strip('";')
+            fields = raw.split("~")
+            if len(fields) < 31:
+                continue
+            code6 = fields[2].strip().zfill(6)
+            quote_time = fields[30].strip()
+            if code6 not in wanted or not quote_time.startswith(today):
+                continue
+            try:
+                price = float(fields[3])
+                open_price = float(fields[5])
+                traded_volume = float(fields[6])
+            except (TypeError, ValueError):
+                continue
+            # Tencent reports yesterday's close with today's timestamp for
+            # suspended/no-trade stocks. Require an actual opening trade so
+            # such a placeholder cannot create an unexecutable order.
+            if (not np.isfinite(price) or price <= 0
+                    or open_price <= 0 or traded_volume <= 0):
+                continue
+            suffix = ".XSHG" if fields[0].strip() == "1" else ".XSHE"
+            out[code6 + suffix] = price
+
+        if out:
+            logger.info(
+                "[open_position] Tencent quote fallback resolved %d/%d target prices",
+                len(out), len(code6s))
+        return out
+
     def _filter_open_position_limit_up_universe(
         self,
         trading_universe_df: Optional[pd.DataFrame],
         daily_basic_df: Optional[pd.DataFrame],
         portfolio_context,
+        log_tag: str = "open-position-targets",
     ) -> Optional[pd.DataFrame]:
         """Remove confirmed unheld limit-up stocks before target inference."""
         if trading_universe_df is not None and not trading_universe_df.empty:
@@ -1818,7 +1882,8 @@ class NativeEngine:
                     }
         if not candidate_codes:
             logger.warning(
-                "[open-position-targets] cannot build candidate universe for pre-model limit-up filter")
+                "[%s] cannot build candidate universe for pre-model limit-up filter",
+                log_tag)
             return trading_universe_df
 
         held_codes: set[str] = set()
@@ -1884,19 +1949,19 @@ class NativeEngine:
         portfolio_context.meta["limit_prices"] = limit_prices
         if missing_codes:
             logger.info(
-                "[open-position-targets] pre-model prices unavailable for %d candidates; "
+                "[%s] pre-model prices unavailable for %d candidates; "
                 "treat as not confirmed limit-up and keep them in the universe",
-                len(missing_codes))
+                log_tag, len(missing_codes))
         if not limit_up_codes:
             logger.info(
-                "[open-position-targets] pre-model limit-up filter: 0/%d excluded",
-                len(candidate_codes))
+                "[%s] pre-model limit-up filter: 0/%d excluded",
+                log_tag, len(candidate_codes))
             return trading_universe_df
 
         filtered_codes = sorted(candidate_codes - limit_up_codes)
         logger.info(
-            "[open-position-targets] pre-model limit-up filter: excluded %d unheld stocks: %s",
-            len(limit_up_codes), ",".join(sorted(limit_up_codes)[:20]))
+            "[%s] pre-model limit-up filter: excluded %d unheld stocks: %s",
+            log_tag, len(limit_up_codes), ",".join(sorted(limit_up_codes)[:20]))
         if source is not None:
             normalized = source[code_col].astype(str).map(
                 lambda code: code.split(".")[0].zfill(6))
@@ -3315,21 +3380,40 @@ class NativeEngine:
         date_str: str,
         end_time: str,
         purpose: str,
+        log_tag: str = "open_position",
+        retries_override: Optional[int] = None,
+        delay_override: Optional[float] = None,
+        request_timeout: Optional[float] = None,
     ):
         """Fetch a verified live holdings snapshot, retrying before fail-closed."""
-        retries = _env_int("OPEN_POSITION_CONTEXT_RETRIES", 3, minimum=1)
-        delay = _env_float("OPEN_POSITION_CONTEXT_RETRY_DELAY", 1.0, minimum=0.0)
+        retries = (retries_override if retries_override is not None else
+                   _env_int("OPEN_POSITION_CONTEXT_RETRIES", 3, minimum=1))
+        delay = (delay_override if delay_override is not None else
+                 _env_float("OPEN_POSITION_CONTEXT_RETRY_DELAY", 1.0, minimum=0.0))
         if self.portfolio_context_fn is None:
-            logger.error("[open_position] portfolio_context_fn unavailable for %s", purpose)
+            logger.error("[%s] portfolio_context_fn unavailable for %s", log_tag, purpose)
             return None
 
         for attempt in range(retries):
             try:
-                context = self.portfolio_context_fn(date_str, end_time)
+                supports_timeout = False
+                if request_timeout is not None:
+                    try:
+                        supports_timeout = (
+                            "request_timeout" in
+                            inspect.signature(self.portfolio_context_fn).parameters
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if supports_timeout:
+                    context = self.portfolio_context_fn(
+                        date_str, end_time, request_timeout=request_timeout)
+                else:
+                    context = self.portfolio_context_fn(date_str, end_time)
             except Exception as exc:
                 logger.error(
-                    "[open_position] holdings fetch failed for %s (%d/%d): %s",
-                    purpose, attempt + 1, retries, exc)
+                    "[%s] holdings fetch failed for %s (%d/%d): %s",
+                    log_tag, purpose, attempt + 1, retries, exc)
                 context = None
 
             meta = getattr(context, "meta", None) if context is not None else None
@@ -3338,8 +3422,8 @@ class NativeEngine:
 
             if context is not None:
                 logger.error(
-                    "[open_position] holdings unusable for %s (%d/%d): stale=%s source=%s",
-                    purpose, attempt + 1, retries,
+                    "[%s] holdings unusable for %s (%d/%d): stale=%s source=%s",
+                    log_tag, purpose, attempt + 1, retries,
                     (meta or {}).get("positions_stale"),
                     (meta or {}).get("source_kind", ""),
                 )
@@ -3347,9 +3431,9 @@ class NativeEngine:
                 time.sleep(delay)
 
         logger.error(
-            "[open_position] holdings unavailable after %d attempts for %s; "
+            "[%s] holdings unavailable after %d attempts for %s; "
             "fail closed without target calculation or orders",
-            retries, purpose)
+            log_tag, retries, purpose)
         return None
 
     def _invalidate_open_position_targets(self) -> None:
@@ -3519,6 +3603,8 @@ class NativeEngine:
                     for code in cached_targets["code"].astype(str)
                 }
                 conversion_succeeded = False
+                external_quote_attempted = False
+                external_quote_prices: dict = {}
                 for attempt in range(max_retries):
                     try:
                         lp = self._snapshot_latest_prices()
@@ -3530,6 +3616,18 @@ class NativeEngine:
                         if unresolved_codes:
                             lp.update(self._snapshot_target_prices_from_shm(
                                 unresolved_codes, late_limit_prices))
+                            resolved_after_shm = {
+                                str(code).split(".")[0].zfill(6) for code in lp
+                            }
+                            external_codes = unresolved_codes - resolved_after_shm
+                            if external_codes and not external_quote_attempted:
+                                external_quote_attempted = True
+                                external_quote_prices = self._snapshot_target_prices_from_external(
+                                    external_codes)
+                        # Preserve the single external snapshot across retries.
+                        # Each iteration rebuilds lp from current state/SHM.
+                        for code, price in external_quote_prices.items():
+                            lp.setdefault(code, price)
                         if lp:
                             portfolio_context.meta["latest_prices"] = lp
                             lp2 = self._snapshot_limit_prices()
@@ -3992,6 +4090,8 @@ class NativeEngine:
                 idx_cons_df=idx_cons_df,
                 trading_universe_df=trading_universe_df,
                 pre_fork_latest_prices=pre_fork_latest_prices,
+                filter_unheld_limit_up_before_inference=(
+                    schedule is not None and schedule.name == "daily_position"),
                 # daily_position 算全市场，内存压力大，推理前 gc 释放因子计算阶段内存
                 # （改前 _write_daily_position_inline 有 gc.collect，此处恢复）
                 gc_before_inference=(schedule is not None and schedule.name == "daily_position"),
@@ -4038,6 +4138,7 @@ class NativeEngine:
         idx_cons_df,
         trading_universe_df,
         pre_fork_latest_prices: dict,
+        filter_unheld_limit_up_before_inference: bool,
         gc_before_inference: bool,
         log_tag: str,
     ) -> Optional[pd.DataFrame]:
@@ -4110,7 +4211,18 @@ class NativeEngine:
         positions_df = None
         try:
             portfolio_context = None
-            if portfolio_context_fn is not None:
+            if filter_unheld_limit_up_before_inference:
+                portfolio_context = self._load_open_position_portfolio_context(
+                    date_str, rt_end_time, "target inference",
+                    log_tag=log_tag,
+                    retries_override=1,
+                    delay_override=0.0,
+                    request_timeout=_env_float(
+                        "DAILY_POSITION_CONTEXT_TIMEOUT", 1.0, minimum=0.1),
+                )
+                if portfolio_context is None:
+                    return None
+            elif portfolio_context_fn is not None:
                 portfolio_context = portfolio_context_fn(date_str, rt_end_time)
             # Augment with engine realtime tick prices (latest_price from shm
             # sync). Used by open_position at 9:30 to size orders off live tick
@@ -4149,6 +4261,10 @@ class NativeEngine:
                 tu_df = trading_universe_df
             else:
                 tu_df = compute_trading_universe(daily_basic_df, universe_extra)
+            if filter_unheld_limit_up_before_inference and portfolio_context is not None:
+                tu_df = self._filter_open_position_limit_up_universe(
+                    tu_df, daily_basic_df, portfolio_context,
+                    log_tag=f"{log_tag}-targets")
             idx_comp_df = compute_index_composition(
                 daily_basic_df, universe_extra,
                 trading_day=date_str,

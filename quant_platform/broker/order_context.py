@@ -17,10 +17,15 @@ from ..inference.interface import PortfolioContext
 logger = logging.getLogger(__name__)
 
 
-def get_portfolio_context(date_str: str, end_time: str) -> PortfolioContext:
+def get_portfolio_context(
+    date_str: str,
+    end_time: str,
+    request_timeout: float | None = None,
+) -> PortfolioContext:
     gateway_url = os.environ.get("ORDER_GATEWAY_URL", "")
     account_id = os.environ.get("BROKER_ACCOUNT_ID", "")
-    timeout = float(os.environ.get("ORDER_GATEWAY_TIMEOUT", "10"))
+    timeout = (float(request_timeout) if request_timeout is not None else
+               float(os.environ.get("ORDER_GATEWAY_TIMEOUT", "10")))
     token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
     broker = os.environ.get("BROKER_TYPE", "atx")
     max_stale_seconds = float(os.environ.get("ORDER_POSITION_MAX_STALE_SECONDS", "15"))
