@@ -35,6 +35,11 @@ import oss2
 import pandas as pd
 
 try:
+    from .turnover_budget import dynamic_optimizer_max_turnover
+except ImportError:  # standalone: python tree_model_inference.py
+    from turnover_budget import dynamic_optimizer_max_turnover
+
+try:
     from calc_predict_tree_model import (
         POSITION_COLUMNS,
         build_optimizer_exposure_frame,
@@ -180,6 +185,7 @@ def _env_float(name: str, default: float) -> float:
 #     turnover budget leaves no room to adjust → infeasible.
 #   - CASH_RATIO: explicit allowance to hold cash (reduces target gross).
 OPTIMIZER_MAX_TURNOVER = _env_float("OPTIMIZER_MAX_TURNOVER", 0.35)
+OPTIMIZER_TURNOVER_BUFFER = _env_float("OPTIMIZER_TURNOVER_BUFFER", 0.02)
 OPTIMIZER_MAX_WEIGHT = _env_float("OPTIMIZER_MAX_WEIGHT", 0.01)
 OPTIMIZER_CASH_RATIO = _env_float("OPTIMIZER_CASH_RATIO", 0.0)
 OPTIMIZER_TRANS_COST = _env_float("OPTIMIZER_TRANS_COST", 0.0003)
@@ -741,6 +747,7 @@ def inference(
     daily_basic = filter_st_stocks_from_daily_basic(daily_basic, date_str)
     all_codes = pd.Index(daily_basic["ID_QI"].dropna().astype(str).unique()).sort_values()
     current_weight = extract_current_position_weights(portfolio_context, all_codes)
+    optimizer_max_turnover = OPTIMIZER_MAX_TURNOVER
 
     # extract_current_position_weights normalizes holdings to sum=1.0
     # (qty*price / Σ qty*price), so the optimizer always thinks we are 100%
@@ -759,14 +766,26 @@ def inference(
                 if "total_asset" in _acct.columns else float("nan")
             _mv = pd.to_numeric(_acct["market_value"].iloc[0], errors="coerce") \
                 if "market_value" in _acct.columns else float("nan")
+            _today_flow = pd.to_numeric(
+                _acct["today_cash_flow"].iloc[0], errors="coerce") \
+                if "today_cash_flow" in _acct.columns else float("nan")
             if math.isfinite(_ta) and _ta > 0 and math.isfinite(_mv) and _mv >= 0:
                 invested_frac = min(_mv / _ta, 1.0)
                 current_weight = current_weight * invested_frac
                 _cw_sum = float(pd.Series(current_weight).sum())
+                optimizer_max_turnover = dynamic_optimizer_max_turnover(
+                    _cw_sum,
+                    today_cash_flow=_today_flow,
+                    total_asset=_ta,
+                    base_turnover=OPTIMIZER_MAX_TURNOVER,
+                    buffer=OPTIMIZER_TURNOVER_BUFFER,
+                )
                 print(
                     f"[tree-infer] rescaled current_weight by invested_frac="
                     f"{invested_frac:.4f} (market_value={_mv:.0f} / total_asset={_ta:.0f})"
-                    f" → current gross={_cw_sum:.4f}",
+                    f" → current gross={_cw_sum:.4f}; turnover budget="
+                    f"{optimizer_max_turnover:.4f} (base={OPTIMIZER_MAX_TURNOVER:.4f}, "
+                    f"today_cash_flow={_today_flow:.0f})",
                     flush=True,
                 )
     benchmark_weight = normalize_benchmark_weights(last_index_csi_all)
@@ -806,7 +825,7 @@ def inference(
         include_debug_cols=INCLUDE_DEBUG_COLS,
         use_optimizer=USE_OPTIMIZER,
         current_weight=current_weight,
-        optimizer_max_turnover=OPTIMIZER_MAX_TURNOVER,
+        optimizer_max_turnover=optimizer_max_turnover,
         optimizer_max_weight=OPTIMIZER_MAX_WEIGHT,
         optimizer_cash_ratio=OPTIMIZER_CASH_RATIO,
         optimizer_trans_cost=OPTIMIZER_TRANS_COST,
