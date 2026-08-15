@@ -7,14 +7,15 @@ def test_filter_codes_preserves_schema_for_stock_without_rows():
     order = pd.DataFrame(
         {
             "Code": pd.Series([1], dtype="int64"),
-            "Time": pd.to_datetime(["2024-01-02 09:30:00"]),
+            "Time": pd.Series([1704159000000000], dtype="int64"),
             "SeqNum": pd.Series([10], dtype="int64"),
+            "OrderPrice": pd.Series([1234], dtype="int32"),
         }
     )
     deal = pd.DataFrame(
         {
             "Code": pd.Series(dtype="int64"),
-            "Time": pd.Series(dtype="datetime64[ns]"),
+            "Time": pd.Series(dtype="int64"),
             "SeqNum": pd.Series(dtype="int64"),
         }
     )
@@ -42,7 +43,13 @@ def test_filter_codes_preserves_schema_for_stock_without_rows():
 
     by_code = {item.code: item for item in filtered}
     assert len(by_code["000001"].l2_order) == 1
+    assert by_code["000001"].l2_order["Code"].iloc[0] == "000001"
+    assert pd.api.types.is_datetime64_any_dtype(by_code["000001"].l2_order["Time"])
+    assert by_code["000001"].l2_order["OrderPrice"].iloc[0] == 12.34
     assert by_code["000002"].l2_order.empty
     assert list(by_code["000002"].l2_order.columns) == list(order.columns)
     assert list(by_code["000002"].l2_deal.columns) == list(deal.columns)
-    assert by_code["000002"].l2_order.dtypes.equals(order.dtypes)
+    assert by_code["000002"].l2_order["Code"].dtype == object
+    assert pd.api.types.is_datetime64_any_dtype(by_code["000002"].l2_order["Time"])
+    assert by_code["000002"].l2_order["OrderPrice"].dtype == "float64"
+    assert pd.api.types.is_datetime64_any_dtype(by_code["000002"].l2_deal["Time"])

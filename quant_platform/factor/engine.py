@@ -769,9 +769,6 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     本函数只在回测路径被调用（engine.py batch loader + api.load_stock_data）。
     通过检测列类型（int32 vs float64/string）自动判断是否需要还原。
     """
-    if df.empty:
-        return df
-
     df = _normalize_legacy_tick_archive_columns(df)
 
     # 检测 Code 列是否为整数类型（OSS 历史数据的标志）
@@ -786,6 +783,23 @@ def _restore_oss_precision(df: pd.DataFrame, code: str) -> pd.DataFrame:
     if not pd.api.types.is_integer_dtype(df[code_col]):
         # 实时 collector 数据直接返回。实盘 Volume ×100 对齐在
         # `_build_df_from_native` 里做（本函数不在实盘路径上）。
+        return df
+
+    if df.empty:
+        # Parquet keeps physical dtypes even when a filtered stock has no rows.
+        # Normalize that schema just like the populated OSS path so strategies
+        # receive a valid canonical empty frame for suspended stocks.
+        df = df.copy()
+        df[code_col] = pd.Series(index=df.index, dtype="object")
+        for col in df.columns:
+            if col == code_col or not pd.api.types.is_integer_dtype(df[col]):
+                continue
+            if any(suffix in col for suffix in ("Price", "IOPV")) or "Volume" in col:
+                df[col] = df[col].astype("float64")
+        if "Time" in df.columns and pd.api.types.is_integer_dtype(df["Time"]):
+            df["Time"] = pd.Series(index=df.index, dtype="datetime64[ns]")
+        if "UpdateTime" in df.columns and pd.api.types.is_integer_dtype(df["UpdateTime"]):
+            df["UpdateTime"] = pd.Series(index=df.index, dtype="datetime64[ns]")
         return df
 
     # --- 需要还原 ---
