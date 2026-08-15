@@ -1475,12 +1475,14 @@ def _filter_codes_from_bundle(
     id_qi_by_code = {_code_to_id_qi(code): code for code in codes}
     code_set = set(codes)
 
-    def _empty_by_code() -> Dict[str, pd.DataFrame]:
-        return {code: pd.DataFrame() for code in codes}
+    def _empty_by_code(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        # Empty per-code data is valid for suspended or inactive stocks. Keep
+        # the source schema so strategies can distinguish it from bad input.
+        return {code: df.iloc[:0].copy() for code in codes}
 
     def _split(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         if df.empty:
-            return _empty_by_code()
+            return _empty_by_code(df)
 
         col = next((c for c in ("Code", "stock_code", "code") if c in df.columns), None)
         if col is None and "SECURITY_ID" in df.columns:
@@ -1498,7 +1500,8 @@ def _filter_codes_from_bundle(
                 for key, part in subset.groupby(col, sort=False)
                 if int(key) in code_by_security_id
             }
-            return {code: groups.get(code, pd.DataFrame()) for code in codes}
+            empty = df.iloc[:0].copy()
+            return {code: groups.get(code, empty.copy()) for code in codes}
 
         if col == "ID_QI":
             normalized = df[col].astype(str).str.zfill(6)
@@ -1507,14 +1510,15 @@ def _filter_codes_from_bundle(
 
         subset = df[normalized.isin(id_qi_by_code.keys())].copy()
         if subset.empty:
-            return _empty_by_code()
+            return _empty_by_code(df)
         subset["_qp_split_code"] = normalized[subset.index].map(id_qi_by_code)
         groups = {
             key: part.drop(columns=["_qp_split_code"]).reset_index(drop=True)
             for key, part in subset.groupby("_qp_split_code", sort=False)
             if key in code_set
         }
-        return {code: groups.get(code, pd.DataFrame()) for code in codes}
+        empty = df.iloc[:0].copy()
+        return {code: groups.get(code, empty.copy()) for code in codes}
 
     order_by_code = _split(bundle.l2_order)
     deal_by_code = _split(bundle.l2_deal)
