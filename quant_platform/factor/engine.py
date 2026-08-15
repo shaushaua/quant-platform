@@ -1203,9 +1203,9 @@ def _compute_codes_from_shared_bundle(args):
                 sum(len(v) for v in normalized.values()),
             )
         return normalized
-    except Exception as e:
+    except Exception:
         code_sample = args[0][:5] if args and isinstance(args[0], list) else []
-        logger.warning("[ForkWorker] task failed codes=%s: %s", code_sample, e)
+        logger.exception("[ForkWorker] task failed codes=%s", code_sample)
         codes = args[0] if args and isinstance(args[0], list) else []
         end_times = args[2] if len(args) > 2 and isinstance(args[2], list) else [""]
         return {code: {et: None for et in end_times} for code in codes}
