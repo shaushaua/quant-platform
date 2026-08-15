@@ -223,6 +223,27 @@ def _load_strategy():
     return load_strategy_file(STRATEGY_PATH, "strategy")
 
 
+def _filter_tradable_universe(
+    daily_basic: pd.DataFrame, factor_info: dict
+) -> pd.DataFrame:
+    """Exclude zero-volume stocks when the strategy requires L2 trade data."""
+    if not (
+        factor_info.get("need_l2_order", False)
+        or factor_info.get("need_l2_deal", False)
+    ):
+        return daily_basic
+
+    volume_col = next(
+        (col for col in ("volume", "Volume", "vol", "VOL") if col in daily_basic.columns),
+        None,
+    )
+    if volume_col is None:
+        return daily_basic
+
+    volume = pd.to_numeric(daily_basic[volume_col], errors="coerce").fillna(0)
+    return daily_basic.loc[volume > 0].copy()
+
+
 # ---------------------------------------------------------------------------
 # outfun：每日计算完成后直接写入 OSS
 # ---------------------------------------------------------------------------
@@ -330,7 +351,16 @@ def main():
             _api = DataAPI(mode="backtest", oss_base_path=DATA_PATH)
             _db = _api.get_daily_data(START_DATE, "daily_basic")
             if not _db.empty and "ID_QI" in _db.columns:
+                total_stocks = len(_db)
+                _db = _filter_tradable_universe(_db, factor_info)
                 all_stocks = sorted(_db["ID_QI"].tolist())
+                if len(_db) != total_stocks:
+                    _logger.info(
+                        "过滤停牌或无成交股票",
+                        total=total_stocks,
+                        tradable=len(_db),
+                        excluded=total_stocks - len(_db),
+                    )
             else:
                 _logger.info("当日无交易数据，跳过（非交易日）", date=START_DATE)
                 _upload_log()
