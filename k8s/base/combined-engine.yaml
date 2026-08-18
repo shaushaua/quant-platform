@@ -86,6 +86,13 @@ spec:
             # 恢复树模型原始换手约束；大额入金建仓阶段曾临时放宽为 1.0。
             - name: OPTIMIZER_MAX_TURNOVER
               value: "0.35"
+            # 行业暴露约束容忍度；显式放在 k8s 配置里，避免依赖代码默认值。
+            - name: OPTIMIZER_INDUSTRY_EXPOSURE_TOL
+              value: "0.05"
+            # 行业暴露约束自适应阶梯：优先用 0.05；若优化器无解/空结果，
+            # 按这里逐级放宽，最宽不超过原生产默认 0.30。
+            - name: OPTIMIZER_INDUSTRY_EXPOSURE_TOL_FALLBACKS
+              value: "0.08,0.10,0.15,0.20,0.30"
             # --- 实盘资金：通过 order-gateway /v1/balance 接口取真实总资产 ---
             # portfolio_context_fn 调 _fetch_balance(ORDER_GATEWAY_URL, BROKER_ACCOUNT_ID)
             # → positions_to_orders 用 account.total_asset 做 position sizing。

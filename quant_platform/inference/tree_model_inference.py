@@ -177,6 +177,69 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_float_list(name: str) -> list[float]:
+    """Read a comma/semicolon separated float list from env."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    values: list[float] = []
+    for item in re.split(r"[,;]", raw):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(float(item))
+        except ValueError:
+            print(f"[tree-infer] ignore invalid {name} item: {item!r}", flush=True)
+    return values
+
+
+def _optimizer_industry_tol_candidates() -> list[float]:
+    """Strict-first industry exposure tolerance ladder.
+
+    The first value is the normal production constraint. Extra values are only
+    attempted if the optimizer fails or returns no target positions, so a tight
+    k8s value can fail open to a looser but still bounded risk budget.
+    """
+    base = OPTIMIZER_INDUSTRY_EXPOSURE_TOL
+    fallbacks = _env_float_list("OPTIMIZER_INDUSTRY_EXPOSURE_TOL_FALLBACKS")
+    values = [base]
+    values.extend(sorted(v for v in fallbacks if v >= base))
+    out: list[float] = []
+    seen: set[float] = set()
+    for value in values:
+        if not math.isfinite(value) or value < 0:
+            continue
+        rounded = round(float(value), 10)
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        out.append(float(value))
+    return out or [base]
+
+
+def _is_optimizer_retryable_error(exc: BaseException) -> bool:
+    """Return whether a prediction failure is likely an optimizer infeasibility.
+
+    The industry exposure ladder should not mask data/schema/model bugs. Retry
+    only when the compiled predictor reports an optimizer/solver infeasibility
+    style error. Empty output is handled explicitly by raising a retryable
+    RuntimeError with the marker below.
+    """
+    text = str(exc).lower()
+    retry_markers = (
+        "optimizer_retryable",
+        "infeasible",
+        "infeasibility",
+        "solver",
+        "optimization",
+        "optimal_inaccurate",
+        "no positions",
+        "empty positions",
+    )
+    return any(marker in text for marker in retry_markers)
+
+
 # Optimizer parameters — overridable via env vars so tuning doesn't require
 # a rebuild. Key knobs for the infeasible-on-rebalance issue:
 #   - MAX_TURNOVER: how much the target portfolio can differ from current.
@@ -799,42 +862,79 @@ def inference(
     print(f"[tree-infer-timing] model_path resolve: {_t_model - _t_daily_basic:.3f}s path={model_path}", flush=True)
 
     _t_pre_predict = _time.time()
-    out = predict_tree_model(
-        daily_basic=daily_basic,
-        daily_feature_czhou1=prev_day_factors_df,
-        model_path=model_path,
-        start_date=signal_date,
-        end_date=signal_date,
-        output_date=date_str,
-        composition_df=(index_composition_df if (index_composition_df is not None
-                                                and "INDEX_CODE" in (index_composition_df.columns if hasattr(index_composition_df, "columns") else []))
-                        else None),
-        talib_dropna_thresh=TALIB_DROPNA_THRESH,
-        apply_trade_mask=APPLY_TRADE_MASK,
-        min_adv=MIN_ADV,
-        adv_window=ADV_WINDOW,
-        adv_min_periods=ADV_MIN_PERIODS,
-        junk_mkt_cap=JUNK_MKT_CAP,
-        junk_float_mkt_cap=JUNK_FLOAT_MKT_CAP,
-        min_price=MIN_PRICE,
-        max_price=MAX_PRICE,
-        tail_frac=POSITION_TAIL_FRAC,
-        enable_short=ENABLE_SHORT,
-        keep_zero_positions=KEEP_ZERO_POSITIONS,
-        allow_missing_features=ALLOW_MISSING_FEATURES,
-        include_debug_cols=INCLUDE_DEBUG_COLS,
-        use_optimizer=USE_OPTIMIZER,
-        current_weight=current_weight,
-        optimizer_max_turnover=optimizer_max_turnover,
-        optimizer_max_weight=OPTIMIZER_MAX_WEIGHT,
-        optimizer_cash_ratio=OPTIMIZER_CASH_RATIO,
-        optimizer_trans_cost=OPTIMIZER_TRANS_COST,
-        benchmark_weight=benchmark_weight,
-        exposure_frame=exposure_frame,
-        optimizer_style_exposure_tol=OPTIMIZER_STYLE_EXPOSURE_TOL,
-        optimizer_industry_exposure_tol=OPTIMIZER_INDUSTRY_EXPOSURE_TOL,
-        optimizer_min_benchmark_constituent_weight=OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT,
-    )
+    industry_tol_candidates = _optimizer_industry_tol_candidates()
+    out = None
+    last_predict_error: Optional[BaseException] = None
+    for idx, industry_tol in enumerate(industry_tol_candidates, start=1):
+        if len(industry_tol_candidates) > 1:
+            print(
+                f"[tree-infer] optimizer industry exposure tol attempt "
+                f"{idx}/{len(industry_tol_candidates)}: {industry_tol:.4f}",
+                flush=True,
+            )
+        try:
+            out = predict_tree_model(
+                daily_basic=daily_basic,
+                daily_feature_czhou1=prev_day_factors_df,
+                model_path=model_path,
+                start_date=signal_date,
+                end_date=signal_date,
+                output_date=date_str,
+                composition_df=(index_composition_df if (index_composition_df is not None
+                                                        and "INDEX_CODE" in (index_composition_df.columns if hasattr(index_composition_df, "columns") else []))
+                                else None),
+                talib_dropna_thresh=TALIB_DROPNA_THRESH,
+                apply_trade_mask=APPLY_TRADE_MASK,
+                min_adv=MIN_ADV,
+                adv_window=ADV_WINDOW,
+                adv_min_periods=ADV_MIN_PERIODS,
+                junk_mkt_cap=JUNK_MKT_CAP,
+                junk_float_mkt_cap=JUNK_FLOAT_MKT_CAP,
+                min_price=MIN_PRICE,
+                max_price=MAX_PRICE,
+                tail_frac=POSITION_TAIL_FRAC,
+                enable_short=ENABLE_SHORT,
+                keep_zero_positions=KEEP_ZERO_POSITIONS,
+                allow_missing_features=ALLOW_MISSING_FEATURES,
+                include_debug_cols=INCLUDE_DEBUG_COLS,
+                use_optimizer=USE_OPTIMIZER,
+                current_weight=current_weight,
+                optimizer_max_turnover=optimizer_max_turnover,
+                optimizer_max_weight=OPTIMIZER_MAX_WEIGHT,
+                optimizer_cash_ratio=OPTIMIZER_CASH_RATIO,
+                optimizer_trans_cost=OPTIMIZER_TRANS_COST,
+                benchmark_weight=benchmark_weight,
+                exposure_frame=exposure_frame,
+                optimizer_style_exposure_tol=OPTIMIZER_STYLE_EXPOSURE_TOL,
+                optimizer_industry_exposure_tol=industry_tol,
+                optimizer_min_benchmark_constituent_weight=OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT,
+            )
+            if out is None or out.empty:
+                raise RuntimeError(
+                    f"optimizer_retryable: predict_tree_model returned no positions "
+                    f"(industry_tol={industry_tol:.4f})"
+                )
+            if idx > 1:
+                print(
+                    f"[tree-infer] optimizer recovered with relaxed "
+                    f"industry exposure tol={industry_tol:.4f}",
+                    flush=True,
+                )
+            break
+        except Exception as exc:
+            last_predict_error = exc
+            if not _is_optimizer_retryable_error(exc):
+                raise
+            if idx >= len(industry_tol_candidates):
+                raise
+            next_tol = industry_tol_candidates[idx]
+            print(
+                f"[tree-infer] optimizer failed with industry exposure "
+                f"tol={industry_tol:.4f}: {exc}; retry with {next_tol:.4f}",
+                flush=True,
+            )
+    if out is None:
+        raise RuntimeError("predict_tree_model produced no output") from last_predict_error
 
     _t_predict = _time.time()
     print(f"[tree-infer-timing] predict_tree_model(.so): {_t_predict - _t_pre_predict:.3f}s ({len(out)} positions)", flush=True)
