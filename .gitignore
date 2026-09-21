@@ -52,3 +52,4 @@ native_mdl_collector/build/
 *_positions.csv
 *_targets.consumed.csv
 OrderAlgo_*.csv
+*.so.temp

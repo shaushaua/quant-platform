@@ -3360,6 +3360,13 @@ class NativeEngine:
                     try:
                         tmp_path.replace(cache_path)
                         logger.info("[open-position-targets] published disk cache: %s", cache_path)
+                        # 上传目标持仓到 OSS（持久化：优化器解的完整 targets，
+                        # 节点缩容后本地 csv 会丢，OSS 留档供事后重算行业 exposure）
+                        try:
+                            _upload_to_oss(positions, date_str, "open-position-targets",
+                                           category="targets")
+                        except Exception as oss_exc:
+                            logger.warning("[open-position-targets] OSS upload failed: %s", oss_exc)
                     except Exception as exc:
                         logger.warning("[open-position-targets] rename tmp→cache failed: %s", exc)
                         try:
