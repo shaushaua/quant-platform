@@ -151,6 +151,16 @@ NgtsResult parse_sh_ngts(const void* msg_data, std::size_t msg_len, double recv_
         else if (flag_raw[0] == 'S') side = 1;
     }
 
+    // 上交所 2026.09.21/22 改版：停牌标的收盘后通过 4.24 增发两条状态单，
+    // TickBSFlag 取值 CLOSE / ENDTR（价格、数量为 0）。它们不是真实交易，
+    // 整体丢弃，避免 price=0 的垃圾行写入 SHM 污染停牌票的因子数据。
+    if (flag_len == 5) {
+        if ((flag_raw[0] == 'C' && std::memcmp(flag_raw, "CLOSE", 5) == 0) ||
+            (flag_raw[0] == 'E' && std::memcmp(flag_raw, "ENDTR", 5) == 0)) {
+            return result;
+        }
+    }
+
     // Parse Type
     const char* typ = msg->Type.c_str();
     auto typ_len = msg->Type.Length;
