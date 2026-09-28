@@ -93,6 +93,10 @@ spec:
             # 按这里逐级放宽，最宽不超过原生产默认 0.30。
             - name: OPTIMIZER_INDUSTRY_EXPOSURE_TOL_FALLBACKS
               value: "0.08,0.10,0.15,0.20,0.30"
+            # 风格暴露约束（SIZE/MOMENTUM/BETA 等 Barra 因子）；原默认 0.30，
+            # 实盘曾顶满上限（SIZE=-0.300），收紧至 0.28。
+            - name: OPTIMIZER_STYLE_EXPOSURE_TOL
+              value: "0.28"
             # --- 实盘资金：通过 order-gateway /v1/balance 接口取真实总资产 ---
             # portfolio_context_fn 调 _fetch_balance(ORDER_GATEWAY_URL, BROKER_ACCOUNT_ID)
             # → positions_to_orders 用 account.total_asset 做 position sizing。
