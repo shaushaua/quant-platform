@@ -97,6 +97,11 @@ spec:
             # 实盘曾顶满上限（SIZE=-0.300），收紧至 0.28。
             - name: OPTIMIZER_STYLE_EXPOSURE_TOL
               value: "0.28"
+            # 风格暴露阶梯兜底：0.28 的 industry 全阶梯都无解时（如持仓暴露
+            # 漂移过远，20261102 事故），自动放宽到 0.40 再试，避免 fail closed
+            # 完全不调仓。空值 = 不启用阶梯。
+            - name: OPTIMIZER_STYLE_EXPOSURE_TOL_FALLBACKS
+              value: "0.40"
             # --- 实盘资金：通过 order-gateway /v1/balance 接口取真实总资产 ---
             # portfolio_context_fn 调 _fetch_balance(ORDER_GATEWAY_URL, BROKER_ACCOUNT_ID)
             # → positions_to_orders 用 account.total_asset 做 position sizing。
