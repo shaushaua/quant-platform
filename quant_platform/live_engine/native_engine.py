@@ -3465,6 +3465,32 @@ class NativeEngine:
                 except Exception as exc:
                     logger.warning("[open_position] cache unlink failed %s: %s", p, exc)
 
+    def _run_csi2000_signal_safe(self) -> None:
+        """csi2000_signal schedule 入口: 产出中证2000独立信号, 异常全吞。
+
+        与全指信号共用引擎进程, 但基准经参数传递(benchmark_code="932000"),
+        不写进程 env — 全指主链路(000985)完全不受影响。等待当天 daily 因子
+        上传 OSS(最多 10 分钟)后运行; 任何失败只记 ERROR 日志。
+        """
+        try:
+            from ..inference.csi2000_product import (
+                run_csi2000_signal, daily_factors_ready)
+            td = self.trading_day
+            if not td:
+                logger.error("[csi2000_signal] trading_day empty, skip")
+                return
+            for _ in range(20):
+                if daily_factors_ready(td):
+                    break
+                time.sleep(30)
+            else:
+                logger.error("[csi2000_signal] 等待 daily 因子超时(10min), skip")
+                return
+            run_csi2000_signal(td)
+            logger.info("[csi2000_signal] done trading_day=%s", td)
+        except Exception as exc:
+            logger.error("[csi2000_signal] failed: %s", exc, exc_info=True)
+
     def _refresh_daily_basic_upload(self) -> None:
         """盘后 15:30 trigger: 重新生成并上传 T-0 和 T-1 daily_basic + composition 到 OSS。
 
@@ -4492,6 +4518,13 @@ class NativeEngine:
                         if schedule.name == "daily_basic_refresh":
                             t = threading.Thread(
                                 target=self._refresh_daily_basic_upload,
+                                daemon=True,
+                            )
+                        # 中证2000独立信号: 复用当天 daily 因子, 独立线程产出 targets,
+                        # 异常全部吞掉 — 新产品故障绝不影响全指主链路
+                        elif schedule.name == "csi2000_signal":
+                            t = threading.Thread(
+                                target=self._run_csi2000_signal_safe,
                                 daemon=True,
                             )
                         else:

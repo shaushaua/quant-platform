@@ -19,7 +19,9 @@
         MySQL: idx_cons + md_security + mkt_equd + equ_free_shares (权重 SQL 与 Go 一致)
 """
 import logging
+import json
 import os
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -58,9 +60,11 @@ EXPOSURE_FIELD_SET = set(EXPOSURE_FIELDS)
 DATAYES_DEFAULT_CUTOFF = "20260303"
 
 # 默认支持的指数代码 (与 Go 端 defaultIndexCodes 一致)
+# 注意 932000(中证2000) 在通联 mkt_idxd_csi 的 EXCHANGE_CD='ZICN'(非 CSI),
+# 写错后缀会静默查空 → composition 里 932000 恒为 0(20261102 发现)。
 DEFAULT_INDEX_CODES: Tuple[str, ...] = (
     "000300.XSHG", "000905.XSHG", "000852.XSHG",
-    "000985.XSHG", "932000.CSI",
+    "000985.XSHG", "932000.ZICN",
 )
 
 
@@ -173,11 +177,158 @@ ORDER BY t1.TICKER_SYMBOL
 """
 
 
+# 行数完整性阈值: 正常全市场 ~5300 只。低于此值视为 MySQL 同步延迟,
+# 触发 T-2 回填 + 飞书告警。(可 env 覆盖)
+DAILY_BASIC_MIN_ROWS = int(os.environ.get("DAILY_BASIC_MIN_ROWS", "5200"))
+
+
+def _prev_trading_day(mysql: MySQLLoader, trade_date: str) -> Optional[str]:
+    """查 trade_date 之前最近的一个有 mkt_equd 数据的交易日(YYYYMMDD)。"""
+    mysql._ensure_connection()
+    with mysql._conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT MAX(TRADE_DATE) FROM mkt_equd WHERE TRADE_DATE < %s",
+            (_norm_date_dash(trade_date),),
+        )
+        row = cursor.fetchone()
+    return str(row[0]).replace("-", "") if row and row[0] else None
+
+
+def _fill_missing_with_prev_day(
+    mysql: MySQLLoader, df: pd.DataFrame, trade_date: str
+) -> pd.DataFrame:
+    """MySQL 延迟防护: 当日行数低于阈值时,缺失票用前一交易日数据回填。
+
+    触发条件: len(df) < DAILY_BASIC_MIN_ROWS (默认 5200)。
+    回填口径: 以 T-1 行集为准,T-2 有而 T-1 缺的票整行补入;
+              日期列(TS/_date 语义)改写为 T-1,数值保持 T-2 陈旧值。
+    告警: 飞书机器人 (quant_platform.utils.notify.feishu_alert)。
+    回填后仍低于阈值 → 升级告警(严重缺失,优化器输入仍可能失真)。
+    """
+    from ..utils.notify import feishu_alert
+    from datetime import datetime as _dt
+
+    # T-0 盘后雏形(td=今天)不回填不告警: MySQL 15:07 才写当日行情,首批
+    # 不全是常态;次日 pod 启动会重刷该日(届时通联已补全)并 force 覆盖。
+    # 回填+告警只针对历史日刷新(T-1/T-2, 即优化器实际消费的那份数据)。
+    if trade_date == _dt.now().strftime("%Y%m%d"):
+        if len(df) < DAILY_BASIC_MIN_ROWS:
+            logger.info(
+                "[daily-basic-fallback] T-0(%s) 当日首批 %d 行(<%d)属正常,"
+                "次日启动重刷时补全,不回填",
+                trade_date, len(df), DAILY_BASIC_MIN_ROWS)
+        return df
+
+    n = len(df)
+    if n >= DAILY_BASIC_MIN_ROWS:
+        return df
+
+    prev_td = _prev_trading_day(mysql, trade_date)
+    if not prev_td:
+        logger.error("[daily-basic-fallback] 无法确定前一交易日,跳过回填")
+        feishu_alert("daily_basic 数据缺失", (
+            f"trade_date={trade_date} 仅 {n} 行(<{DAILY_BASIC_MIN_ROWS}),"
+            f"且查不到前一交易日,未回填。优化器输入可能失真!"))
+        return df
+
+    # 用同一 SQL 查 T-2
+    td_dash = _norm_date_dash(trade_date)
+    exp_cols = _get_exposure_columns(mysql)
+    idx_cols = _get_index_columns(mysql)
+    sql_prev = _build_daily_basic_sql(_norm_date_dash(prev_td), exp_cols, idx_cols)
+    mysql._ensure_connection()
+    with mysql._conn.cursor() as cursor:
+        cursor.execute(sql_prev)
+        columns = [desc[0] for desc in cursor.description]
+        prev_rows = cursor.fetchall()
+    if not prev_rows:
+        logger.error("[daily-basic-fallback] T-2(%s) 也无数据,跳过回填", prev_td)
+        return df
+
+    df_prev = pd.DataFrame(prev_rows, columns=columns)
+    if "TS" in df_prev.columns:
+        df_prev["TS"] = pd.to_datetime(df_prev["TS"]).dt.strftime("%Y%m%d")
+    if "ID_QI" in df_prev.columns:
+        df_prev["ID_QI"] = df_prev["ID_QI"].astype(str).str.zfill(6)
+
+    if "ID_QI" in df.columns:
+        current_ids = df["ID_QI"].astype(str).str.split(".").str[0].str.zfill(6)
+        have = set(current_ids)
+    else:
+        have = set()
+    prev_all = set(df_prev["ID_QI"].astype(str))
+    missing = sorted(prev_all - have)
+
+    if not missing:
+        # 行少但 ID 集合与 T-2 相同 → 不是延迟缺票(可能是市场自然缩容),不回填
+        logger.warning(
+            "[daily-basic-fallback] %d 行 < 阈值 %d,但与 T-2(%s) 票集相同,不回填",
+            n, DAILY_BASIC_MIN_ROWS, prev_td)
+        return df
+
+    filled = df_prev[df_prev["ID_QI"].astype(str).isin(missing)].copy()
+    # 日期语义归到 T-1: 快照属于 T-1,数值是 T-2 陈旧值。
+    # 注意: parquet 保持 96 列不变(不添加标记列,严格消费者不受影响);
+    # 回填明细写入 sidecar JSON({date}_stale_fill.json, 同目录)供审计。
+    if "TS" in filled.columns:
+        filled["TS"] = trade_date
+    out = pd.concat([df, filled], ignore_index=True)
+
+    _write_stale_fill_sidecar(trade_date, prev_td, missing)
+
+    msg = (
+        f"trade_date={trade_date}: T-1 行情仅 {n} 行(<{DAILY_BASIC_MIN_ROWS}),"
+        f"判定 MySQL 同步延迟。已用 T-2({prev_td}) 回填 {len(missing)} 只"
+        f"(明细见 {trade_date}_stale_fill.json),回填后 {len(out)} 行。"
+        f"缺失示例: {', '.join(missing[:8])}"
+    )
+    logger.warning("[daily-basic-fallback] %s", msg)
+    feishu_alert("MySQL数据延迟-已回填T-2", msg)
+
+    if len(out) < DAILY_BASIC_MIN_ROWS:
+        feishu_alert("MySQL数据延迟-回填后仍不足", (
+            f"trade_date={trade_date} 回填后仍仅 {len(out)} 行"
+            f"(<{DAILY_BASIC_MIN_ROWS}),T-2 也缺数据。优化器输入可能失真,请人工核查!"))
+    return out
+
+
+def _write_stale_fill_sidecar(trade_date: str, prev_td: str, missing: list) -> None:
+    """回填审计 sidecar: 本地 + OSS 同日期目录各一份。
+
+    {date}_stale_fill.json = {"stale_from": T-2, "filled": [...codes], "count": N}
+    下游/排查用它对齐"哪些票是陈旧行情", 与 96 列 parquet 解耦。
+    """
+    payload = json.dumps({
+        "trade_date": trade_date,
+        "stale_from": prev_td,
+        "count": len(missing),
+        "filled": missing,
+    }, ensure_ascii=False)
+    key = f"2026/{trade_date[:6]}/{trade_date}/{trade_date}_stale_fill.json"
+    local_dir = Path(os.environ.get("FACTOR_OUTPUT_PATH", "/tmp")) / "data_refresh_audit"
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / f"{trade_date}_stale_fill.json").write_text(payload, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[daily-basic-fallback] 本地 sidecar 写入失败: %s", exc)
+    try:
+        from .oss_loader import OSSDataLoader
+        OSSDataLoader()._oss_bucket.put_object(key, payload.encode("utf-8"))
+        logger.info("[daily-basic-fallback] sidecar 已上传: %s", key)
+    except Exception as exc:
+        logger.warning("[daily-basic-fallback] sidecar 上传失败(不影响主流程): %s", exc)
+
+
 def _query_daily_basic(
     mysql: MySQLLoader,
     trade_date: str,
 ) -> pd.DataFrame:
-    """执行 96 列 SQL,返回 DataFrame。"""
+    """执行 96 列 SQL,返回 DataFrame。
+
+    MySQL 同步延迟防护（20261030 事故）: T-1 行情缺行(mkt_equd/adj_af INNER
+    JOIN 丢票)时,缺失票用 T-2 的行回填并告警。数据陈旧一天(因子/市值误差
+    ~0.03σ)远好于静默缺行造成的优化器幻影(~1.5σ)。
+    """
     td_dash = _norm_date_dash(trade_date)
     exp_cols = _get_exposure_columns(mysql)
     idx_cols = _get_index_columns(mysql)
@@ -194,6 +345,7 @@ def _query_daily_basic(
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=columns)
+    df = _fill_missing_with_prev_day(mysql, df, trade_date)
     # TS 标准化为 YYYYMMDD
     if "TS" in df.columns:
         df["TS"] = pd.to_datetime(df["TS"]).dt.strftime("%Y%m%d")
@@ -406,6 +558,17 @@ def refresh_daily_data(
         else:
             if oss.upload_composition(td, comp_df):
                 success = True
+            # 权重新鲜度审计 sidecar: 多少成分用了 T-2 价 / 基准成分数,
+            # 与 daily_basic 的 {date}_stale_fill.json 对齐(排查 20261030 类事故)
+            audit = getattr(mysql, "last_index_weight_audit", None)
+            if audit:
+                try:
+                    key = f"2026/{td[:6]}/{td}/{td}_index_weight_audit.json"
+                    oss._oss_bucket.put_object(
+                        key, json.dumps(audit, ensure_ascii=False).encode("utf-8"))
+                    logger.info("index_weight 审计 sidecar 已上传: %s", key)
+                except Exception as exc:
+                    logger.warning("index_weight 审计 sidecar 上传失败: %s", exc)
     except Exception as e:
         logger.error(f"composition 生成失败: {e}", exc_info=True)
 

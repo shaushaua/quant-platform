@@ -64,6 +64,9 @@ class MySQLLoader:
         """
         self.host = host or os.getenv("MYSQL_HOST", "rm-bp15t3z3kt5174n47so.mysql.rds.aliyuncs.com")
         self.port = port or int(os.getenv("MYSQL_PORT", "3306"))
+        # get_index_weight 的审计信息(最近一次): stale 计数/基准成分数,
+        # 供调用方落 sidecar 与 daily_basic 的回填明细对齐
+        self.last_index_weight_audit: dict = {}
         self.user = user or os.getenv("MYSQL_USER", "hermes_trade")
         self.password = password or os.getenv("MYSQL_PASSWORD", "1tuweN6688")
         self.database = database or os.getenv("MYSQL_DATABASE", "hermes")
@@ -577,7 +580,19 @@ class MySQLLoader:
                         f"index_weight: 成分股用 T={td_dash}, 价格/股本用 T-1={prev_td_dash}"
                     )
 
+                # MySQL 延迟防护(20261030 事故): T-1 行情缺行的成分会被
+                # `close IS NOT NULL` 静默剔除 → 基准缺成分重归一 → 优化器幻影。
+                # prices CTE 取 (T-1, T-2) 两日最新价: T-1 缺价自动落到 T-2,
+                # 正常日(T-1 全量)结果与 Go buildCompositionSQL 完全一致。
+                cursor.execute(
+                    "SELECT MAX(TRADE_DATE) FROM mkt_equd WHERE TRADE_DATE < %s",
+                    (prev_td_dash,),
+                )
+                prev2_row = cursor.fetchone()
+                prev2_td_dash = str(prev2_row[0]) if prev2_row and prev2_row[0] else prev_td_dash
+
                 # 与 Go buildCompositionSQL 一致:CTE 三段(members/prices/shares)
+                # prices 为双日兜底版,并输出 price_date 供 Python 统计陈旧价占比
                 sql = f"""
                     WITH members AS (
                         SELECT
@@ -601,10 +616,15 @@ class MySQLLoader:
                           AND stock.LIST_STATUS_CD = 'L'
                     ),
                     prices AS (
-                        SELECT SECURITY_ID, CLOSE_PRICE AS close
-                        FROM mkt_equd
-                        WHERE TRADE_DATE = %s
-                          AND EXCHANGE_CD IN ('XSHG', 'XSHE')
+                        SELECT SECURITY_ID, close, price_date FROM (
+                            SELECT SECURITY_ID, CLOSE_PRICE AS close, TRADE_DATE AS price_date,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY SECURITY_ID ORDER BY TRADE_DATE DESC
+                                   ) AS rn
+                            FROM mkt_equd
+                            WHERE TRADE_DATE IN (%s, %s)
+                              AND EXCHANGE_CD IN ('XSHG', 'XSHE')
+                        ) p WHERE p.rn = 1
                     ),
                     shares AS (
                         SELECT ms.SECURITY_ID, efs.FREE_SHARES AS ff_shares
@@ -628,7 +648,8 @@ class MySQLLoader:
                         (s.ff_shares * p.close) /
                             SUM(s.ff_shares * p.close) OVER (
                                 PARTITION BY m.INDEX_CODE, m.INDEX_EXCHANGE
-                            ) AS weight
+                            ) AS weight,
+                        p.price_date
                     FROM members m
                     JOIN prices p ON m.SECURITY_ID = p.SECURITY_ID
                     JOIN shares s ON m.SECURITY_ID = s.SECURITY_ID
@@ -640,7 +661,7 @@ class MySQLLoader:
                 """
                 params = (
                     filter_params
-                    + (td_dash, td_dash, prev_td_dash, prev_td_dash)
+                    + (td_dash, td_dash, prev_td_dash, prev2_td_dash, prev_td_dash)
                 )
                 cursor.execute(sql, params)
                 columns = [desc[0] for desc in cursor.description]
@@ -658,11 +679,54 @@ class MySQLLoader:
                 logger.info(
                     f"获取 index_weight: codes={index_codes}, trading_day={td}, {len(df)} 条"
                 )
-                return df
+                self._check_index_weight_freshness(df, td, prev_td_dash)
+                # price_date 仅用于新鲜度校验,不进入返回值 — 保持接口列不变,
+                # 避免 composition.parquet 多列影响既有消费者(Go/回测)。
+                return df.drop(columns=["price_date"], errors="ignore")
 
         except Exception as e:
             logger.error(f"查询 index_weight 失败: {e}")
             return pd.DataFrame()
+
+    def _check_index_weight_freshness(
+        self, df: pd.DataFrame, td: str, prev_td_dash: str
+    ) -> None:
+        """基准权重完整性/新鲜度校验,异常发飞书告警(不抛异常)。
+
+        20261030 事故教训: T-1 行情缺行 → 成分被静默剔除 → 基准畸变 →
+        优化器对着幻影 current 调仓过冲。两个检查:
+        1. price_date < T-1 的成分(用了 T-2 陈旧价)>1% → 提示回退已生效
+        2. 000985 成分数 < 4800(正常~4876) → 基准仍不完整,升级告警
+
+        审计: stale 计数与成分数记录到 self.last_index_weight_audit,
+        由调用方(data_refresh)落 sidecar, 与 daily_basic 的 stale_fill 对齐。
+        """
+        self.last_index_weight_audit = {"trading_day": td, "stale_prices": 0,
+                                        "benchmark_000985_count": None}
+        try:
+            from ..utils.notify import feishu_alert
+        except Exception:
+            return
+        try:
+            if df.empty or "price_date" not in df.columns:
+                return
+            stale_mask = df["price_date"].astype(str) < str(prev_td_dash)
+            n_stale = int(stale_mask.sum())
+            self.last_index_weight_audit["stale_prices"] = n_stale
+            if n_stale > max(50, int(len(df) * 0.01)):
+                feishu_alert("基准权重-用了T-2陈旧价", (
+                    f"trading_day={td}: {n_stale}/{len(df)} 条成分的收盘价"
+                    f"落后于 T-1({prev_td_dash}),已自动用 T-2 价兜底(回退生效)。"
+                    f"说明 MySQL T-1 行情仍有缺口。"))
+            bench = df[df["INDEX_CODE"].astype(str) == "000985"]
+            self.last_index_weight_audit["benchmark_000985_count"] = (
+                len(bench) if len(bench) else None)
+            if len(bench) and len(bench) < 4800:
+                feishu_alert("基准权重-成分数不足", (
+                    f"trading_day={td}: 000985 成分仅 {len(bench)} 只(<4800,正常~4876)。"
+                    f"基准可能畸变,优化器输入风险!请检查 MySQL idx_cons/mkt_equd。"))
+        except Exception as exc:
+            logger.warning("[index_weight_freshness] check failed: %s", exc)
 
     @staticmethod
     def _build_index_filter(index_codes: List[str]):

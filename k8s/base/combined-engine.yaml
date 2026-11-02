@@ -135,7 +135,22 @@ spec:
             - name: MINUTE_SKIP_TIMES
               value: "09:30"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position,open_position,daily_basic_refresh"
+              value: "minute,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal"
+            # 中证2000独立信号: 15:12 产出 targets 到 /data/factors/csi2000/
+            # 与全指信号共用因子/模型, 池/基准(932000)/资金独立, 虚拟盘不下单
+            - name: CSI2000_SIGNAL_TRIGGER_TIME
+              value: "15:12"
+            # 飞书告警 webhook(只存 Secret, 代码/仓库不留真实地址)。
+            # optional=true: Secret 未创建时 env 为空, 告警静默降级(仅日志),
+            # 不阻塞 Pod 启动。创建命令:
+            #   kubectl -n quant create secret generic feishu-webhook \
+            #     --from-literal=FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/xxx'
+            - name: FEISHU_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: feishu-webhook
+                  key: FEISHU_WEBHOOK_URL
+                  optional: true
             # 临时关闭分钟级下单：minute 继续算因子+同步 tick，但不推单
             # 想恢复分钟下单把这个改成 true 即可
             - name: MINUTE_RUN_INFERENCE

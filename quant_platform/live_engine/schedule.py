@@ -251,4 +251,19 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             is_daily_result=False,
         ))
 
+    if "csi2000_signal" in enabled:
+        # 中证2000独立信号: 15:12 触发(引擎 daily 因子 15:10 产出之后),
+        # 产出当天 targets/orders/positions 到 /data/factors/csi2000/。
+        # 与全指信号共用因子与模型, 池/基准/资金独立, 虚拟盘不下单。
+        t = _parse_trigger_time(
+            os.environ.get("CSI2000_SIGNAL_TRIGGER_TIME", "15:12"),
+            (15, 12), "CSI2000_SIGNAL_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="csi2000_signal",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            run_inference=False,
+            is_daily_result=False,
+        ))
+
     return schedules

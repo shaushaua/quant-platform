@@ -756,7 +756,13 @@ def inference(
     trading_universe_df: Optional[pd.DataFrame] = None,
     index_composition_df: Optional[pd.DataFrame] = None,
     portfolio_context=None,
+    benchmark_code: Optional[str] = None,
 ) -> pd.DataFrame:
+    """benchmark_code: 优化基准指数代码(TICKER)。
+    None → 读 OPTIMIZER_BENCHMARK env(默认 000985, 全指信号路径)。
+    显式传参(如 "932000") → 使用该基准, 不受进程 env 影响 —
+    同一引擎进程内并行跑多个产品(全指/中证2000)时互不污染。
+    """
     import time as _time
     _t0 = _time.time()
 
@@ -789,22 +795,27 @@ def inference(
             prev_day_factors_df["trade_date"] = prev_date
 
     last_index_csi_all = None
+    # 优化基准可配: 默认中证全指 000985(现有行为不变); 新产品(如中证2000)
+    # 通过 benchmark_code 参数或 OPTIMIZER_BENCHMARK env 传入 —
+    # 风格/行业约束、成分下限、信号超配全部切到该基准坐标系。
+    # 参数优先于 env: 同进程多产品并行时各自传参互不污染。
+    _benchmark = (benchmark_code or os.environ.get("OPTIMIZER_BENCHMARK", "")).strip() or "000985"
     if index_composition_df is not None and not index_composition_df.empty:
         index_csi_all = index_composition_df
-        # Long format (INDEX_CODE + weight columns): filter to 000985 directly
+        # Long format (INDEX_CODE + weight columns): filter to benchmark directly
         if "INDEX_CODE" in index_csi_all.columns and "weight" in index_csi_all.columns:
-            index_csi_all = index_csi_all[index_csi_all["INDEX_CODE"].astype(str) == "000985"]
+            index_csi_all = index_csi_all[index_csi_all["INDEX_CODE"].astype(str) == _benchmark]
             if not index_csi_all.empty:
                 date_col = "trade_date" if "trade_date" in index_csi_all.columns else "date" if "date" in index_csi_all.columns else None
                 if date_col is not None:
                     index_csi_all = index_csi_all[index_csi_all[date_col].astype(str) == index_csi_all[date_col].astype(str).max()]
                 last_index_csi_all = index_csi_all[["ID_QI", "weight"]].set_index("ID_QI")["weight"]
-        # Wide format (weight_000985 column from compute_index_composition)
-        elif "weight_000985" in index_csi_all.columns:
-            sub = index_csi_all[["ID_QI", "weight_000985"]].dropna(subset=["weight_000985"])
-            sub = sub[sub["weight_000985"] > 0]
+        # Wide format (weight_{benchmark} column from compute_index_composition)
+        elif f"weight_{_benchmark}" in index_csi_all.columns:
+            sub = index_csi_all[["ID_QI", f"weight_{_benchmark}"]].dropna(subset=[f"weight_{_benchmark}"])
+            sub = sub[sub[f"weight_{_benchmark}"] > 0]
             if not sub.empty:
-                last_index_csi_all = sub.set_index("ID_QI")["weight_000985"]
+                last_index_csi_all = sub.set_index("ID_QI")[f"weight_{_benchmark}"]
             # Melt wide → long so the .so (which expects INDEX_CODE/trade_date/
             # weight columns) gets the same data shape as load_index_composition_from_oss.
             # Without this, passing wide format causes KeyError 'INDEX_CODE' at
