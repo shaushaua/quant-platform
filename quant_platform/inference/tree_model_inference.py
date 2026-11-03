@@ -235,11 +235,22 @@ def _is_optimizer_retryable_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     if type(exc).__name__ == "SolverError":
         return True
-    if not isinstance(exc, RuntimeError):
-        return False
-    return ("optimizer_retryable" in text or
-            ("optimizer" in text and any(marker in text for marker in
-             ("infeasible", "infeasibility", "user_limit", "optimal_inaccurate", "solver failed", "solver error"))))
+    # 宽匹配保底: 20261102 实盘 .so 的 user_limit 错误不含 "optimizer" 字样、
+    # 异常类型也未证实是 RuntimeError — 收窄判定会让该类错误单发失败。
+    # 这里取新旧判定并集: 命中任一 marker 即可重试(多重试的代价只是多跑
+    # 几档优化器, 漏重试的代价是 9:30 直接失败)。
+    broad_markers = (
+        "optimizer_retryable",
+        "infeasible",
+        "infeasibility",
+        "solver",
+        "optimization",
+        "user_limit",
+        "optimal_inaccurate",
+        "no positions",
+        "empty positions",
+    )
+    return any(marker in text for marker in broad_markers)
 
 
 def _optimizer_retry_stages(base_turnover: float):
@@ -1205,6 +1216,12 @@ def inference(
 
     _t_pre_predict = _time.time()
     retry_stages = _optimizer_retry_stages(optimizer_max_turnover)
+    # 首日建仓(无存量持仓): 对空仓任何非零目标都"超换手", 低档阶梯注定不可行;
+    # _validate_target_contract 对空仓本就按满额预算校验 — 直接从顶格开始,
+    # 省掉 3 次必败求解(9:30→9:45 截止窗口内每一次求解都很贵)。
+    if float(current_weight.abs().sum()) < 1e-8 and retry_stages:
+        ceiling = max(stage[2] for stage in retry_stages)
+        retry_stages = [(style, industry, ceiling) for style, industry, _ in retry_stages]
     out = None
     last_predict_error: Optional[BaseException] = None
     total_attempts = len(retry_stages)

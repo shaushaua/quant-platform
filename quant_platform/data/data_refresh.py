@@ -486,6 +486,66 @@ def _query_composition(
 
 # ==================== 刷新主入口 ====================
 
+
+# 风险列清单(与 inference/tree_model_inference.py 的 RISK_*_COLS 保持一致;
+# 不直接 import 该模块 — 那会拉起 calc_predict_tree_model.so 依赖)
+_RISK_STYLE_COLS = ("BETA", "MOMENTUM", "SIZE", "EARNYILD", "RESVOL",
+                    "GROWTH", "BTOP", "LEVERAGE", "LIQUIDTY", "SIZENL")
+_RISK_ACTIVE_INDUSTRY_COLS = (
+    "Agriculture", "Automobiles", "Banks", "BuildMater", "Computers",
+    "Conglomerates", "ConstrDecor", "Defense", "Electronics", "FoodBeverages",
+    "HealthCare", "HomeAppliances", "LightIndustry", "MachineEquip", "Media",
+    "NonbankFinan", "NonferrousMetals", "RealEstate", "Steel", "Telecoms",
+    "Transportation", "Utilities", "BasicChemicals", "BeautyCare", "Coal",
+    "EnvironProtect", "Petroleum", "PowerEquip", "RetailTrade",
+    "SocialServices", "TextileApparel",
+)
+
+
+def _guard_risk_columns(oss, mysql, df, td):
+    """行在列空防护(20261103 事故形态: 行数 5301 正常、Barra/行业列整列为空)。
+
+    - 行业分类(跨日稳定)整列空 → 用前一交易日分类按 ID_QI 回填 + 告警
+    - 风格因子(时变)整列空 → 不回填(推理层快照回退机制会用上一完整日),
+      仅飞书告警, 当天 15:30 后人工核查上游
+    """
+    import io as _io
+
+    def _col_all_nan(cols):
+        present = [c for c in cols if c in df.columns]
+        return bool(present) and df[present].isna().all().all()
+
+    industry_empty = _col_all_nan(_RISK_ACTIVE_INDUSTRY_COLS)
+    style_empty = _col_all_nan(_RISK_STYLE_COLS)
+    if not industry_empty and not style_empty:
+        return df
+
+    msgs = []
+    if industry_empty:
+        try:
+            prev = _previous_trading_day(mysql, td)
+            key = f"2026/{prev[:6]}/{prev}/{prev}_daily_basic_data.parquet"
+            prev_df = pd.read_parquet(_io.BytesIO(oss._oss_bucket.get_object(key).read()))
+            m = prev_df.set_index("ID_QI")[list(_RISK_ACTIVE_INDUSTRY_COLS)]
+            for c in _RISK_ACTIVE_INDUSTRY_COLS:
+                df[c] = df[c].fillna(df["ID_QI"].map(m[c]))
+            filled = int(df[list(_RISK_ACTIVE_INDUSTRY_COLS)].notna().any(axis=1).sum())
+            msgs.append(f"行业列整列为空, 已用 {prev} 分类回填({filled}/{len(df)} 行有值)")
+            logger.warning("daily_basic %s: %s", td, msgs[-1])
+        except Exception as exc:
+            msgs.append(f"行业列整列为空且回填失败: {exc}")
+            logger.error("daily_basic %s 行业列回填失败: %s", td, exc)
+    if style_empty:
+        msgs.append("Barra 风格列(BETA 等 10 列)整列为空 — 不回填, 推理将回退上一完整快照, 请查上游")
+        logger.error("daily_basic %s: 风格列整列为空", td)
+    try:
+        from quant_platform.utils.notify import feishu_alert
+        feishu_alert("daily_basic 风险列缺失防护", f"trade_date={td}: " + "; ".join(msgs))
+    except Exception:
+        pass
+    return df
+
+
 def refresh_daily_data(
     trade_date: str,
     oss: OSSDataLoader,
@@ -537,6 +597,9 @@ def refresh_daily_data(
                     logger.error(
                         f"通联 API 失败,barra 字段保留 MySQL 数据 (可能为空): {e}"
                     )
+
+            # 行在列空防护: 行业回填 + 风格告警(20261103 形态)
+            df = _guard_risk_columns(oss, mysql, df, td)
 
             # 列数校验 (Go 是 96 列);只要 df 非空就上传,不依赖 datayes 成功
             if len(df.columns) != 96:
