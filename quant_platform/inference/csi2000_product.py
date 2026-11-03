@@ -136,12 +136,16 @@ class YinHeBrokerAdapter(BrokerAdapter):
     def __init__(self) -> None:
         # 银河机是独立交易机/独立网关: 必须单独配地址(nginx 8080 /yinhe/ 前缀),
         # 否则会把 yinhe 订单发到 ATX 网关。未配置时回退 ORDER_GATEWAY_URL
-        # (单网关同时挂双 broker 的部署形态仍可用)。
+        # (单网关同时挂双 broker 的部署形式仍可用)。
         self.gateway_url = (
             os.environ.get("CSI2000_GATEWAY_URL")
             or os.environ.get("ORDER_GATEWAY_URL", "")
         ).rstrip("/")
         self.token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
+        # 第三道锁: 网关回报的 account_id 必须等于本产品账户,
+        # 任何接线/路由/机器身份错误在这里拦下, 拒绝交易。
+        self.expected_account = (
+            os.environ.get("CSI2000_ACCOUNT_ID") or "201500101750").strip()
         self.fallback_to_virtual = os.environ.get(
             "YINHE_FALLBACK_VIRTUAL_POSITIONS", "1") in ("1", "true", "yes")
         self._virtual = VirtualBrokerAdapter()
@@ -158,6 +162,8 @@ class YinHeBrokerAdapter(BrokerAdapter):
                             float(ctx.account["available_cash"].iloc[0]))
                 return ctx
             except Exception as exc:
+                if "ACCOUNT_MISMATCH" in str(exc):
+                    raise  # 接线错误绝不回退虚拟账本(否则真实下单+假持仓=sizing 灾难)
                 if not self.fallback_to_virtual:
                     raise
                 logger.warning("[csi2000:yinhe] gateway 账户获取失败(%s), 回退虚拟账本", exc)
@@ -180,6 +186,12 @@ class YinHeBrokerAdapter(BrokerAdapter):
         pos_payload = _get("/v1/positions?broker=yinhe")
         if not pos_payload.get("ok"):
             raise RuntimeError(f"positions: {pos_payload.get('error')}")
+        got_acct = str(pos_payload.get("account_id") or "").strip()
+        if got_acct != self.expected_account:
+            raise RuntimeError(
+                f"ACCOUNT_MISMATCH: 网关回报 account_id={got_acct!r} != 本产品账户 "
+                f"{self.expected_account!r} — 接线错误, 拒绝交易 "
+                f"(检查 CSI2000_GATEWAY_URL / nginx /yinhe/→10.100.0.3:18081 / 网关机器身份)")
         bal_payload = _get("/v1/balance?broker=yinhe")
         if not bal_payload.get("ok"):
             raise RuntimeError(f"balance: {bal_payload.get('error')}")
@@ -232,6 +244,11 @@ class YinHeBrokerAdapter(BrokerAdapter):
         with _rq.urlopen(req, timeout=30) as resp:
             result = _json.loads(resp.read())
         ok = bool(result.get("ok"))
+        got_broker = str(result.get("broker") or "").strip()
+        if ok and got_broker and got_broker != "yinhe":
+            raise RuntimeError(
+                f"ACCOUNT_MISMATCH: 下单被路由到 broker={got_broker!r}(应为 yinhe), "
+                f"拒绝本次成交确认, 立即检查网关接线")
         if not ok:
             logger.error("[csi2000:yinhe] 下单失败: %s", result.get("error"))
         elif result.get("skipped"):
