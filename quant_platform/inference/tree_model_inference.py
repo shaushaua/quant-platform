@@ -194,39 +194,12 @@ def _env_float_list(name: str) -> list[float]:
     return values
 
 
-def _optimizer_industry_tol_candidates() -> list[float]:
-    """Strict-first industry exposure tolerance ladder.
-
-    The first value is the normal production constraint. Extra values are only
-    attempted if the optimizer fails or returns no target positions, so a tight
-    k8s value can fail open to a looser but still bounded risk budget.
-    """
-    base = OPTIMIZER_INDUSTRY_EXPOSURE_TOL
-    fallbacks = _env_float_list("OPTIMIZER_INDUSTRY_EXPOSURE_TOL_FALLBACKS")
-    values = [base]
-    values.extend(sorted(v for v in fallbacks if v >= base))
-    out: list[float] = []
-    seen: set[float] = set()
-    for value in values:
-        if not math.isfinite(value) or value < 0:
-            continue
-        rounded = round(float(value), 10)
-        if rounded in seen:
-            continue
-        seen.add(rounded)
-        out.append(float(value))
-    return out or [base]
-
-
 def _optimizer_style_tol_candidates() -> list[float]:
     """Style exposure tolerance ladder.
 
     First value is the production constraint (OPTIMIZER_STYLE_EXPOSURE_TOL).
-    Extra values come from OPTIMIZER_STYLE_EXPOSURE_TOL_FALLBACKS (e.g. "0.40")
-    and are attempted only after the full industry ladder fails — covers the
-    case where current holdings drifted so far outside the style band that no
-    in-band solution exists within the turnover budget (20261102 incident).
-    Empty/absent fallbacks keep single-shot behavior unchanged.
+    Configured extra values are considered only after the turnover ladder fails.
+    Industry tolerance remains fixed at the original configured value.
     """
     base = OPTIMIZER_STYLE_EXPOSURE_TOL
     fallbacks = _env_float_list("OPTIMIZER_STYLE_EXPOSURE_TOL_FALLBACKS")
@@ -245,6 +218,10 @@ def _optimizer_style_tol_candidates() -> list[float]:
     return out or [base]
 
 
+class RiskConstraintViolation(RuntimeError):
+    """A finite target violates the independently verified risk bounds."""
+
+
 def _is_optimizer_retryable_error(exc: BaseException) -> bool:
     """Return whether a prediction failure is likely an optimizer infeasibility.
 
@@ -253,21 +230,33 @@ def _is_optimizer_retryable_error(exc: BaseException) -> bool:
     style error. Empty output is handled explicitly by raising a retryable
     RuntimeError with the marker below.
     """
+    if isinstance(exc, RiskConstraintViolation):
+        return True
     text = str(exc).lower()
-    retry_markers = (
-        "optimizer_retryable",
-        "infeasible",
-        "infeasibility",
-        "solver",
-        "optimization",
-        # CVXPY/ECOS 求解器约束不可行的典型状态字；20261102 实盘 user_limit
-        # 不匹配任何 marker 导致行业阶梯从未触发，这里显式补上。
-        "user_limit",
-        "optimal_inaccurate",
-        "no positions",
-        "empty positions",
-    )
-    return any(marker in text for marker in retry_markers)
+    if type(exc).__name__ == "SolverError":
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    return ("optimizer_retryable" in text or
+            ("optimizer" in text and any(marker in text for marker in
+             ("infeasible", "infeasibility", "user_limit", "optimal_inaccurate", "solver failed", "solver error"))))
+
+
+def _optimizer_retry_stages(base_turnover: float):
+    """Relax turnover first, then style; industry remains fixed in every stage."""
+    styles = sorted(set(_optimizer_style_tol_candidates() + [OPTIMIZER_STYLE_EXPOSURE_TOL * 1.5, OPTIMIZER_STYLE_EXPOSURE_TOL * 2]))
+    industry = OPTIMIZER_INDUSTRY_EXPOSURE_TOL
+    if (not all(math.isfinite(v) and v >= 0 for v in styles + [industry])
+            or not math.isfinite(base_turnover) or base_turnover < 0
+            or not math.isfinite(RISK_RETRY_TURNOVER_FLOOR) or RISK_RETRY_TURNOVER_FLOOR < 0):
+        raise RuntimeError("risk validation: invalid optimizer retry configuration")
+    if os.environ.get("OPTIMIZER_INDUSTRY_EXPOSURE_TOL_FALLBACKS", "").strip():
+        print("[tree-risk WARNING] industry tolerance fallbacks are ignored; industry remains fixed", flush=True)
+    ceiling = max(base_turnover, RISK_RETRY_TURNOVER_FLOOR)
+    turnovers = sorted(set([base_turnover, ceiling] + [v for v in (0.50, 0.75) if base_turnover < v < ceiling]))
+    stages = [(OPTIMIZER_STYLE_EXPOSURE_TOL, industry, turnover) for turnover in turnovers]
+    stages.extend((style, industry, ceiling) for style in styles if style > OPTIMIZER_STYLE_EXPOSURE_TOL + 1e-12)
+    return stages
 
 
 # Optimizer parameters — overridable via env vars so tuning doesn't require
@@ -289,6 +278,26 @@ OPTIMIZER_MIN_BENCHMARK_CONSTITUENT_WEIGHT = _env_float(
 )
 MORNING_SIGNAL_CUTOFF = "093000"
 POSITION_OUTPUT: Optional[Path] = None
+
+# Risk validation is separate from model feature inputs.
+RISK_COVERAGE_LOOKBACK = 5
+RISK_COVERAGE_MAX_DROP = 0.20
+RISK_MAX_AGE_DAYS = int(os.environ.get("TREE_RISK_MAX_AGE_DAYS", "14"))
+RISK_STYLE_COLS = ("BETA", "MOMENTUM", "SIZE", "EARNYILD", "RESVOL",
+                   "GROWTH", "BTOP", "LEVERAGE", "LIQUIDTY", "SIZENL")
+RISK_INDUSTRY_COLS = (
+    "Agriculture", "Automobiles", "Banks", "BuildMater", "Chemicals", "Commerce",
+    "Computers", "Conglomerates", "ConstrDecor", "Defense", "ElectricalEquip",
+    "Electronics", "FoodBeverages", "HealthCare", "HomeAppliances", "Leisure",
+    "LightIndustry", "MachineEquip", "Media", "Mining", "NonbankFinan",
+    "NonferrousMetals", "RealEstate", "Steel", "Telecoms", "TextileGarment",
+    "Transportation", "Utilities", "BasicChemicals", "BeautyCare", "Coal",
+    "EnvironProtect", "Petroleum", "PowerEquip", "RetailTrade", "SocialServices",
+    "TextileApparel",
+)
+RISK_LEGACY_INDUSTRY_COLS = ("Chemicals", "Commerce", "ElectricalEquip", "Leisure", "Mining", "TextileGarment")
+RISK_ACTIVE_INDUSTRY_COLS = tuple(c for c in RISK_INDUSTRY_COLS if c not in RISK_LEGACY_INDUSTRY_COLS)
+RISK_RETRY_TURNOVER_FLOOR = _env_float("TREE_RISK_RETRY_TURNOVER_FLOOR", 1.0)
 
 _OSS_BUCKETS: dict[str, oss2.Bucket] = {}
 _DAILY_FEATURE_CACHE: dict[str, pd.DataFrame] = {}
@@ -747,6 +756,282 @@ def append_current_daily_basic(history: pd.DataFrame, current: Optional[pd.DataF
     return coerce_daily_basic_dtypes(combined)
 
 
+def _risk_held_codes(portfolio_context) -> set[str]:
+    """Absent account data is not evidence of an empty portfolio."""
+    import numpy as np
+    if portfolio_context is None:
+        raise RuntimeError("risk validation: portfolio_context is required")
+    positions = getattr(portfolio_context, "positions", None)
+    if not isinstance(positions, pd.DataFrame):
+        raise RuntimeError("risk validation: positions must be a DataFrame")
+    if positions.empty:
+        account = getattr(portfolio_context, "account", None)
+        if not isinstance(account, pd.DataFrame) or account.empty or "market_value" not in account:
+            raise RuntimeError("risk validation: cannot verify that an empty portfolio is actually empty")
+        mv = pd.to_numeric(account["market_value"], errors="coerce").iloc[0]
+        if not np.isfinite(mv) or abs(mv) > 1e-8:
+            raise RuntimeError("risk validation: empty positions conflict with account market value")
+        return set()
+    cc = next((c for c in ("code", "stock_code", "symbol", "ID_QI", "_code6") if c in positions), None)
+    vc = next((c for c in ("position", "weight", "market_value", "value", "position_value", "current_volume", "volume", "qty", "quantity") if c in positions), None)
+    if cc is None or vc is None:
+        raise RuntimeError("risk validation: positions lack code or amount")
+    amounts = pd.to_numeric(positions[vc], errors="coerce")
+    if not np.isfinite(amounts.to_numpy(dtype=float)).all():
+        raise RuntimeError("risk validation: invalid position amount")
+    for other in ("position", "weight", "market_value", "value", "position_value", "current_volume", "volume", "qty", "quantity"):
+        if other != vc and other in positions:
+            other_amount = pd.to_numeric(positions[other], errors="coerce")
+            if ((amounts.abs() <= 1e-10) & (other_amount.abs() > 1e-10)).any():
+                raise RuntimeError("risk validation: contradictory zero and nonzero position amounts")
+    codes = positions.loc[amounts.abs() > 1e-10, cc].map(normalize_code6)
+    if codes.isna().any():
+        raise RuntimeError("risk validation: invalid held stock code")
+    return set(codes)
+
+
+def _require_live_risk_clock(date_str: str):
+    """Historical as-of versions are absent; do not silently introduce lookahead."""
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+    if date_str != today:
+        raise RuntimeError("risk validation: historical/future replay requires verified point-in-time snapshots; live-only gate")
+
+
+def _risk_composition(index_composition_df, benchmark: str, risk_date: str):
+    """Require an explicitly dated benchmark; undated engine inputs use OSS."""
+    comp = index_composition_df
+    date_col = next((c for c in ("trade_date", "date", "TS") if isinstance(comp, pd.DataFrame) and c in comp), None)
+    if date_col is None or not {"INDEX_CODE", "weight", "ID_QI"}.issubset(comp.columns):
+        comp = load_index_composition_from_oss(risk_date, risk_date)
+        date_col = next((c for c in ("trade_date", "date", "TS") if c in comp), None)
+    if date_col is None or not {"INDEX_CODE", "weight", "ID_QI"}.issubset(comp.columns):
+        raise RuntimeError("dated benchmark composition with weights is required")
+    frame = comp.loc[comp["INDEX_CODE"].astype(str) == benchmark].copy()
+    frame["_risk_date"] = frame[date_col].map(normalize_date)
+    frame = frame.loc[frame["_risk_date"] == risk_date].copy()
+    if frame.empty and comp is index_composition_df:
+        comp = load_index_composition_from_oss(risk_date, risk_date)
+        date_col = next((c for c in ("trade_date", "date", "TS") if c in comp), None)
+        if date_col is None or not {"INDEX_CODE", "weight", "ID_QI"}.issubset(comp.columns):
+            raise RuntimeError("dated benchmark composition with weights is required")
+        frame = comp.loc[comp["INDEX_CODE"].astype(str) == benchmark].copy()
+        frame["_risk_date"] = frame[date_col].map(normalize_date)
+        frame = frame.loc[frame["_risk_date"] == risk_date].copy()
+    if frame.empty:
+        raise RuntimeError(f"benchmark {benchmark} has no composition for {risk_date}")
+    frame["_risk_code"] = frame["ID_QI"].map(normalize_code6)
+    raw = pd.to_numeric(frame["weight"], errors="coerce")
+    if (frame["_risk_code"].isna().any() or raw.isna().any()
+            or (~raw.map(math.isfinite)).any() or (raw < 0).any()
+            or frame["_risk_code"].duplicated().any()):
+        raise RuntimeError("benchmark contains invalid or duplicate codes/weights")
+    positive = raw > 0
+    weights = normalize_benchmark_weights(pd.Series(raw[positive].to_numpy(), index=frame.loc[positive, "_risk_code"]))
+    if weights is None or weights.empty:
+        raise RuntimeError("benchmark has no positive weights")
+    return weights
+
+
+def _risk_reject_mixed_date_sidecars(day: str):
+    """Do not treat known per-stock stale-filled inputs as a single-date snapshot."""
+    bucket = make_bucket(OSS_DATA_BUCKET)
+    for suffix, field in (("stale_fill", "count"), ("index_weight_audit", "stale_prices")):
+        key = daily_basic_prefix(day) + day + "_" + suffix + ".json"
+        if bucket.object_exists(key):
+            response = bucket.get_object(key)
+            try:
+                audit = json.loads(response.read())
+            finally:
+                response.close()
+            count = audit.get(field)
+            if count is None or not isinstance(count, (int, float)) or not math.isfinite(count) or count < 0:
+                raise RuntimeError(f"invalid {suffix} sidecar")
+            if count > 0:
+                raise RuntimeError(f"{suffix} sidecar records {count} stale rows")
+
+
+def _emit_risk_warning(message: str):
+    """Log the warning and reuse the platform notifier when configured."""
+    print(f"[tree-risk WARNING] {message}", flush=True)
+    try:
+        from quant_platform.utils.notify import feishu_alert
+        if not feishu_alert("tree model risk data warning", message):
+            print("[tree-risk WARNING] notification was not delivered; inspect process logs", flush=True)
+    except Exception as exc:
+        print(f"[tree-risk WARNING] notification unavailable ({type(exc).__name__}); inspect process logs", flush=True)
+
+
+def select_validated_risk_snapshot(daily_basic, date_str, index_composition_df, benchmark, held_codes):
+    """Select the latest complete prior-day risk snapshot; never fill risks with zero.
+
+    Five preceding independently qualifying snapshots provide the baseline;
+    upstream as-of/version provenance cannot be proven from this frame.
+    """
+    import numpy as np
+    required_cols = RISK_STYLE_COLS + RISK_ACTIVE_INDUSTRY_COLS
+    if RISK_MAX_AGE_DAYS < 1 or not set(RISK_STYLE_COLS + RISK_INDUSTRY_COLS).issubset(daily_basic.columns):
+        raise RuntimeError("risk validation: invalid max age or missing Barra style/industry columns")
+    prior = daily_basic.loc[daily_basic["trade_date"].astype(str) < date_str].copy()
+    counts = prior.groupby("trade_date")["ID_QI"].nunique().sort_index()
+    dates = list(counts.index.astype(str))
+    today = datetime.strptime(date_str, "%Y%m%d")
+    rejected = []
+    cache = {}
+    def inspect(day, require_current_holdings):
+        cache_key = (day, require_current_holdings)
+        if cache_key in cache:
+            return cache[cache_key]
+        try:
+            _risk_reject_mixed_date_sidecars(day)
+            snapshot = prior.loc[prior["trade_date"].astype(str) == day].copy()
+            if snapshot.empty or snapshot["ID_QI"].duplicated().any():
+                raise RuntimeError("empty snapshot or duplicate stock codes")
+            if snapshot[list(RISK_LEGACY_INDUSTRY_COLS)].notna().any().any():
+                raise RuntimeError("legacy industry fields are populated; classification schema requires review")
+            bm = _risk_composition(index_composition_df, benchmark, day)
+            needed = pd.Index(sorted(set(bm.index.astype(str)) | (held_codes if require_current_holdings else set())))
+            risk = snapshot.set_index("ID_QI").reindex(needed)[list(required_cols)].apply(pd.to_numeric, errors="coerce")
+            valid = np.isfinite(risk.to_numpy(dtype=float))
+            if not valid.all():
+                bad_cols = list(risk.columns[~valid.all(axis=0)])
+                raise RuntimeError("missing Barra values for benchmark or held positions; fields=" + ",".join(bad_cols))
+            ind = risk[list(RISK_ACTIVE_INDUSTRY_COLS)].to_numpy(dtype=float)
+            if not np.isin(ind, [0.0, 1.0]).all() or not np.allclose(ind.sum(axis=1), 1.0, atol=1e-8):
+                raise RuntimeError("active industry classification must be complete one-hot")
+            result = (snapshot, bm, None)
+        except Exception as exc:
+            result = (None, None, f"{type(exc).__name__}: {exc}")
+        cache[cache_key] = result
+        return result
+    for candidate in reversed(dates):
+        age = (today - datetime.strptime(candidate, "%Y%m%d")).days
+        if age > RISK_MAX_AGE_DAYS:
+            break
+        snapshot, bm, error = inspect(candidate, True)
+        if error:
+            rejected.append(f"{candidate}: {error}")
+            continue
+        qualified = []
+        for day in reversed([x for x in dates if x < candidate]):
+            _, previous_bm, previous_error = inspect(day, False)
+            if previous_error is None:
+                qualified.append((day, previous_bm))
+            if len(qualified) == RISK_COVERAGE_LOOKBACK:
+                break
+        if len(qualified) < RISK_COVERAGE_LOOKBACK:
+            rejected.append(f"{candidate}: fewer than five historical dates")
+            continue
+        baseline = float(np.median([int(counts.loc[day]) for day, _ in qualified]))
+        count = int(counts.loc[candidate])
+        drop = 1 - count / baseline if baseline > 0 else float("inf")
+        if drop >= RISK_COVERAGE_MAX_DROP - 1e-12:
+            rejected.append(f"{candidate}: stock coverage drop {drop:.2%}")
+            continue
+        bm_baseline = float(np.median([len(previous_bm) for _, previous_bm in qualified]))
+        if bm_baseline <= 0 or len(bm) <= bm_baseline * (1 - RISK_COVERAGE_MAX_DROP) + 1e-12:
+            rejected.append(f"{candidate}: benchmark member coverage drop")
+            continue
+        summary = f"date={candidate} age_days={age} stocks={count} baseline={baseline:.0f} rejected={rejected}"
+        if rejected or age > 1:
+            _emit_risk_warning("using historical risk snapshot; " + summary)
+        else:
+            print(f"[tree-risk] {summary}", flush=True)
+        print("[tree-risk WARNING] independent trading calendar and snapshot availability not verified", flush=True)
+        return snapshot, bm, {"risk_date": candidate, "age_days": age, "stock_count": count,
+                              "baseline_median": baseline, "stock_drop": drop, "rejected": rejected}
+    failure = "risk validation: no qualifying snapshot: " + "; ".join(rejected[-8:])
+    _emit_risk_warning(failure)
+    raise RuntimeError(failure)
+
+
+def _validate_prediction_holdings(daily_basic, signal_date, factors, universe, held_codes):
+    """Do not allow existing positions to disappear before the compiled optimizer."""
+    signal_codes = set(daily_basic.loc[daily_basic["trade_date"].astype(str) == signal_date, "ID_QI"])
+    factor_codes = set()
+    if factors is not None and not factors.empty:
+        key = next((c for c in ("ID_QI", "code", "_code6") if c in factors), None)
+        if key:
+            factor_codes = set(factors[key].map(normalize_code6).dropna())
+    eligible = signal_codes & factor_codes
+    if universe is not None:
+        eligible &= set(universe)
+    missing = held_codes - eligible
+    if missing:
+        raise RuntimeError(f"risk validation: {len(missing)} held stocks missing from model inputs; examples={sorted(missing)[:8]}")
+
+
+def _validate_target_risk(out, risk_frame, benchmark_weight, style_tol, industry_tol):
+    """Independent complete-benchmark style and industry check."""
+    import numpy as np
+    code_col = next((c for c in ("_code6", "code", "ID_QI") if c in out), None)
+    if code_col is None or "position" not in out:
+        raise RuntimeError("risk validation: target lacks code or position")
+    codes = out[code_col].map(normalize_code6)
+    values = pd.to_numeric(out["position"], errors="coerce")
+    if codes.isna().any() or not np.isfinite(values.to_numpy(dtype=float)).all() or codes.duplicated().any():
+        raise RuntimeError("risk validation: target contains invalid or duplicate positions")
+    weights = pd.Series(values.to_numpy(dtype=float), index=codes)
+    weights = weights.loc[weights.abs() > 1e-10]
+    exposure = risk_frame.reindex(weights.index)[list(RISK_STYLE_COLS)].apply(pd.to_numeric, errors="coerce")
+    benchmark = risk_frame.reindex(benchmark_weight.index)[list(RISK_STYLE_COLS)].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(exposure.to_numpy(dtype=float)).all() or not np.isfinite(benchmark.to_numpy(dtype=float)).all():
+        raise RuntimeError("risk validation: target or full benchmark has missing Barra values")
+    active = exposure.mul(weights, axis=0).sum(axis=0) - benchmark.mul(benchmark_weight, axis=0).sum(axis=0)
+    limit = benchmark.std(axis=0) * float(style_tol)
+    if not np.isfinite(limit.to_numpy(dtype=float)).all() or (limit <= 0).any():
+        raise RuntimeError("risk validation: invalid benchmark style dispersion")
+    breaches = active.index[active.abs() > limit + 1e-6]
+    if len(breaches):
+        raise RiskConstraintViolation("risk validation: target violates full-benchmark style bounds: " + ", ".join(map(str, breaches)))
+    other_cols = [c for c in risk_frame.columns if c not in RISK_STYLE_COLS]
+    if not set(RISK_ACTIVE_INDUSTRY_COLS + ("XSHG", "XSHE")).issubset(other_cols):
+        raise RuntimeError("risk validation: industry or exchange exposures are missing")
+    target_other = risk_frame.reindex(weights.index)[other_cols].apply(pd.to_numeric, errors="coerce")
+    benchmark_other = risk_frame.reindex(benchmark_weight.index)[other_cols].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(target_other.to_numpy(dtype=float)).all() or not np.isfinite(benchmark_other.to_numpy(dtype=float)).all():
+        raise RuntimeError("risk validation: target or benchmark has missing industry/exchange exposures")
+    target_exp = target_other.mul(weights, axis=0).sum(axis=0)
+    bench_exp = benchmark_other.mul(benchmark_weight, axis=0).sum(axis=0)
+    constrained = bench_exp > 1e-8
+    low = (1.0 - float(industry_tol)) * bench_exp
+    high = (1.0 + float(industry_tol)) * bench_exp
+    bad = constrained & ((target_exp < low - 1e-6) | (target_exp > high + 1e-6))
+    if bad.any():
+        raise RiskConstraintViolation("risk validation: target violates full-benchmark industry/exchange bounds: " + ", ".join(map(str, bad.index[bad])))
+    print(f"[tree-risk] independent target style check passed tolerance={style_tol:.4f}", flush=True)
+
+
+def _validate_target_contract(out, current_weight, stage_turnover):
+    """Check the final reported position and actual turnover before returning it."""
+    import numpy as np
+    code_col = next((c for c in ("_code6", "code", "ID_QI") if c in out), None)
+    if code_col is None or "position" not in out:
+        raise RuntimeError("risk validation: target lacks position or code")
+    codes = out[code_col].map(normalize_code6)
+    values = pd.to_numeric(out["position"], errors="coerce")
+    if codes.isna().any() or codes.duplicated().any() or not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise RuntimeError("risk validation: invalid target positions")
+    target = pd.Series(values.to_numpy(dtype=float), index=codes)
+    current = pd.to_numeric(current_weight, errors="coerce")
+    if not np.isfinite(current.to_numpy(dtype=float)).all() or current.index.duplicated().any():
+        raise RuntimeError("risk validation: invalid optimizer current weights")
+    current.index = current.index.astype(str)
+    idx = current.index.union(target.index)
+    current = current.reindex(idx, fill_value=0.)
+    target = target.reindex(idx, fill_value=0.)
+    if not ENABLE_SHORT and (target < -1e-6).any():
+        raise RuntimeError("risk validation: unexpected short position")
+    expected = max(0., 1. - OPTIMIZER_CASH_RATIO)
+    if abs(float(target.sum()) - expected) > 1e-5:
+        raise RuntimeError("risk validation: target sum differs from configured investment budget")
+    effective_turnover = max(stage_turnover, expected) if current.abs().sum() < 1e-8 else stage_turnover
+    if float((target - current).abs().sum()) > effective_turnover + 1e-5:
+        raise RuntimeError("risk validation: target exceeds turnover limit against full current weights")
+    if not ENABLE_SHORT and (target > np.maximum(OPTIMIZER_MAX_WEIGHT, current) + 1e-6).any():
+        raise RuntimeError("risk validation: target increases a position beyond its limit")
+
+
 def inference(
     date_str: str,
     end_time: str,
@@ -766,7 +1051,16 @@ def inference(
     import time as _time
     _t0 = _time.time()
 
+    date_str = normalize_date(date_str)
+    if date_str is None:
+        raise RuntimeError("risk validation: invalid decision date")
+    _require_live_risk_clock(date_str)
     daily_basic = load_production_daily_basic(date_str, current_daily_basic=daily_basic_df)
+    held_codes = _risk_held_codes(portfolio_context)
+    _benchmark = (benchmark_code or os.environ.get("OPTIMIZER_BENCHMARK", "")).strip() or "000985"
+    risk_snapshot, risk_benchmark, risk_audit = select_validated_risk_snapshot(
+        daily_basic, date_str, index_composition_df, _benchmark, held_codes,
+    )
     _t_daily_basic = _time.time()
     print(f"[tree-infer-timing] daily_basic: {_t_daily_basic - _t0:.3f}s ({len(daily_basic)} rows)", flush=True)
     universe = normalize_universe_codes(trading_universe_df)
@@ -849,6 +1143,7 @@ def inference(
     #   1. 即使没配 TRADING_UNIVERSE_MODULE，inference 也能独立保证无 ST
     #   2. 防止 Pod 启动后盘中 ST 状态变化（摘帽/戴帽）导致的遗漏
     daily_basic = filter_st_stocks_from_daily_basic(daily_basic, date_str)
+    _validate_prediction_holdings(daily_basic, signal_date, prev_day_factors_df, universe, held_codes)
     all_codes = pd.Index(daily_basic["ID_QI"].dropna().astype(str).unique()).sort_values()
     current_weight = extract_current_position_weights(portfolio_context, all_codes)
     optimizer_max_turnover = OPTIMIZER_MAX_TURNOVER
@@ -892,8 +1187,14 @@ def inference(
                     f"today_cash_flow={_today_flow:.0f})",
                     flush=True,
                 )
-    benchmark_weight = normalize_benchmark_weights(last_index_csi_all)
-    exposure_frame = build_optimizer_exposure_frame(daily_basic, signal_date)
+    benchmark_weight = risk_benchmark
+    exposure_frame = build_optimizer_exposure_frame(risk_snapshot, risk_audit["risk_date"])
+    if exposure_frame is None or exposure_frame.empty:
+        raise RuntimeError("risk validation: exposure frame is empty")
+    # These six legacy columns were verified empty across the entire selected
+    # snapshot; do not fill them with 0 or invent a one-to-one mapping.
+    exposure_frame = exposure_frame.drop(columns=list(RISK_LEGACY_INDUSTRY_COLS), errors="ignore")
+    print("[tree-risk] excluded six fully empty legacy industry fields; 31 current fields validated", flush=True)
     model_path = (
         DEFAULT_MODEL_PATH
         if Path(DEFAULT_MODEL_PATH).exists() and Path(DEFAULT_MODEL_PATH).stat().st_size > 0
@@ -903,19 +1204,19 @@ def inference(
     print(f"[tree-infer-timing] model_path resolve: {_t_model - _t_daily_basic:.3f}s path={model_path}", flush=True)
 
     _t_pre_predict = _time.time()
-    industry_tol_candidates = _optimizer_industry_tol_candidates()
-    style_tol_candidates = _optimizer_style_tol_candidates()
+    retry_stages = _optimizer_retry_stages(optimizer_max_turnover)
     out = None
     last_predict_error: Optional[BaseException] = None
-    total_attempts = len(style_tol_candidates) * len(industry_tol_candidates)
+    total_attempts = len(retry_stages)
     attempt = 0
-    for style_tol in style_tol_candidates:
-        for industry_tol in industry_tol_candidates:
+    for stage in retry_stages:
+        for style_tol, industry_tol, stage_turnover in [stage]:
             attempt += 1
             if total_attempts > 1:
                 print(
                     f"[tree-infer] optimizer attempt {attempt}/{total_attempts}: "
-                    f"style_tol={style_tol:.4f}, industry_tol={industry_tol:.4f}",
+                    f"style_tol={style_tol:.4f}, industry_tol={industry_tol:.4f}, "
+                    f"turnover={stage_turnover:.4f}, risk_date={risk_audit['risk_date']}",
                     flush=True,
                 )
             try:
@@ -945,7 +1246,7 @@ def inference(
                     include_debug_cols=INCLUDE_DEBUG_COLS,
                     use_optimizer=USE_OPTIMIZER,
                     current_weight=current_weight,
-                    optimizer_max_turnover=optimizer_max_turnover,
+                    optimizer_max_turnover=stage_turnover,
                     optimizer_max_weight=OPTIMIZER_MAX_WEIGHT,
                     optimizer_cash_ratio=OPTIMIZER_CASH_RATIO,
                     optimizer_trans_cost=OPTIMIZER_TRANS_COST,
@@ -960,6 +1261,8 @@ def inference(
                         f"optimizer_retryable: predict_tree_model returned no positions "
                         f"(style_tol={style_tol:.4f}, industry_tol={industry_tol:.4f})"
                     )
+                _validate_target_contract(out, current_weight, stage_turnover)
+                _validate_target_risk(out, exposure_frame, benchmark_weight, style_tol, industry_tol)
                 if attempt > 1:
                     print(
                         f"[tree-infer] optimizer recovered with "
@@ -969,6 +1272,9 @@ def inference(
                 break
             except Exception as exc:
                 last_predict_error = exc
+                # A compiled solver can return a finite target that fails our
+                # independent gate. Never retain that target for a later stage.
+                out = None
                 if not _is_optimizer_retryable_error(exc):
                     raise
                 if attempt >= total_attempts:
@@ -990,6 +1296,10 @@ def inference(
 
     if universe is not None:
         out = out[out["_code6"].isin(set(universe))].copy()
+    if out.empty:
+        raise RuntimeError("risk validation: target is empty after universe filtering")
+    _validate_target_contract(out, current_weight, stage_turnover)
+    _validate_target_risk(out, exposure_frame, benchmark_weight, style_tol, industry_tol)
 
     print(
         f"[tree-inference] date={date_str} end_time={end_time} "
