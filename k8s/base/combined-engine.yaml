@@ -135,11 +135,20 @@ spec:
             - name: MINUTE_SKIP_TIMES
               value: "09:30"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal"
+              value: "minute,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal,csi2000_open"
             # 中证2000独立信号: 15:12 产出 targets 到 /data/factors/csi2000/
             # 与全指信号共用因子/模型, 池/基准(932000)/资金独立, 虚拟盘不下单
             - name: CSI2000_SIGNAL_TRIGGER_TIME
               value: "15:12"
+            # 中证2000实盘执行: 09:30 昨日 targets 在银河账户建仓/调仓
+            # (真实持仓/资金 sizing → 皓兴 VWAP 205), CSI2000_BROKER 控制通道
+            - name: CSI2000_OPEN_TRIGGER_TIME
+              value: "09:30"
+            - name: CSI2000_OPEN_DEADLINE
+              value: "09:45"
+            # virtual(默认): 虚拟盘落盘; yinhe: 实盘走银河启明(gateway broker=yinhe)
+            - name: CSI2000_BROKER
+              value: "virtual"
             # 飞书告警 webhook(只存 Secret, 代码/仓库不留真实地址)。
             # optional=true: Secret 未创建时 env 为空, 告警静默降级(仅日志),
             # 不阻塞 Pod 启动。创建命令:

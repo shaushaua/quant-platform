@@ -266,4 +266,22 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             is_daily_result=False,
         ))
 
+    if "csi2000_open" in enabled:
+        # 中证2000实盘执行: 09:30 用昨日 targets 在银河账户建仓/调仓
+        # (真实持仓/资金 sizing → 皓兴 VWAP 205), 与全指 open_position 对称。
+        t = _parse_trigger_time(
+            os.environ.get("CSI2000_OPEN_TRIGGER_TIME", "09:30"),
+            (9, 30), "CSI2000_OPEN_TRIGGER_TIME")
+        deadline = _parse_trigger_time(
+            os.environ.get("CSI2000_OPEN_DEADLINE", "09:45"),
+            (9, 45), "CSI2000_OPEN_DEADLINE")
+        schedules.append(ComputationSchedule(
+            name="csi2000_open",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            trigger_deadline=deadline,
+            run_inference=False,
+            is_daily_result=False,
+        ))
+
     return schedules

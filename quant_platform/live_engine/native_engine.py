@@ -3465,6 +3465,28 @@ class NativeEngine:
                 except Exception as exc:
                     logger.warning("[open_position] cache unlink failed %s: %s", p, exc)
 
+    def _run_csi2000_open_safe(self) -> None:
+        """csi2000_open schedule 入口: 9:30 实盘执行(昨日 targets → 银河账户),
+        异常全吞 + 飞书告警, 不影响全指主链路。"""
+        try:
+            from ..inference.csi2000_product import run_csi2000_open
+            from ..utils.notify import feishu_alert
+            td = self.trading_day
+            if not td:
+                logger.error("[csi2000_open] trading_day empty, skip")
+                return
+            orders = run_csi2000_open(td)
+            n = 0 if orders is None else len(orders)
+            logger.info("[csi2000_open] done trading_day=%s orders=%d", td, n)
+            feishu_alert("csi2000-开盘执行完成", f"{td}: 推单 {n} 笔(银河账户, 皓兴VWAP)")
+        except Exception as exc:
+            logger.error("[csi2000_open] failed: %s", exc, exc_info=True)
+            try:
+                from ..utils.notify import feishu_alert
+                feishu_alert("csi2000-开盘执行失败", f"{self.trading_day}: {exc}")
+            except Exception:
+                pass
+
     def _run_csi2000_signal_safe(self) -> None:
         """csi2000_signal schedule 入口: 产出中证2000独立信号, 异常全吞。
 
@@ -4525,6 +4547,13 @@ class NativeEngine:
                         elif schedule.name == "csi2000_signal":
                             t = threading.Thread(
                                 target=self._run_csi2000_signal_safe,
+                                daemon=True,
+                            )
+                        # 中证2000实盘执行: 09:30 昨日 targets 在银河账户下单,
+                        # 独立线程 + 异常全吞(含飞书告警)
+                        elif schedule.name == "csi2000_open":
+                            t = threading.Thread(
+                                target=self._run_csi2000_open_safe,
                                 daemon=True,
                             )
                         else:

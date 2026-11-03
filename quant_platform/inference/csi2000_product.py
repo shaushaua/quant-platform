@@ -111,13 +111,126 @@ class VirtualBrokerAdapter(BrokerAdapter):
 
 
 def get_broker(name: str) -> BrokerAdapter:
-    """适配器注册表。实盘接入时在此注册新适配器, 例如:
-        CSI2000_BROKER=new_broker → NewBrokerAdapter(api_key=...)
+    """适配器注册表。实盘接入:
+        CSI2000_BROKER=yinhe → YinHeBrokerAdapter(银河启明 iTrade)
     """
-    brokers = {"virtual": VirtualBrokerAdapter}
+    brokers: dict = {"virtual": VirtualBrokerAdapter, "yinhe": YinHeBrokerAdapter}
     if name not in brokers:
         raise RuntimeError(f"未知 CSI2000_BROKER={name!r}, 可选: {list(brokers)}")
     return brokers[name]()
+
+
+class YinHeBrokerAdapter(BrokerAdapter):
+    """银河启明 iTrade 适配器(实盘)。
+
+    下单: order-gateway 多 broker 路由 → POST /v1/orders {"broker":"yinhe"}
+          → 写启明扫单目录的 OrderAlgo_YYYYMMDD.dbf(协议与 ATX 同源)。
+          OrdType 由 gateway config 的 algo_codes 映射:
+          皓兴VWAP=205 / 皓兴TWAP=204 / 跃然T0=601;请求带 algo_strategy。
+    持仓/资金: gateway → 启明 ReportPosition/ReportBalance dbf
+          (?broker=yinhe); 不可用时 fallback CSV 虚拟账本。
+    """
+
+    name = "yinhe"
+
+    def __init__(self) -> None:
+        self.gateway_url = os.environ.get("ORDER_GATEWAY_URL", "").rstrip("/")
+        self.token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
+        self.fallback_to_virtual = os.environ.get(
+            "YINHE_FALLBACK_VIRTUAL_POSITIONS", "1") in ("1", "true", "yes")
+        self._virtual = VirtualBrokerAdapter()
+
+    def get_positions(self, trading_day: str) -> "PortfolioContext":
+        from quant_platform.inference.interface import PortfolioContext
+
+        if self.gateway_url:
+            try:
+                ctx = self._fetch_gateway_context()
+                logger.info("[csi2000:yinhe] gateway 账户: 持仓 %d 只, 总资产 %.0f, 可用 %.0f",
+                            len(ctx.positions),
+                            float(ctx.account["total_asset"].iloc[0]),
+                            float(ctx.account["available_cash"].iloc[0]))
+                return ctx
+            except Exception as exc:
+                if not self.fallback_to_virtual:
+                    raise
+                logger.warning("[csi2000:yinhe] gateway 账户获取失败(%s), 回退虚拟账本", exc)
+        if self.fallback_to_virtual:
+            return self._virtual.get_positions(trading_day)
+        raise RuntimeError("yinhe 账户不可用且未开虚拟回退")
+
+    def _fetch_gateway_context(self) -> "PortfolioContext":
+        import json as _json
+        import urllib.request as _rq
+        from quant_platform.inference.interface import PortfolioContext
+
+        def _get(path):
+            req = _rq.Request(
+                f"{self.gateway_url}{path}",
+                headers={"Authorization": f"Bearer {self.token}"})
+            with _rq.urlopen(req, timeout=10) as resp:
+                return _json.loads(resp.read())
+
+        pos_payload = _get("/v1/positions?broker=yinhe")
+        if not pos_payload.get("ok"):
+            raise RuntimeError(f"positions: {pos_payload.get('error')}")
+        bal_payload = _get("/v1/balance?broker=yinhe")
+        if not bal_payload.get("ok"):
+            raise RuntimeError(f"balance: {bal_payload.get('error')}")
+        if pos_payload.get("stale"):
+            logger.warning("[csi2000:yinhe] 持仓回报过期 %ss (%s)",
+                           int(pos_payload.get("stale_seconds", 0)),
+                           pos_payload.get("source_file"))
+
+        positions = pd.DataFrame(pos_payload.get("positions") or [])
+        if not positions.empty:
+            positions = positions.rename(columns={
+                "symbol": "code", "volume": "qty", "available_volume": "available_qty"})
+            for col in ("code",):
+                if col in positions.columns:
+                    positions[col] = positions[col].astype(str).str.split(".").str[0].str.zfill(6)
+        bal = bal_payload.get("balance") or {}
+        account = pd.DataFrame([{
+            "total_asset": float(bal.get("total_asset", 0) or 0),
+            "available_cash": float(bal.get("available_cash", 0) or 0),
+            "market_value": float(bal.get("market_value", 0) or 0),
+        }])
+        return PortfolioContext(
+            account_id="csi2000-yinhe", broker=self.name,
+            positions=positions, account=account,
+            meta={"source": "qiming_report"})
+
+    def push_orders(self, orders: pd.DataFrame, trading_day: str) -> bool:
+        import json as _json
+        import urllib.request as _rq
+        if not self.gateway_url:
+            raise RuntimeError("ORDER_GATEWAY_URL 未配置, yinhe 适配器无法下单")
+        payload = []
+        for _, r in orders.iterrows():
+            code6 = str(r["code"]).split(".")[0].zfill(6)
+            exchange = "SH" if code6.startswith(("60", "68", "9")) else "SZ"
+            payload.append({
+                "symbol": f"{code6}.{exchange}",
+                "side": r["side"],
+                "volume": int(r["volume"]),
+                "algo_strategy": "vwap",        # 皓兴VWAP(205); T0增强单用 "t0"(601)
+                "strategy": "csi2000",
+                "order_id": f"csi2k_{trading_day}_{code6}",
+            })
+        req = _rq.Request(
+            f"{self.gateway_url}/v1/orders",
+            data=_json.dumps({"broker": "yinhe", "orders": payload}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.token}"},
+            method="POST")
+        with _rq.urlopen(req, timeout=30) as resp:
+            result = _json.loads(resp.read())
+        ok = bool(result.get("ok"))
+        if not ok:
+            logger.error("[csi2000:yinhe] 下单失败: %s", result.get("error"))
+        elif result.get("skipped"):
+            logger.warning("[csi2000:yinhe] 部分跳过: %s", result.get("skipped")[:3])
+        return ok
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -209,15 +322,41 @@ def daily_factors_ready(trading_day: str) -> bool:
 
 
 def _load_close_prices(trading_day: str) -> pd.Series:
+    """当日收盘价; 15:30 daily_basic 刷新前 OSS 无当日文件 → 回退 T-1 收盘。
+
+    折股/订单定价用 T-1 价近似(±10% 内), 次日 targets 会按新价重算 —
+    只影响虚拟账本的股数取整, 不影响优化器权重(权重来自 targets 本身)。
+    """
     from quant_platform.data.oss_loader import OSSDataLoader
     oss = OSSDataLoader(base_path="2026")
-    key = f"2026/2026{trading_day[4:6]}/{trading_day}/{trading_day}_daily_basic_data.parquet"
-    try:
-        obj = oss._oss_bucket.get_object(key)
-        db = pd.read_parquet(io.BytesIO(obj.read()))
-        return db.set_index(db["ID_QI"].astype(str).str.zfill(6))["close"].astype(float)
-    except Exception:
-        return pd.Series(dtype=float)
+
+    def _try(date_str: str):
+        if not date_str:
+            return pd.Series(dtype=float)
+        key = f"2026/2026{date_str[4:6]}/{date_str}/{date_str}_daily_basic_data.parquet"
+        try:
+            obj = oss._oss_bucket.get_object(key)
+            db = pd.read_parquet(io.BytesIO(obj.read()))
+            return db.set_index(db["ID_QI"].astype(str).str.zfill(6))["close"].astype(float)
+        except Exception:
+            return pd.Series(dtype=float)
+
+    px = _try(trading_day)
+    if not px.empty:
+        return px
+
+    # 回退: 逐日前找最多 7 天, 命中即用
+    from datetime import datetime, timedelta
+    d = datetime.strptime(trading_day, "%Y%m%d")
+    for _ in range(7):
+        d -= timedelta(days=1)
+        ds = d.strftime("%Y%m%d")
+        px_prev = _try(ds)
+        if not px_prev.empty:
+            logger.warning("[csi2000] 当日(%s)收盘价未上传(15:30前), 折股用 %s 价近似",
+                           trading_day, ds)
+            return px_prev
+    return pd.Series(dtype=float)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -225,8 +364,13 @@ def _load_close_prices(trading_day: str) -> pd.Series:
 # ══════════════════════════════════════════════════════════════════
 
 def run_csi2000_signal(trading_day: str,
-                       broker: Optional[BrokerAdapter] = None) -> Optional[pd.DataFrame]:
-    """产出当日中证2000 targets。供引擎 schedule 与手动 CLI 共用。
+                       broker: Optional[BrokerAdapter] = None,
+                       factor_date: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """产出中证2000 targets。供引擎 schedule 与手动 CLI 共用。
+
+    factor_date: 因子所用日期。默认=trading_day(15:12 盘后信号用当日
+    daily 因子); 9:30 实盘执行传 T-1(与全指 open_position 同口径:
+    T-1 因子 + 当前账户现场推理, 不是读缓存)。
 
     返回 targets DataFrame; 失败抛异常(引擎侧 catch 并记日志,不影响其他 schedule)。
     """
@@ -239,7 +383,7 @@ def run_csi2000_signal(trading_day: str,
     universe_df = pd.DataFrame({"code": universe_codes})
     logger.info("[csi2000] universe: %d 只(纯2000池)", len(universe_codes))
 
-    factors = load_daily_factors(trading_day)
+    factors = load_daily_factors(factor_date or trading_day)
     ctx = broker.get_positions(trading_day)
 
     from quant_platform.inference.tree_model_inference import inference
@@ -273,8 +417,13 @@ def run_csi2000_signal(trading_day: str,
     return targets
 
 
-def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str) -> pd.DataFrame:
-    """targets(目标权重) vs 当前持仓 → 订单(code/side/volume/price)。"""
+def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str,
+                       capital: Optional[float] = None) -> pd.DataFrame:
+    """targets(目标权重) vs 当前持仓 → 订单(code/side/volume/price)。
+
+    capital: sizing 基准资金。None → 取 ctx.account.total_asset(实盘真实
+    资金); 虚拟账本 account 也是 1000 万, 行为不变。
+    """
     pos = getattr(ctx, "positions", pd.DataFrame())
     px = _load_close_prices(trading_day)
     tgt = targets[["_code6", "position"]].copy() if "_code6" in targets.columns \
@@ -283,6 +432,10 @@ def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str) -> pd.DataF
     cur_qty: pd.Series = pd.Series(dtype=float)
     if not pos.empty and "qty" in pos.columns:
         cur_qty = pos.set_index(pos["code"].astype(str).str.zfill(6))["qty"].astype(float)
+
+    if capital is None:
+        acct = getattr(ctx, "account", None)
+        capital = float(acct["total_asset"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
 
     rows = []
     target_codes = set(tgt["_code6"])
@@ -293,7 +446,7 @@ def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str) -> pd.DataF
         price = float(px.get(code6, 0.0))
         if price <= 0:
             continue
-        want = int(w * VIRTUAL_CAPITAL / price / 100) * 100
+        want = int(w * capital / price / 100) * 100
         have = float(cur_qty.get(code6, 0.0))
         delta = want - have
         if abs(delta) < 100:
@@ -320,6 +473,93 @@ def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str) -> pd.DataF
             "volume": int(have // 100) * 100, "price": round(price, 2),
         })
     return pd.DataFrame(rows)
+
+
+def run_csi2000_open(trading_day: str,
+                     broker: Optional[BrokerAdapter] = None) -> Optional[pd.DataFrame]:
+    """9:30 实盘执行入口: 与全指 open_position 同口径 — 现场推理, 不读缓存。
+
+    流程(对称全指):
+      T-1 daily 因子 + 2000池/基准 → inference 现场算 targets →
+      gateway?broker=yinhe 真实持仓/资金 → 真实 total_asset sizing →
+      差额订单(含清仓) → 可用资金预检 → 皓兴 VWAP(205) 下单。
+
+    定价用最近可得收盘价(9:30 时当日 daily_basic 未上传 → 自动 T-1),
+    VWAP 算法执行端会用市场实时价, 折股误差在 ±10% 涨跌幅内。
+    """
+    from ..utils.notify import feishu_alert
+    from quant_platform.data.oss_loader import OSSDataLoader
+    import oss2 as _oss2
+
+    broker = broker or get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
+
+    # 1) 找 T-1(最近一份已上传的 daily 因子, 当日 15:10 才有)
+    oss = OSSDataLoader(base_path="2026")
+    auth = _oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
+    rb = _oss2.Bucket(auth, os.environ["OSS_ENDPOINT"], "stock-mdl-data-result")
+    from datetime import datetime as _dt, timedelta as _td
+    factor_date = trading_day
+    for _ in range(7):
+        try:
+            rb.head_object(_daily_factor_key(factor_date))
+            break
+        except Exception:
+            d = _dt.strptime(factor_date, "%Y%m%d") - _td(days=1)
+            factor_date = d.strftime("%Y%m%d")
+    if factor_date == trading_day:
+        # 当日因子 9:30 不可能存在(15:10 产出), 上面循环必然回退;
+        # 仍相等说明 head 成功 — 不该发生, 防御性跳过
+        pass
+    logger.info("[csi2000-open] 现场推理: 因子=%s 执行日=%s", factor_date, trading_day)
+
+    # 2) 现场算 targets(真实账户 ctx 供优化器 invested_frac/sizing)
+    targets = run_csi2000_signal(trading_day, broker=broker, factor_date=factor_date)
+    if targets is None or targets.empty:
+        raise RuntimeError("csi2000-open: inference 未产出 targets")
+
+    # 3) 真实账户(与 run_csi2000_signal 内部同一 ctx, 重取一次拿最新)
+    ctx = broker.get_positions(trading_day)
+    acct = getattr(ctx, "account", None)
+    total_asset = float(acct["total_asset"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
+    avail = float(acct["available_cash"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
+    logger.info("[csi2000-open] 账户: 总资产 %.0f, 可用 %.0f, 持仓 %d 只",
+                total_asset, avail, len(getattr(ctx, "positions", pd.DataFrame())))
+
+    # 4) 差额订单(真实资金 sizing + 清仓)
+    orders = _targets_to_orders(targets, ctx, trading_day, capital=total_asset)
+    if orders.empty:
+        logger.info("[csi2000-open] 无差额订单(已到位)")
+        return orders
+
+    # 5) 可用资金预检: 买单额 ≤ 可用现金 + 卖单估值×0.9(T+1 卖出回笼按折价计)
+    buys = orders[orders["side"] == "buy"]
+    sells = orders[orders["side"] == "sell"]
+    buy_amt = float((buys["volume"] * buys["price"]).sum()) if len(buys) else 0.0
+    sell_amt = float((sells["volume"] * sells["price"]).sum()) if len(sells) else 0.0
+    budget = avail + sell_amt * 0.9
+    if buy_amt > budget:
+        over = buy_amt - budget
+        feishu_alert("csi2000-资金预检不足", (
+            f"{trading_day}: 买单 {buy_amt/1e4:.0f}万 > 预算 {budget/1e4:.0f}万"
+            f"(可用 {avail/1e4:.0f} + 卖出×0.9 {sell_amt*0.9/1e4:.0f}万), 超 {over/1e4:.0f}万。"
+            f"按预算比例截断买单。"))
+        ratio = budget / buy_amt if buy_amt > 0 else 0.0
+        keep_n = int(len(buys) * ratio)
+        # 截断: 保留买单中金额大的(按金额降序), 其余丢弃
+        buys = buys.assign(_amt=buys["volume"] * buys["price"]).sort_values("_amt", ascending=False)
+        buys = buys.head(keep_n).drop(columns="_amt")
+        orders = pd.concat([buys, sells], ignore_index=True)
+        logger.warning("[csi2000-open] 买单按预算 %.0f%% 截断: 保留 %d 笔",
+                       ratio * 100, len(buys))
+
+    # 6) 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205)
+    ok = broker.push_orders(orders, trading_day)
+    if ok:
+        logger.info("[csi2000-open] 已推 %d 笔(买 %d/卖 %d, 买额 %.0f万)",
+                    len(orders), len(buys), len(sells), buy_amt / 1e4)
+        od_path = OUT_DIR / f"csi2000_open_orders_{trading_day}.csv"
+        orders.to_csv(od_path, index=False)
+    return orders
 
 
 def _write_virtual_positions(trading_day: str, targets: pd.DataFrame,
