@@ -398,7 +398,8 @@ def _load_close_prices(trading_day: str) -> pd.Series:
 
 def run_csi2000_signal(trading_day: str,
                        broker: Optional[BrokerAdapter] = None,
-                       factor_date: Optional[str] = None) -> Optional[pd.DataFrame]:
+                       factor_date: Optional[str] = None,
+                       push: bool = True) -> Optional[pd.DataFrame]:
     """产出中证2000 targets。供引擎 schedule 与手动 CLI 共用。
 
     factor_date: 因子所用日期。默认=trading_day(15:12 盘后信号用当日
@@ -439,9 +440,11 @@ def run_csi2000_signal(trading_day: str,
     targets.to_csv(tgt_path, index=False)
     logger.info("[csi2000] targets %d 只 → %s", len(targets), tgt_path)
 
-    # 订单 = targets vs 持仓 的差额(方向/数量), 走 broker 通道(虚盘落盘/实盘API)
+    # 订单 = targets vs 持仓 的差额(方向/数量), 走 broker 通道(虚盘落盘/实盘API)。
+    # push=False 供 run_csi2000_open 复用推理但自行推送(资金预检/截断后再推,
+    # 否则会先推一版未经预检的订单 + open 再推一版 = 双重下单)。
     orders = _targets_to_orders(targets, ctx, trading_day)
-    if not orders.empty:
+    if push and not orders.empty:
         broker.push_orders(orders, trading_day)
 
     # 虚盘: 更新模拟持仓文件(次日 get_positions 用)
@@ -546,7 +549,7 @@ def run_csi2000_open(trading_day: str,
     logger.info("[csi2000-open] 现场推理: 因子=%s 执行日=%s", factor_date, trading_day)
 
     # 2) 现场算 targets(真实账户 ctx 供优化器 invested_frac/sizing)
-    targets = run_csi2000_signal(trading_day, broker=broker, factor_date=factor_date)
+    targets = run_csi2000_signal(trading_day, broker=broker, factor_date=factor_date, push=False)
     if targets is None or targets.empty:
         raise RuntimeError("csi2000-open: inference 未产出 targets")
 

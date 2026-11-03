@@ -134,7 +134,7 @@ def filter_st_stocks_from_daily_basic(daily_basic, date_str: str = ""):
 
 
 DEFAULT_OUTPUT = Path("artifacts/tree_model_positions.csv")
-OSS_ENDPOINT = "https://oss-cn-hangzhou.aliyuncs.com"
+OSS_ENDPOINT = os.environ.get("OSS_ENDPOINT", "https://oss-cn-hangzhou.aliyuncs.com")
 OSS_DATA_BUCKET = "quant-mdl-data"
 OSS_RESULT_BUCKET = "stock-mdl-data-result"
 OSS_MODEL_BUCKET = OSS_RESULT_BUCKET
