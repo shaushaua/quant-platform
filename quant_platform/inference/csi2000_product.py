@@ -134,7 +134,13 @@ class YinHeBrokerAdapter(BrokerAdapter):
     name = "yinhe"
 
     def __init__(self) -> None:
-        self.gateway_url = os.environ.get("ORDER_GATEWAY_URL", "").rstrip("/")
+        # 银河机是独立交易机/独立网关: 必须单独配地址(nginx 8080 /yinhe/ 前缀),
+        # 否则会把 yinhe 订单发到 ATX 网关。未配置时回退 ORDER_GATEWAY_URL
+        # (单网关同时挂双 broker 的部署形态仍可用)。
+        self.gateway_url = (
+            os.environ.get("CSI2000_GATEWAY_URL")
+            or os.environ.get("ORDER_GATEWAY_URL", "")
+        ).rstrip("/")
         self.token = os.environ.get("ORDER_GATEWAY_TOKEN", "")
         self.fallback_to_virtual = os.environ.get(
             "YINHE_FALLBACK_VIRTUAL_POSITIONS", "1") in ("1", "true", "yes")
@@ -204,7 +210,7 @@ class YinHeBrokerAdapter(BrokerAdapter):
         import json as _json
         import urllib.request as _rq
         if not self.gateway_url:
-            raise RuntimeError("ORDER_GATEWAY_URL 未配置, yinhe 适配器无法下单")
+            raise RuntimeError("CSI2000_GATEWAY_URL/ORDER_GATEWAY_URL 未配置, yinhe 适配器无法下单")
         payload = []
         for _, r in orders.iterrows():
             code6 = str(r["code"]).split(".")[0].zfill(6)

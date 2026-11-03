@@ -27,6 +27,10 @@ patches:
                   # 不覆盖的话 kubectl apply -k overlays/prod 会把实盘打成模拟盘。
                   - name: ORDER_GATEWAY_URL
                     value: "http://172.24.99.176:8080"
+                  # 中证2000(银河机独立网关): 同一 ECS nginx 8080 的 /yinhe/ 前缀
+                  # → WireGuard 10.100.0.3:18080。与全指 ATX 网关物理隔离
+                  - name: CSI2000_GATEWAY_URL
+                    value: "http://172.24.99.176:8080/yinhe"
                   - name: BROKER_ACCOUNT_ID
                     value: "501000119118"
                   # --- ST/退市过滤：Pod 启动时调 trading_universe() 排除 ST ---

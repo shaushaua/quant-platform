@@ -149,6 +149,10 @@ spec:
             # virtual(默认): 虚拟盘落盘; yinhe: 实盘走银河启明(gateway broker=yinhe)
             - name: CSI2000_BROKER
               value: "virtual"
+            # 银河机网关独立地址(ECS nginx 8080 /yinhe/ 前缀 → WireGuard 10.100.0.3)。
+            # 留空回退 ORDER_GATEWAY_URL(=ATX 网关, 两台机各自跑网关时会发错机器)
+            - name: CSI2000_GATEWAY_URL
+              value: ""
             # 飞书告警 webhook(只存 Secret, 代码/仓库不留真实地址)。
             # optional=true: Secret 未创建时 env 为空, 告警静默降级(仅日志),
             # 不阻塞 Pod 启动。创建命令:
