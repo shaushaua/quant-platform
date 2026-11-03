@@ -146,8 +146,11 @@ class YinHeBrokerAdapter(BrokerAdapter):
         # 任何接线/路由/机器身份错误在这里拦下, 拒绝交易。
         self.expected_account = (
             os.environ.get("CSI2000_ACCOUNT_ID") or "201500101750").strip()
+        # 虚拟回退默认关闭: yinhe 实盘模式下任何账户获取失败都必须中止,
+        # 回退虚拟账本会导致"真实下单 + 虚拟持仓 sizing"的错单。
+        # 仅调试时显式置 1。
         self.fallback_to_virtual = os.environ.get(
-            "YINHE_FALLBACK_VIRTUAL_POSITIONS", "1") in ("1", "true", "yes")
+            "YINHE_FALLBACK_VIRTUAL_POSITIONS", "0") in ("1", "true", "yes")
         self._virtual = VirtualBrokerAdapter()
 
     def get_positions(self, trading_day: str) -> "PortfolioContext":
@@ -186,6 +189,13 @@ class YinHeBrokerAdapter(BrokerAdapter):
         pos_payload = _get("/v1/positions?broker=yinhe")
         if not pos_payload.get("ok"):
             raise RuntimeError(f"positions: {pos_payload.get('error')}")
+        # 账户名配置错(差一个字)的典型形态: ok=true 但 0 行匹配。
+        # 网关会带 client_names_in_report 提示真实名单 —— 这里硬中止。
+        if pos_payload.get("client_name_mismatch"):
+            raise RuntimeError(
+                "ACCOUNT_MISMATCH: gateway client_name 未匹配到任何回报行, "
+                f"回报内实际账户名: {pos_payload.get('client_names_in_report')} — "
+                "需修正网关配置中的 client_name 后重打包")
         got_acct = str(pos_payload.get("account_id") or "").strip()
         if got_acct != self.expected_account:
             raise RuntimeError(
