@@ -16,8 +16,12 @@
 #
 # 观察要点(只读):
 #   - 每分钟两轮计算日志(耗时), 两轮合计应 <60s
-#   - /data/factors/daily-rolling/{HHMMSS}.csv 产物与 minute 的 {HHMMSS}.csv 同分钟共存
+#   - /data/mdtest/factors/daily-rolling/{td}_{HHMMSS}.csv 每分钟独立留档
+#     (与 minute 的根目录 HHMMSS.csv 互不互踩)
 #   - OSS minutes-daily-feature/{HHMMSS}.parquet 上传成功、列 schema 与 daily-feature 一致
+#   - 每 10 分钟 minute-trade-test/ 出两份 targets(全指+2000)及各自耗时
+#   - 早分钟(9:15-9:30)滚动因子的 NaN 比例 — v2 从未在此窗口被调用过
+#   - 容器 RSS 是否随时间缓涨(每分钟全市场大对象分配的碎片观察)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,6 +62,17 @@ spec:
               value: "quant_platform.strategies.protected_eillen_intraday_strategy"
             - name: DAILY_FACTOR_MODULE
               value: "quant_platform.strategies.protected_eillen_strategy_v2"
+            # v2 只暴露多票 batch 入口(不设则每分钟全量调用失败零产出)
+            - name: DAILY_USE_MULTI_CODE
+              value: "true"
+            # 固定 end_time=150000(与生产一致, 决定 F_*_150000 列名与调用契约)
+            - name: END_TIMES
+              value: "150000"
+            # 10min 交易方案推理测试: minute_daily 算完因子后每 10 分钟
+            # (HH:00/10/20/30/40/50) 用最新滚动因子分别跑全指+2000推理,
+            # 只出 targets 落 minute-trade-test/, 不构建订单不碰网关
+            - name: MINUTE_TRADE_TEST
+              value: "true"
             - name: INFERENCE_MODULE
               value: "quant_platform.inference.tree_model_orders"
             - name: TRADING_UNIVERSE_MODULE

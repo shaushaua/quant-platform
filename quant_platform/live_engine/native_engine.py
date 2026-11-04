@@ -3542,6 +3542,84 @@ class NativeEngine:
             except Exception:
                 pass
 
+    # ── 10 分钟交易方案·推理测试挂钩(仅测试 Pod, env 默认关) ──────────
+    def _compute_minute_daily(self, schedule) -> None:
+        """minute_daily 计算包装: 因子算完后, 每 10 分钟节拍追加双产品推理。
+
+        MINUTE_TRADE_TEST 未开启时与 _compute_and_output 完全等价(生产
+        COMPUTE_SCHEDULES 不含 minute_daily, 双保险零影响)。推理只出
+        targets(全指 inference + 2000 run_csi2000_signal 虚盘), 不构建
+        订单、不触碰任何网关 — 验证"分钟滚动因子 → 10min 双推理"链路的
+        正确性与耗时, 为 10 分钟交易版供数据。
+        """
+        self._compute_and_output(schedule)
+        if os.environ.get("MINUTE_TRADE_TEST", "").lower() not in {"1", "true", "yes", "y", "on"}:
+            return
+        if datetime.now().minute % 10 != 0:
+            return
+        try:
+            self._minute_trade_test_infer()
+        except Exception as exc:
+            logger.error("[minute-trade-test] 推理失败: %s", exc, exc_info=True)
+
+    def _minute_trade_test_infer(self) -> None:
+        """读最新 daily-rolling 滚动因子, 全指/2000 分别推理并落 targets CSV。
+
+        产物: {FACTOR_OUTPUT_PATH}/minute-trade-test/{td}_{HHMMSS}_{quanzhi|csi2000}_targets.csv
+        """
+        import time as _time
+        from ..inference.csi2000_product import get_broker, run_csi2000_signal
+        from ..inference.tree_model_inference import inference as _inference
+
+        td = self.trading_day
+        if not td or not self.output_path:
+            return
+        rolling_dir = Path(str(self.output_path)) / "daily-rolling"
+        # 取最新滚动因子文件(计算线程刚写完; 解析失败=半文件 → 短重试)
+        fpath, fdf = None, None
+        for _ in range(3):
+            files = sorted(rolling_dir.glob(f"{td}_*.csv")) if rolling_dir.is_dir() else []
+            if files:
+                cand = files[-1]
+                try:
+                    df = pd.read_csv(cand)
+                    if len(df) > 100:
+                        fpath, fdf = cand, df
+                        break
+                except Exception:
+                    pass
+            time.sleep(1)
+        if fdf is None:
+            logger.warning("[minute-trade-test] 无可用滚动因子(daily-rolling/), 跳过本轮")
+            return
+        tag = fpath.stem.split("_")[-1]           # HHMMSS
+        out_dir = rolling_dir.parent / "minute-trade-test"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # inference() 强制要求 portfolio_context(空仓也要可验证); 测试 Pod
+        # 无网关, 用虚盘空持仓 ctx(市值 0, 总资产 1000万虚拟)
+        vctx = get_broker("virtual").get_positions(td)
+        t0 = _time.time()
+        tz = _inference(
+            td, "150000",
+            prev_day_factors_df=fdf, intraday_factors_df=fdf,
+            daily_basic_df=self._daily_basic_df,
+            trading_universe_df=self._trading_universe_df,
+            index_composition_df=self._idx_cons_df,
+            portfolio_context=vctx,
+        )
+        if tz is None or tz.empty:
+            raise RuntimeError("全指推理未产出 targets")
+        tz.to_csv(out_dir / f"{td}_{tag}_quanzhi_targets.csv", index=False)
+        logger.info("[minute-trade-test] 全指: %d 只 targets, %.1fs (因子=%s)",
+                    len(tz), _time.time() - t0, fpath.name)
+        t1 = _time.time()
+        t2k = run_csi2000_signal(td, factor_df=fdf, push=False)
+        if t2k is None or t2k.empty:
+            raise RuntimeError("2000 推理未产出 targets")
+        t2k.to_csv(out_dir / f"{td}_{tag}_csi2000_targets.csv", index=False)
+        logger.info("[minute-trade-test] 2000: %d 只 targets, %.1fs",
+                    len(t2k), _time.time() - t1)
+
     def _refresh_daily_basic_upload(self) -> None:
         """盘后 15:30 trigger: 重新生成并上传 T-0 和 T-1 daily_basic + composition 到 OSS。
 
@@ -4106,6 +4184,11 @@ class NativeEngine:
             label = schedule.result_label
         else:
             label = end_time
+        # minute_daily: 因子函数契约的 end_time 固定 150000(决定 F_*_150000
+        # 列名), 但存储 label 用实际分钟 — 每分钟独立文件滚动留档, 不互相
+        # 覆盖(此前固定 150000 每分钟覆盖, 无法事后核对历史分钟值)。
+        if schedule is not None and schedule.name == "minute_daily":
+            label = _minute_end_time(datetime.now())
         # Runtime end_time for downstream (inference, portfolio context, order
         # queue, latency query): daily_position passes "" to the factor function
         # but uses label here so _query_deal_latency / file lookups resolve.
@@ -4595,6 +4678,14 @@ class NativeEngine:
                         elif schedule.name == "csi2000_position":
                             t = threading.Thread(
                                 target=self._run_csi2000_position_safe,
+                                daemon=True,
+                            )
+                        # minute_daily: 算完因子后按 10min 节拍挂双产品推理测试
+                        # (MINUTE_TRADE_TEST 开关, 默认关 = 与直接计算完全等价)
+                        elif schedule.name == "minute_daily":
+                            t = threading.Thread(
+                                target=self._compute_minute_daily,
+                                args=(schedule,),
                                 daemon=True,
                             )
                         else:
