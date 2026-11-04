@@ -288,11 +288,12 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
         ))
 
     if "csi2000_open" in enabled:
-        # 中证2000实盘执行: 09:30 用昨日 targets 在银河账户建仓/调仓
-        # (真实持仓/资金 sizing → 皓兴 VWAP 205), 与全指 open_position 对称。
+        # 中证2000实盘执行: 09:31 在银河账户建仓/调仓(真实持仓/资金 sizing
+        # → 皓兴 VWAP 205)。与全指 open_position(09:30)错峰 1 分钟, 避免两
+        # 个产品同时刻重算/推理互相拖累(20261104 9:30 并发事故教训)。
         t = _parse_trigger_time(
-            os.environ.get("CSI2000_OPEN_TRIGGER_TIME", "09:30"),
-            (9, 30), "CSI2000_OPEN_TRIGGER_TIME")
+            os.environ.get("CSI2000_OPEN_TRIGGER_TIME", "09:31"),
+            (9, 31), "CSI2000_OPEN_TRIGGER_TIME")
         deadline = _parse_trigger_time(
             os.environ.get("CSI2000_OPEN_DEADLINE", "09:45"),
             (9, 45), "CSI2000_OPEN_DEADLINE")
@@ -306,13 +307,13 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
         ))
 
     if "csi2000_position" in enabled:
-        # 中证2000 14:50 盘中调仓: 与全指 daily_position 同频同口径。
+        # 中证2000 14:51 盘中调仓: 与全指 daily_position(14:50)错峰 1 分钟。
         # 因子 = 引擎当天现算的 {td}_145000.csv(handler 内轮询等待
         # daily_position 产出, 不依赖 15:10 才上传的 OSS daily 因子);
-        # 执行 = 与 09:30 csi2000_open 同一实盘链(银河账户, 皓兴 VWAP)。
+        # 执行 = 与 09:31 csi2000_open 同一实盘链(银河账户, 皓兴 VWAP)。
         t = _parse_trigger_time(
-            os.environ.get("CSI2000_POSITION_TRIGGER_TIME", "14:50"),
-            (14, 50), "CSI2000_POSITION_TRIGGER_TIME")
+            os.environ.get("CSI2000_POSITION_TRIGGER_TIME", "14:51"),
+            (14, 51), "CSI2000_POSITION_TRIGGER_TIME")
         deadline = _parse_trigger_time(
             os.environ.get("CSI2000_POSITION_DEADLINE", "15:00"),
             (15, 0), "CSI2000_POSITION_DEADLINE")
