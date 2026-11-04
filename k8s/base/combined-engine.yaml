@@ -131,11 +131,14 @@ spec:
               value: "quant_platform.broker.order_context"
             - name: COMPUTE_INTERVAL
               value: "60"
-            # 9:30 只运行开盘日频调仓，避免与分钟因子争抢 CPU。
+            # 9:30-9:35 与 14:50-14:55 是下单窗口(open_position/csi2000_open 与
+            # daily_position/csi2000_position), minute 与 minute_daily 共用此
+            # 跳过名单 — 窗口内不做任何因子计算, CPU 留给调仓; 这些分钟的
+            # 分钟因子无任何消费方(MINUTE_RUN_INFERENCE=false)。
             - name: MINUTE_SKIP_TIMES
-              value: "09:30"
+              value: "09:30,09:31,09:32,09:33,09:34,09:35,14:50,14:51,14:52,14:53,14:54,14:55"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
+              value: "minute,minute_daily,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
             # 中证2000独立信号: 15:12 产出 targets 到 /data/factors/csi2000/
             # 与全指信号共用因子/模型, 池/基准(932000)/资金独立, 虚拟盘不下单
             - name: CSI2000_SIGNAL_TRIGGER_TIME
