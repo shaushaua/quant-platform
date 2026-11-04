@@ -390,10 +390,18 @@ def read_metadata_cache(bucket_name: str, category: str, cache_key: str):
 def write_metadata_cache(bucket_name: str, category: str, cache_key: str, payload) -> None:
     path = metadata_cache_path(bucket_name, category, cache_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    tmp_path.replace(path)
+    # 唯一化 tmp 文件名(与 read_oss_object_cached 同款修复): 20261104 09:30 实盘,
+    # 全指 open_position 与 csi2000_open 两线程并发冷启动 exists 元数据缓存,
+    # 共用 ".tmp" 后缀导致一个 rename 走、另一个 FileNotFoundError → 全指
+    # fail closed。元数据内容确定(同 key 同值), 各写各的 tmp 再 rename 幂等。
+    tmp_path = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def read_oss_object_cached(
