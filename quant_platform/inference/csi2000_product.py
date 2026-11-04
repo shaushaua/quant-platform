@@ -628,9 +628,17 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
                 continue
             keep_rows.append(r)
         if drop_codes:
+            # 释放权重按比例重分配给剩余票(保持原权重和, 最大资金利用率)
+            pre_sum = float(pd.to_numeric(targets["position"], errors="coerce").fillna(0).sum())
             targets = pd.DataFrame(keep_rows).reset_index(drop=True)
-            logger.warning("[csi2000-%s] 剔除未持有涨停买单 %d 只: %s",
-                           tag, len(drop_codes), sorted(set(drop_codes))[:10])
+            post_sum = float(pd.to_numeric(targets["position"], errors="coerce").fillna(0).sum())
+            if post_sum > 0:
+                targets["position"] = (pd.to_numeric(targets["position"], errors="coerce").fillna(0)
+                                       * (pre_sum / post_sum))
+            logger.warning("[csi2000-%s] 剔除未持有涨停买单 %d 只: %s; "
+                           "释放权重 %.2f%% 已按比例重分配给剩余票",
+                           tag, len(drop_codes), sorted(set(drop_codes))[:10],
+                           (pre_sum - post_sum) * 100)
 
     # 差额订单(真实资金 sizing + 清仓)
     orders = _targets_to_orders(targets, ctx, trading_day, capital=total_asset)

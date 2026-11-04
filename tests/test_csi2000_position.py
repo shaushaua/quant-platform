@@ -242,7 +242,7 @@ class TestCsi2000Position(unittest.TestCase):
             "code": ["000001.XSHE", "000002.XSHE"],
             "position": [0.50, 0.10],   # 000001 实时价 10.0 ≥ 涨停 10.0 → 剔除
         })
-        broker = _CountingBroker(_Ctx(_account(10_000_000, 1_000_000), _positions({})))
+        broker = _CountingBroker(_Ctx(_account(10_000_000, 10_000_000), _positions({})))
 
         orders = cp.run_csi2000_open(
             self.td, broker=broker, targets_override=override,
@@ -253,7 +253,9 @@ class TestCsi2000Position(unittest.TestCase):
         m_load.assert_not_called()      # 未加载 OSS 因子
         self.assertEqual(len(broker.pushed), 1)
         got = {(r.code, r.side, int(r.volume)) for r in broker.pushed[0].itertuples()}
-        self.assertEqual(got, {("000002", "buy", 105_200)})
+        # 000001(0.50权重)被剔 → 释放权重重分配: 000002 权重 0.10 → 0.60
+        # want = int(0.6*1e7/9.5/100)*100 = 631500 股
+        self.assertEqual(got, {("000002", "buy", 631_500)})
 
     def test_resolve_factor_date_falls_back(self, *mocks):
         """OSS 全部 404 时回退 7 天(stub 桶 head 必抛)。"""

@@ -3655,6 +3655,48 @@ class NativeEngine:
             + [(14, m) for m in (0, 10, 20, 30, 40)]
         )
 
+    def _drop_and_renormalize_targets(self, targets: Optional[pd.DataFrame],
+                                      portfolio_context,
+                                      price_source: Optional[dict] = None) -> Optional[pd.DataFrame]:
+        """剔除"未持有且已涨停"的目标票, 释放权重按比例重分配给剩余票。
+
+        price_source 优先用竞价价(auction_fetch 9:26), 为空回退 SHM 实时价;
+        拿不到价格的票默认未涨停(不剔除不重分配, 调仓优先)。等比放大回
+        原权重和 — 剔除涨停不降低资金利用率(用户要求最大资金利用率)。
+        """
+        if targets is None or targets.empty or not price_source:
+            return targets
+        limits = self._daily_limit_prices or {}
+        if not limits:
+            return targets
+        pos = getattr(portfolio_context, "positions", None)
+        held: set = set()
+        if pos is not None and not getattr(pos, "empty", True) and "code" in pos.columns:
+            held = {str(c).split(".")[0].zfill(6) for c in pos["code"]}
+        col = "_code6" if "_code6" in targets.columns else "code"
+        rows, dropped = [], []
+        for _, r in targets.iterrows():
+            code6 = str(r[col]).split(".")[0].zfill(6)
+            lim = limits.get(code6)
+            px = float(price_source.get(code6, 0) or 0)
+            if (code6 not in held and lim is not None and px > 0
+                    and float(lim[0]) > 0 and px >= float(lim[0])):
+                dropped.append(code6)
+                continue
+            rows.append(r)
+        if not dropped:
+            return targets
+        pre_sum = float(pd.to_numeric(targets["position"], errors="coerce").fillna(0).sum())
+        out = pd.DataFrame(rows).reset_index(drop=True)
+        post_sum = float(pd.to_numeric(out["position"], errors="coerce").fillna(0).sum())
+        if post_sum > 0:
+            out["position"] = (pd.to_numeric(out["position"], errors="coerce").fillna(0)
+                               * (pre_sum / post_sum))
+        logger.warning("[open_position] 竞价剔除未持有涨停 %d 只: %s; "
+                       "释放权重 %.2f%% 已按比例重分配给剩余票",
+                       len(dropped), dropped[:10], (pre_sum - post_sum) * 100)
+        return out
+
     def _run_auction_fetch_safe(self) -> None:
         """auction_fetch schedule 入口: 9:26 取集合竞价价并判定一字涨停。
 
@@ -3924,6 +3966,16 @@ class NativeEngine:
                     date_str, end_time_label, "order conversion")
                 if portfolio_context is None:
                     return
+
+                # 9:26 竞价价的一字板剔除 + 权重等比重分配(尽力而为):
+                # 拿不到价格默认未涨停, 不剔除不重分配, 直接进转单。
+                try:
+                    cached_targets = self._drop_and_renormalize_targets(
+                        cached_targets, portfolio_context,
+                        price_source=self._auction_prices
+                        or self._snapshot_latest_prices() or {})
+                except Exception as exc:
+                    logger.warning("[open_position] 竞价涨停剔除失败(跳过, 直接转单): %s", exc)
 
                 # At 9:30:00 the collector creates SHM files lazily, so some
                 # target codes have no price yet. positions_to_orders reports
