@@ -33,6 +33,8 @@ def get_portfolio_context(date_str: str, end_time: str,
     }])
     logger.info("[virtual-context] 空仓虚拟账户 %.0f万 (%s %s)",
                 VIRTUAL_TOTAL_CAPITAL / 1e4, date_str, end_time)
+    # positions_usable=True: 空仓是合法可用的组合状态(引擎 open_position 的
+    # 持仓可用性校验要求该标志, False 会被三连拒后 fail closed)。
     return PortfolioContext(
         account_id="virtual-test",
         broker="virtual",
@@ -43,5 +45,5 @@ def get_portfolio_context(date_str: str, end_time: str,
         account=account,
         orders=pd.DataFrame(),
         deals=pd.DataFrame(),
-        meta={"positions_usable": False, "virtual": True},
+        meta={"positions_usable": True, "virtual": True},
     )
