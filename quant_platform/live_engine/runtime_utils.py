@@ -69,6 +69,14 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str,
         import io
         import oss2
 
+        # 测试 Pod 混合负载验证用: 关掉上传后不写任何生产共享 OSS 对象
+        # (daily-feature/daily.parquet 是次日实盘因子输入, 绝不能被测试
+        # Pod 覆盖); OSS 读取不受影响。生产不设置此 env, 行为不变。
+        if os.environ.get("FACTOR_OSS_UPLOAD_ENABLED", "true").lower() not in {
+                "1", "true", "yes", "y", "on"}:
+            logger.info("[OSS] uploads disabled (FACTOR_OSS_UPLOAD_ENABLED), skip")
+            return
+
         endpoint = os.environ.get("OSS_ENDPOINT", "")
         ak_id = os.environ.get("OSS_ACCESS_KEY_ID", "")
         ak_secret = os.environ.get("OSS_ACCESS_KEY_SECRET", "")

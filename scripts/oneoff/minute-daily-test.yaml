@@ -1,27 +1,39 @@
-# minute_daily 因子测试 Pod（非交易日/盘前部署，盘中自跑，全程无下单可能）
+# 混合负载计时测试 Pod（架构拆分前的替代方案：与生产同 Pod 混跑全部负载）
 #
-# 用途: 实测 0444baf 的 minute_daily 调度 —— minute(老min因子) + minute_daily
-# (v2日频模块滚动) 每分钟各算一轮串行, 验证正确性/耗时/OSS 上传。
+# 目的: 在"不拆架构"的前提下, 验证一个 Pod 混跑生产全量调度 + minute_daily
+# + 10min 双推理, 时间是否够用(10 分钟间隔的余量)。盘前部署盘中自跑,
+# 全程零真实下单可能。
 #
-# 隔离三保证:
-#   1. 只算因子: MINUTE_RUN_INFERENCE=false + 不含任何 csi2000/open_position
-#      schedule + 不配置任何 gateway env → 无推理、无下单代码路径可达。
-#   2. 独立节点: nodeSelector 独占标签, 与引擎节点物理分开(需先给测试节点
-#      打标签: kubectl label nodes <node> quant.lianghua.io/minute-daily-test=true)。
-#   3. 独立目录: SHM/因子输出全部 emptyDir, 不碰节点上 /data/factors、
-#      /data/quant/shm(引擎 hostPath)。
+# 与生产完全一致的负载: minute(每分钟老min因子) + minute_daily(每分钟v2滚动,
+# 0444baf) + open_position(9:30) + daily_position(14:50) + csi2000_open(9:30,
+# 虚盘) + csi2000_position(14:50, 虚盘) + csi2000_signal(15:12, 虚盘) +
+# MINUTE_TRADE_TEST(10min 固定点双推理)。
 #
-# 镜像: 复用 combined-engine:latest(含 0444baf 之后的新镜像, 部署前确认已重建)。
-# 部署窗口: 必须在 08:00 前(交易日)或非交易日 —— 交易时段禁止 kubectl 写操作。
+# 三重防真实下单:
+#   1. 不设 ORDER_GATEWAY_URL / CSI2000_GATEWAY_URL → 全指推单路径直接 skip
+#   2. CSI2000_BROKER 未设(默认 virtual) → 2000 全部虚盘落盘
+#   3. 虚盘 portfolio context(virtual_context.py) → open_position/daily_position
+#      推理用空仓虚拟账户(1000万), 不查任何真实账户
 #
-# 观察要点(只读):
-#   - 每分钟两轮计算日志(耗时), 两轮合计应 <60s
-#   - /data/mdtest/factors/daily-rolling/{td}_{HHMMSS}.csv 每分钟独立留档
-#     (与 minute 的根目录 HHMMSS.csv 互不互踩)
-#   - OSS minutes-daily-feature/{HHMMSS}.parquet 上传成功、列 schema 与 daily-feature 一致
-#   - 每 10 分钟 minute-trade-test/ 出两份 targets(全指+2000)及各自耗时
-#   - 早分钟(9:15-9:30)滚动因子的 NaN 比例 — v2 从未在此窗口被调用过
-#   - 容器 RSS 是否随时间缓涨(每分钟全市场大对象分配的碎片观察)
+# 不写任何生产共享 OSS 对象:
+#   - FACTOR_OSS_UPLOAD_ENABLED=false → 因子上传全关(OSS 读取不受影响)
+#   - COMPUTE_SCHEDULES 不含 daily(15:10) 与 daily_basic_refresh(15:30) —
+#     这两个写 daily-feature/daily.parquet 和 daily_basic, 是次日实盘输入,
+#     测试 Pod 绝不能碰; csi2000_signal 15:12 会等生产 Pod 15:10 的上传
+#
+# 计时观察点(只读):
+#   ① 每分钟 minute+minute_daily 两轮串行合计 <60s
+#   ② 10min 点双推理耗时(minute-trade-test 日志, 须远小于 600s)
+#   ③ 9:30 burst(open_position+csi2000_open)与 14:50 burst(daily_position
+#     +csi2000_position)在混合负载下的完成时间
+#   ④ daily-rolling/{td}_{HHMMSS}.csv 每分钟独立留档; minute-trade-test/
+#     每 10 分钟出全指+2000两份 targets
+#   ⑤ 早分钟(9:15-9:30)滚动因子 NaN 比例; 容器 RSS 是否缓涨
+#
+# 隔离: 独立节点标签(需先打: kubectl label nodes <node>
+# quant.lianghua.io/minute-daily-test=true) + emptyDir 数据目录。
+# 部署窗口: 交易日 08:00 前或非交易日(交易时段禁止 kubectl 写操作)。
+# 镜像: combined-engine:latest(部署前确认已按最新 HEAD 重建)。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,49 +61,73 @@ spec:
             - secretRef:
                 name: quant-secrets
           env:
-            # 只启用两套因子计算, 无任何交易 schedule
+            # ── 生产同款调度 + minute_daily(不含 daily/daily_basic_refresh) ──
             - name: COMPUTE_SCHEDULES
-              value: "minute,minute_daily"
+              value: "minute,minute_daily,open_position,daily_position,csi2000_open,csi2000_position,csi2000_signal"
             - name: MINUTE_RUN_INFERENCE
-              value: "false"
+              value: "false"                # 与生产一致: minute 只算因子
             - name: MINUTE_SKIP_TIMES
               value: "09:30"
             - name: COMPUTE_INTERVAL
               value: "60"
+            - name: MINUTE_DAILY_INTERVAL
+              value: "60"
+            # ── 模块(与生产一致) ──
             - name: FACTOR_MODULE
               value: "quant_platform.strategies.protected_eillen_intraday_strategy"
             - name: DAILY_FACTOR_MODULE
               value: "quant_platform.strategies.protected_eillen_strategy_v2"
-            # v2 只暴露多票 batch 入口(不设则每分钟全量调用失败零产出)
+            - name: INFERENCE_MODULE
+              value: "quant_platform.inference.tree_model_orders"
+            - name: TRADING_UNIVERSE_MODULE
+              value: "quant_platform.inference.trading_universe"
+            # v2 只暴露多票 batch 入口(不设则每分钟全量失败零产出)
             - name: DAILY_USE_MULTI_CODE
               value: "true"
             # 固定 end_time=150000(与生产一致, 决定 F_*_150000 列名与调用契约)
             - name: END_TIMES
               value: "150000"
-            # 10min 交易方案推理测试: 在固定时间点(默认 9:40→11:20 与
-            # 13:10→14:40 每 10 分钟一个共 22 点, 避开 9:30 开盘与 14:50
-            # 尾盘调仓)用最新滚动因子分别跑全指+2000推理, 只出 targets 落
-            # minute-trade-test/, 不构建订单不碰网关; 时间点可用
-            # MINUTE_TRADE_TEST_TIMES="HH:MM,..." 覆盖
+            # ── 虚盘推理供数(替代 order_context 的网关持仓查询) ──
+            - name: PORTFOLIO_CONTEXT_MODULE
+              value: "quant_platform.broker.virtual_context"
+            # ── 不写生产共享 OSS 对象(读取不受影响) ──
+            - name: FACTOR_OSS_UPLOAD_ENABLED
+              value: "false"
+            # ── 10min 双推理测试(固定时间点 9:40→11:20/13:10→14:40) ──
             - name: MINUTE_TRADE_TEST
               value: "true"
-            - name: INFERENCE_MODULE
-              value: "quant_platform.inference.tree_model_orders"
-            - name: TRADING_UNIVERSE_MODULE
-              value: "quant_platform.inference.trading_universe"
-            # 隔离目录(pod 内 emptyDir, 不碰节点引擎目录)
+            # ── 触发器(与生产同值, 显式声明便于核对) ──
+            - name: OPEN_POSITION_TRIGGER_TIME
+              value: "09:30"
+            - name: OPEN_POSITION_TRIGGER_DEADLINE
+              value: "09:35"
+            - name: DAILY_POSITION_TRIGGER_TIME
+              value: "14:50"
+            - name: CSI2000_OPEN_TRIGGER_TIME
+              value: "09:30"
+            - name: CSI2000_OPEN_DEADLINE
+              value: "09:45"
+            - name: CSI2000_POSITION_TRIGGER_TIME
+              value: "14:50"
+            - name: CSI2000_POSITION_DEADLINE
+              value: "15:00"
+            - name: CSI2000_SIGNAL_TRIGGER_TIME
+              value: "15:12"
+            # ── 隔离目录(pod 内 emptyDir, 不碰节点引擎目录) ──
             - name: NATIVE_SHM_DIR
               value: "/data/mdtest/shm"
             - name: FACTOR_OUTPUT_PATH
               value: "/data/mdtest/factors"
+            - name: CSI2000_OUT_DIR
+              value: "/data/mdtest/factors/csi2000"
             - name: COLLECTOR_DISK_OUTPUT
               value: "/data/mdtest/collector_output"
             - name: PIPELINE_LOG_DIR
               value: "/data/mdtest/pipeline_logs"
             - name: PIPELINE_LOG_FALLBACK_DIR
               value: "/tmp/mdtest_pipeline_logs"
-            # MDL 订阅(与引擎同配置; 注意: 第二条 MDL 云连接若被拒,
-            # 本测试会无行情 —— 这本身是"需要 feeder 中继"的架构证据)
+            # ── MDL 订阅(与引擎同配置; 第二条 MDL 云连接若被拒, 本测试
+            #    会无行情 — 这本身是"需要 feeder 中继"的架构证据) ──
             - name: MDL_USE_LOCAL_CLIENT
               value: "true"
             - name: MDL_IO_THREADS
@@ -134,7 +170,7 @@ spec:
               value: "3000000"
             - name: NATIVE_DEAL_ROWS_PER_STOCK
               value: "3000000"
-            # 归档全关(测试 pod 不写 OSS 原始数据)
+            # 归档全关(测试 Pod 不写 OSS 原始数据)
             - name: RAW_DATA_ARCHIVE_ENABLED
               value: "false"
             - name: ARCHIVE_INTERVAL
@@ -143,8 +179,9 @@ spec:
             requests:
               cpu: "2"
               memory: 32Gi
+            # 与生产同 limit(实际受节点核数封顶), 保证计时口径一致
             limits:
-              cpu: "30"
+              cpu: "44"
               memory: 120Gi
           volumeMounts:
             - mountPath: /data/mdtest
