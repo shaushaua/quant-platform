@@ -1,0 +1,147 @@
+# minute_daily 因子测试 Pod（非交易日/盘前部署，盘中自跑，全程无下单可能）
+#
+# 用途: 实测 0444baf 的 minute_daily 调度 —— minute(老min因子) + minute_daily
+# (v2日频模块滚动) 每分钟各算一轮串行, 验证正确性/耗时/OSS 上传。
+#
+# 隔离三保证:
+#   1. 只算因子: MINUTE_RUN_INFERENCE=false + 不含任何 csi2000/open_position
+#      schedule + 不配置任何 gateway env → 无推理、无下单代码路径可达。
+#   2. 独立节点: nodeSelector 独占标签, 与引擎节点物理分开(需先给测试节点
+#      打标签: kubectl label nodes <node> quant.lianghua.io/minute-daily-test=true)。
+#   3. 独立目录: SHM/因子输出全部 emptyDir, 不碰节点上 /data/factors、
+#      /data/quant/shm(引擎 hostPath)。
+#
+# 镜像: 复用 combined-engine:latest(含 0444baf 之后的新镜像, 部署前确认已重建)。
+# 部署窗口: 必须在 08:00 前(交易日)或非交易日 —— 交易时段禁止 kubectl 写操作。
+#
+# 观察要点(只读):
+#   - 每分钟两轮计算日志(耗时), 两轮合计应 <60s
+#   - /data/factors/daily-rolling/{HHMMSS}.csv 产物与 minute 的 {HHMMSS}.csv 同分钟共存
+#   - OSS minutes-daily-feature/{HHMMSS}.parquet 上传成功、列 schema 与 daily-feature 一致
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minute-daily-test
+  namespace: quant
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minute-daily-test
+  template:
+    metadata:
+      labels:
+        app: minute-daily-test
+    spec:
+      nodeSelector:
+        quant.lianghua.io/minute-daily-test: "true"
+      containers:
+        - name: minute-daily-test
+          image: 172.24.99.176:5000/quant-platform/combined-engine:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: quant-secrets
+          env:
+            # 只启用两套因子计算, 无任何交易 schedule
+            - name: COMPUTE_SCHEDULES
+              value: "minute,minute_daily"
+            - name: MINUTE_RUN_INFERENCE
+              value: "false"
+            - name: MINUTE_SKIP_TIMES
+              value: "09:30"
+            - name: COMPUTE_INTERVAL
+              value: "60"
+            - name: FACTOR_MODULE
+              value: "quant_platform.strategies.protected_eillen_intraday_strategy"
+            - name: DAILY_FACTOR_MODULE
+              value: "quant_platform.strategies.protected_eillen_strategy_v2"
+            - name: INFERENCE_MODULE
+              value: "quant_platform.inference.tree_model_orders"
+            - name: TRADING_UNIVERSE_MODULE
+              value: "quant_platform.inference.trading_universe"
+            # 隔离目录(pod 内 emptyDir, 不碰节点引擎目录)
+            - name: NATIVE_SHM_DIR
+              value: "/data/mdtest/shm"
+            - name: FACTOR_OUTPUT_PATH
+              value: "/data/mdtest/factors"
+            - name: COLLECTOR_DISK_OUTPUT
+              value: "/data/mdtest/collector_output"
+            - name: PIPELINE_LOG_DIR
+              value: "/data/mdtest/pipeline_logs"
+            - name: PIPELINE_LOG_FALLBACK_DIR
+              value: "/tmp/mdtest_pipeline_logs"
+            # MDL 订阅(与引擎同配置; 注意: 第二条 MDL 云连接若被拒,
+            # 本测试会无行情 —— 这本身是"需要 feeder 中继"的架构证据)
+            - name: MDL_USE_LOCAL_CLIENT
+              value: "true"
+            - name: MDL_IO_THREADS
+              value: "4"
+            - name: MDL_CALLBACK_MULTITHREAD
+              value: "true"
+            - name: MDL_SUBS
+              value: "4.4,4.24,6.28,6.33,6.36"
+            - name: MDL_FLUSH_INTERVAL_MS
+              value: "10"
+            - name: MDL_BATCH_SIZE
+              value: "2000"
+            - name: MDL_QUEUE_WARN_SIZE
+              value: "50000"
+            - name: MDL_QUEUE_HARD_LIMIT
+              value: "200000"
+            - name: MDL_LOCAL_SPLIT_SUBS
+              value: "true"
+            - name: MDL_TCP_OUTPUT_BUFFER_MAX
+              value: "2048000"
+            - name: MDL_LOG_PATH
+              value: "/data/mdtest/mdl_logs/mdl"
+            - name: IDX_CONS_CODES
+              value: "000300,000905,000852,000985,932000"
+            - name: FACTOR_WORKERS
+              value: "6"
+            - name: ENGINE_MODE
+              value: "native"
+            - name: TZ
+              value: "Asia/Shanghai"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: SHM_STORE_BACKEND
+              value: "native"
+            - name: NATIVE_ROWS_PER_STOCK
+              value: "200000"
+            - name: NATIVE_TICK_ROWS_PER_STOCK
+              value: "50000"
+            - name: NATIVE_ORDER_ROWS_PER_STOCK
+              value: "3000000"
+            - name: NATIVE_DEAL_ROWS_PER_STOCK
+              value: "3000000"
+            # 归档全关(测试 pod 不写 OSS 原始数据)
+            - name: RAW_DATA_ARCHIVE_ENABLED
+              value: "false"
+            - name: ARCHIVE_INTERVAL
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 32Gi
+            limits:
+              cpu: "30"
+              memory: 120Gi
+          volumeMounts:
+            - mountPath: /data/mdtest
+              name: mdtest-data
+      volumes:
+        - name: mdtest-data
+          emptyDir: {}
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: quant
+        - effect: NoSchedule
+          key: node.kubernetes.io/disk-pressure
+          operator: Exists
+      dnsPolicy: ClusterFirstWithHostNet
+      hostNetwork: true
