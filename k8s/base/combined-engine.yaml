@@ -135,7 +135,7 @@ spec:
             - name: MINUTE_SKIP_TIMES
               value: "09:30"
             - name: COMPUTE_SCHEDULES
-              value: "minute,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal,csi2000_open"
+              value: "minute,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
             # 中证2000独立信号: 15:12 产出 targets 到 /data/factors/csi2000/
             # 与全指信号共用因子/模型, 池/基准(932000)/资金独立, 虚拟盘不下单
             - name: CSI2000_SIGNAL_TRIGGER_TIME
@@ -146,6 +146,12 @@ spec:
               value: "09:30"
             - name: CSI2000_OPEN_DEADLINE
               value: "09:45"
+            # 中证2000 14:50 盘中调仓: 与全指 daily_position 同频同口径,
+            # 用当天现算 {td}_145000.csv 因子(handler 等待 daily_position 产出)
+            - name: CSI2000_POSITION_TRIGGER_TIME
+              value: "14:50"
+            - name: CSI2000_POSITION_DEADLINE
+              value: "15:00"
             # virtual(默认): 虚拟盘落盘; yinhe: 实盘走银河启明(gateway broker=yinhe)
             - name: CSI2000_BROKER
               value: "virtual"

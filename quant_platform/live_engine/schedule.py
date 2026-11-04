@@ -305,4 +305,24 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             is_daily_result=False,
         ))
 
+    if "csi2000_position" in enabled:
+        # 中证2000 14:50 盘中调仓: 与全指 daily_position 同频同口径。
+        # 因子 = 引擎当天现算的 {td}_145000.csv(handler 内轮询等待
+        # daily_position 产出, 不依赖 15:10 才上传的 OSS daily 因子);
+        # 执行 = 与 09:30 csi2000_open 同一实盘链(银河账户, 皓兴 VWAP)。
+        t = _parse_trigger_time(
+            os.environ.get("CSI2000_POSITION_TRIGGER_TIME", "14:50"),
+            (14, 50), "CSI2000_POSITION_TRIGGER_TIME")
+        deadline = _parse_trigger_time(
+            os.environ.get("CSI2000_POSITION_DEADLINE", "15:00"),
+            (15, 0), "CSI2000_POSITION_DEADLINE")
+        schedules.append(ComputationSchedule(
+            name="csi2000_position",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            trigger_deadline=deadline,
+            run_inference=False,
+            is_daily_result=False,
+        ))
+
     return schedules

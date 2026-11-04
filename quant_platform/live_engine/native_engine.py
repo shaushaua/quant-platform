@@ -3516,6 +3516,32 @@ class NativeEngine:
         except Exception as exc:
             logger.error("[csi2000_signal] failed: %s", exc, exc_info=True)
 
+    def _run_csi2000_position_safe(self) -> None:
+        """csi2000_position schedule 入口: 14:50 实盘调仓(当天现算因子 → 银河账户),
+        异常全吞 + 飞书告警, 不影响全指主链路。
+
+        内部等待全指 daily_position 产出 {td}_145000.csv(最多 10 分钟) —
+        全指 14:50 因子没出来时 2000 同步不交易(fail 一致), 超时飞书告警。
+        """
+        try:
+            from ..inference.csi2000_product import run_csi2000_position
+            td = self.trading_day
+            if not td:
+                logger.error("[csi2000_position] trading_day empty, skip")
+                return
+            orders = run_csi2000_position(td)
+            n = 0 if orders is None else len(orders)
+            logger.info("[csi2000_position] done trading_day=%s orders=%d", td, n)
+            from ..utils.notify import feishu_alert
+            feishu_alert("csi2000-14:50调仓完成", f"{td}: 推单 {n} 笔(银河账户, 皓兴VWAP)")
+        except Exception as exc:
+            logger.error("[csi2000_position] failed: %s", exc, exc_info=True)
+            try:
+                from ..utils.notify import feishu_alert
+                feishu_alert("csi2000-14:50调仓失败", f"{self.trading_day}: {exc}")
+            except Exception:
+                pass
+
     def _refresh_daily_basic_upload(self) -> None:
         """盘后 15:30 trigger: 重新生成并上传 T-0 和 T-1 daily_basic + composition 到 OSS。
 
@@ -4562,6 +4588,13 @@ class NativeEngine:
                         elif schedule.name == "csi2000_open":
                             t = threading.Thread(
                                 target=self._run_csi2000_open_safe,
+                                daemon=True,
+                            )
+                        # 中证2000 14:50 盘中调仓: 与全指 daily_position 同频,
+                        # 用当天现算因子, 独立线程 + 异常全吞(含飞书告警)
+                        elif schedule.name == "csi2000_position":
+                            t = threading.Thread(
+                                target=self._run_csi2000_position_safe,
                                 daemon=True,
                             )
                         else:

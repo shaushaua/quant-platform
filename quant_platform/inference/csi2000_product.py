@@ -14,6 +14,9 @@
 触发方式:
   引擎内: COMPUTE_SCHEDULES 含 "csi2000_signal" (schedule.py 注册,
           CSI2000_SIGNAL_TRIGGER_TIME 默认 15:12, daily 因子产出后)
+          含 "csi2000_open" (09:30, T-1 因子现场推理建仓/调仓)
+          含 "csi2000_position" (14:50, 用 daily_position 现算的
+          {td}_145000.csv 盘中调仓, 与全指 14:50 同频)
   手动:   scripts/csi2000_signal.py --date YYYYMMDD (同一核心逻辑)
 
 输出: {OUT_DIR}/csi2000_targets_{date}.csv    目标持仓(信号)
@@ -25,6 +28,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
@@ -399,12 +403,15 @@ def _load_close_prices(trading_day: str) -> pd.Series:
 def run_csi2000_signal(trading_day: str,
                        broker: Optional[BrokerAdapter] = None,
                        factor_date: Optional[str] = None,
-                       push: bool = True) -> Optional[pd.DataFrame]:
+                       push: bool = True,
+                       factor_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
     """产出中证2000 targets。供引擎 schedule 与手动 CLI 共用。
 
     factor_date: 因子所用日期。默认=trading_day(15:12 盘后信号用当日
     daily 因子); 9:30 实盘执行传 T-1(与全指 open_position 同口径:
     T-1 因子 + 当前账户现场推理, 不是读缓存)。
+    factor_df: 直接传入因子(如 14:50 调仓用引擎现算的 {td}_145000.csv),
+    提供时不再走 OSS 加载, factor_date 被忽略。
 
     返回 targets DataFrame; 失败抛异常(引擎侧 catch 并记日志,不影响其他 schedule)。
     """
@@ -417,7 +424,11 @@ def run_csi2000_signal(trading_day: str,
     universe_df = pd.DataFrame({"code": universe_codes})
     logger.info("[csi2000] universe: %d 只(纯2000池)", len(universe_codes))
 
-    factors = load_daily_factors(factor_date or trading_day)
+    if factor_df is not None:
+        factors = factor_df
+        logger.info("[csi2000] 使用传入因子: %d 行, %d 列", len(factors), len(factors.columns))
+    else:
+        factors = load_daily_factors(factor_date or trading_day)
     ctx = broker.get_positions(trading_day)
 
     from quant_platform.inference.tree_model_inference import inference
@@ -553,21 +564,34 @@ def run_csi2000_open(trading_day: str,
     if targets is None or targets.empty:
         raise RuntimeError("csi2000-open: inference 未产出 targets")
 
-    # 3) 真实账户(与 run_csi2000_signal 内部同一 ctx, 重取一次拿最新)
+    # 3~6) 实盘差额订单 → 资金预检 → 推单(与 14:50 调仓共用同一执行链)
+    return _push_targets_live(targets, broker, trading_day, tag="open")
+
+
+def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
+                       trading_day: str, tag: str) -> pd.DataFrame:
+    """实盘执行共用链(9:30 open 与 14:50 调仓同一份代码): 差额订单 → 资金预检 → 推单。
+
+    单一入口: 两处触发时序不同, 但预检/截断/落盘规则必须始终一致,
+    分开维护会在实盘上漂移出两套行为。
+    """
+    from ..utils.notify import feishu_alert
+
+    # 真实账户(与 run_csi2000_signal 内部同一 ctx, 重取一次拿最新)
     ctx = broker.get_positions(trading_day)
     acct = getattr(ctx, "account", None)
     total_asset = float(acct["total_asset"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
     avail = float(acct["available_cash"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
-    logger.info("[csi2000-open] 账户: 总资产 %.0f, 可用 %.0f, 持仓 %d 只",
-                total_asset, avail, len(getattr(ctx, "positions", pd.DataFrame())))
+    logger.info("[csi2000-%s] 账户: 总资产 %.0f, 可用 %.0f, 持仓 %d 只",
+                tag, total_asset, avail, len(getattr(ctx, "positions", pd.DataFrame())))
 
-    # 4) 差额订单(真实资金 sizing + 清仓)
+    # 差额订单(真实资金 sizing + 清仓)
     orders = _targets_to_orders(targets, ctx, trading_day, capital=total_asset)
     if orders.empty:
-        logger.info("[csi2000-open] 无差额订单(已到位)")
+        logger.info("[csi2000-%s] 无差额订单(已到位)", tag)
         return orders
 
-    # 5) 可用资金预检: 买单额 ≤ 可用现金 + 卖单估值×0.9(T+1 卖出回笼按折价计)
+    # 可用资金预检: 买单额 ≤ 可用现金 + 卖单估值×0.9(T+1 卖出回笼按折价计)
     buys = orders[orders["side"] == "buy"]
     sells = orders[orders["side"] == "sell"]
     buy_amt = float((buys["volume"] * buys["price"]).sum()) if len(buys) else 0.0
@@ -585,17 +609,67 @@ def run_csi2000_open(trading_day: str,
         buys = buys.assign(_amt=buys["volume"] * buys["price"]).sort_values("_amt", ascending=False)
         buys = buys.head(keep_n).drop(columns="_amt")
         orders = pd.concat([buys, sells], ignore_index=True)
-        logger.warning("[csi2000-open] 买单按预算 %.0f%% 截断: 保留 %d 笔",
-                       ratio * 100, len(buys))
+        logger.warning("[csi2000-%s] 买单按预算 %.0f%% 截断: 保留 %d 笔",
+                       tag, ratio * 100, len(buys))
 
-    # 6) 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205)
+    # 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205)
     ok = broker.push_orders(orders, trading_day)
     if ok:
-        logger.info("[csi2000-open] 已推 %d 笔(买 %d/卖 %d, 买额 %.0f万)",
-                    len(orders), len(buys), len(sells), buy_amt / 1e4)
-        od_path = OUT_DIR / f"csi2000_open_orders_{trading_day}.csv"
+        logger.info("[csi2000-%s] 已推 %d 笔(买 %d/卖 %d, 买额 %.0f万)",
+                    tag, len(orders), len(buys), len(sells), buy_amt / 1e4)
+        od_path = OUT_DIR / f"csi2000_{tag}_orders_{trading_day}.csv"
         orders.to_csv(od_path, index=False)
     return orders
+
+
+def run_csi2000_position(trading_day: str,
+                         broker: Optional[BrokerAdapter] = None,
+                         factor_file: Optional[str] = None,
+                         wait_seconds: int = 600) -> Optional[pd.DataFrame]:
+    """14:50 盘中调仓: 与全指 daily_position 同频同口径, 推银河实盘。
+
+    因子来源 = 引擎 daily_position 14:50 现算的本地 {td}_145000.csv
+    (正式 daily 因子 15:10 才上传 OSS, 盘中拿不到; 这也是全指 14:50
+    下单用的同一份因子)。等待文件出现且为当日产出, 超时飞书告警并放弃 —
+    全指 14:50 没产出因子时 2000 同步不交易(fail 一致)。
+    执行与 run_csi2000_open 完全同一实盘链(真实持仓/资金 sizing →
+    资金预检 → 银河 gateway)。
+    """
+    from ..utils.notify import feishu_alert
+    from datetime import datetime as _dt
+
+    broker = broker or get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
+
+    path = Path(factor_file) if factor_file else (
+        Path(os.environ.get("FACTOR_OUTPUT_PATH", "/data/factors"))
+        / f"{trading_day}_145000.csv")
+    # 新鲜度按"当日产出"判定(mtime ≥ 当日 00:00): 该文件只有 daily_position
+    # 会写, 同日文件必为当天 14:50 计算, 不必卡到具体时分(跨时区/回补更稳)。
+    cutoff = _dt.strptime(trading_day, "%Y%m%d").timestamp()
+    deadline = time.time() + wait_seconds
+    factor_df: Optional[pd.DataFrame] = None
+    while time.time() < deadline:
+        try:
+            if path.is_file() and path.stat().st_mtime >= cutoff:
+                df = pd.read_csv(path)
+                if len(df) > 100 and any(c.startswith("F_") for c in df.columns):
+                    factor_df = df
+                    break
+                logger.warning("[csi2000-position] 因子文件未就绪(%d 行), 继续等待", len(df))
+        except Exception:
+            pass  # 与 daily_position 写入并发读到半文件, 下一轮重试
+        time.sleep(min(5, max(0.2, deadline - time.time())))
+    if factor_df is None:
+        msg = f"{trading_day}: 未等到 14:50 因子文件({path}), 2000 调仓放弃"
+        logger.error("[csi2000-position] %s", msg)
+        feishu_alert("csi2000-14:50因子超时", msg)
+        raise RuntimeError(msg)
+    logger.info("[csi2000-position] 使用盘中现算因子: %s (%d 行)", path, len(factor_df))
+
+    targets = run_csi2000_signal(trading_day, broker=broker, factor_df=factor_df, push=False)
+    if targets is None or targets.empty:
+        raise RuntimeError("csi2000-position: inference 未产出 targets")
+    return _push_targets_live(targets, broker, trading_day, tag="position")
 
 
 def _write_virtual_positions(trading_day: str, targets: pd.DataFrame,
