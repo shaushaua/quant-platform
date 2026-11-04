@@ -4032,13 +4032,16 @@ class NativeEngine:
                 if portfolio_context is None:
                     return
 
-                # 9:26 竞价价的一字板剔除 + 权重等比重分配(尽力而为):
+                # 9:30 剔除+权重等比重分配(尽力而为): 优先用 SHM 实时价
+                # (能抓 9:26→9:30 间新封板的票并重分配), 竞价价兜底;
                 # 拿不到价格默认未涨停, 不剔除不重分配, 直接进转单。
+                # 转单内部的涨停兜底(interface.py)仍保留, 只剔不重分配 —
+                # 两层语义: 本层=主力(剔+重分配), 转单层=最后保险(只剔)。
                 try:
                     cached_targets = self._drop_and_renormalize_targets(
                         cached_targets, portfolio_context,
-                        price_source=self._auction_prices
-                        or self._snapshot_latest_prices() or {})
+                        price_source=self._snapshot_latest_prices()
+                        or self._auction_prices or {})
                 except Exception as exc:
                     logger.warning("[open_position] 竞价涨停剔除失败(跳过, 直接转单): %s", exc)
 
