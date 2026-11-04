@@ -256,6 +256,14 @@ class TestCsi2000Position(unittest.TestCase):
         # 000001(0.50权重)被剔 → 释放权重重分配: 000002 权重 0.10 → 0.60
         # want = int(0.6*1e7/9.5/100)*100 = 631500 股
         self.assertEqual(got, {("000002", "buy", 631_500)})
+        # 预检模式(push=False): 全流程跑但不推单, 返回订单包
+        pre = cp.run_csi2000_open(
+            self.td, broker=broker, targets_override=override,
+            latest_prices={"000001": 10.0, "000002": 9.5},
+            limit_prices={"000001": (10.0, 9.0), "000002": (10.5, 9.5)},
+            push=False)
+        self.assertEqual(len(broker.pushed), 1)   # 没有新增推送
+        self.assertEqual(len(pre), 1)             # 订单包就绪
 
     def test_resolve_factor_date_falls_back(self, *mocks):
         """OSS 全部 404 时回退 7 天(stub 桶 head 必抛)。"""

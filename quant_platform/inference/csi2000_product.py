@@ -548,13 +548,16 @@ def run_csi2000_open(trading_day: str,
                      broker: Optional[BrokerAdapter] = None,
                      targets_override: Optional[pd.DataFrame] = None,
                      latest_prices: Optional[dict] = None,
-                     limit_prices: Optional[dict] = None) -> Optional[pd.DataFrame]:
+                     limit_prices: Optional[dict] = None,
+                     push: bool = True) -> Optional[pd.DataFrame]:
     """9:30/9:31 实盘执行入口: 与全指 open_position 同口径 — 现场推理, 不读缓存。
 
     targets_override: 预计算(open_precompute)已算好的 targets 直接传入,
     跳过因子加载与推理(9:31 只剩过滤+差额+推单, 秒级); None 则现场算。
     latest_prices/limit_prices: 可选的实时价/涨跌停表(code6 → (high, low)),
     提供时在推单前剔除"未持有且已涨停"的买单(竞价价判断, 防资金冻结)。
+    push=False: 9:26 预检模式 — 剔除/重分配/差额/资金预检全跑, 只不推单
+    不落盘, 返回订单包供 9:30 直接推送(风险全部前移到 9:26 发现)。
 
     流程(对称全指):
       T-1 daily 因子 + 2000池/基准 → inference 现场算 targets →
@@ -584,20 +587,25 @@ def run_csi2000_open(trading_day: str,
 
     # 3~6) 实盘差额订单 → 资金预检 → 推单(与 14:50 调仓共用同一执行链)
     return _push_targets_live(targets, broker, trading_day, tag="open",
-                              latest_prices=latest_prices, limit_prices=limit_prices)
+                              latest_prices=latest_prices, limit_prices=limit_prices,
+                              push=push)
 
 
 def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
                        trading_day: str, tag: str,
                        latest_prices: Optional[dict] = None,
-                       limit_prices: Optional[dict] = None) -> pd.DataFrame:
+                       limit_prices: Optional[dict] = None,
+                       push: bool = True) -> pd.DataFrame:
     """实盘执行共用链(9:30 open 与 14:50 调仓同一份代码): 差额订单 → 资金预检 → 推单。
 
     单一入口: 两处触发时序不同, 但预检/截断/落盘规则必须始终一致,
     分开维护会在实盘上漂移出两套行为。
-    latest_prices/limit_prices 提供时, 先剔除"未持有且已涨停"的买单 —
+    latest_prices/limit_prices 提供时, 先剔除"未持有且已涨停"的买单并
+    把释放权重按比例重分配 —
     涨停买不进, VWAP 挂到过期只会冻结资金; 持仓内的票不剔(卖出/加仓
     不受一字板影响, 由资金预检与算法端兜底)。
+    push=False: 预检模式 — 全流程跑到资金预检为止, 不推单不落盘,
+    返回订单包(9:26 预建, 9:30 直接推)。
     """
     from ..utils.notify import feishu_alert
 
@@ -667,7 +675,12 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
         logger.warning("[csi2000-%s] 买单按预算 %.0f%% 截断: 保留 %d 笔",
                        tag, ratio * 100, len(buys))
 
-    # 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205)
+    # 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205);
+    # push=False 预检模式到此为止, 订单包直接返回
+    if not push:
+        logger.info("[csi2000-%s] 预检完成(未推单): %d 笔订单就绪, 9:30 直接推",
+                    tag, len(orders))
+        return orders
     ok = broker.push_orders(orders, trading_day)
     if ok:
         logger.info("[csi2000-%s] 已推 %d 笔(买 %d/卖 %d, 买额 %.0f万)",

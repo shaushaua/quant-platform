@@ -649,6 +649,9 @@ class NativeEngine:
         # auction_fetch(9:26)取的集合竞价价(code6 → price), 9:30 推单前
         # 涨停过滤用; 为空 = 过滤降级, 直接推(调仓优先于过滤)
         self._auction_prices: dict = {}
+        # 9:26 预建的 csi2000 订单包(剔除/重分配/差额/资金预检全过),
+        # 9:30 一次性推送; None = 预检未跑/失败, 9:30 走现场路径
+        self._csi2000_preflight_orders: Optional[pd.DataFrame] = None
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
         # _cached_shm_files was removed — SHM files are created lazily by the
@@ -3495,22 +3498,38 @@ class NativeEngine:
             if not td:
                 logger.error("[csi2000_open] trading_day empty, skip")
                 return
-            # 预计算(9:1x)的 targets 一次性消费; 竞价价(auction_fetch 9:26
-            # 已取)+涨跌停表传给执行链, 剔除"未持有且一字涨停"的买单;
-            # 竞价价缺失时回退 SHM 实时价, 再缺则不过滤直接推(调仓优先)
-            pre_targets = self._csi2000_open_targets
-            self._csi2000_open_targets = None
-            if pre_targets is not None:
-                logger.info("[csi2000_open] using precomputed targets: %d rows",
-                            len(pre_targets))
-            latest = self._auction_prices or self._snapshot_latest_prices() or {}
-            limits = dict(self._daily_limit_prices) if self._daily_limit_prices else None
-            orders = run_csi2000_open(
-                td,
-                targets_override=pre_targets,
-                latest_prices=latest or None,
-                limit_prices=limits or None,
-            )
+            # 9:26 预建的订单包(剔除/重分配/差额/预检全过)直接推送 —
+            # 9:30 只剩一个推送动作; 预建缺失/为空走现场路径兜底
+            pre_orders = self._csi2000_preflight_orders
+            self._csi2000_preflight_orders = None
+            if pre_orders is not None and not pre_orders.empty:
+                from ..inference.csi2000_product import get_broker, OUT_DIR
+                broker = get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
+                logger.info("[csi2000_open] pushing prebuilt orders: %d rows", len(pre_orders))
+                broker.push_orders(pre_orders, td)
+                try:
+                    pre_orders.to_csv(OUT_DIR / f"csi2000_open_orders_{td}.csv",
+                                      index=False)
+                except Exception:
+                    pass
+                orders = pre_orders
+            else:
+                # 预计算(9:1x)的 targets 一次性消费; 竞价价(auction_fetch 9:26
+                # 已取)+涨跌停表传给执行链, 剔除"未持有且一字涨停"的买单;
+                # 竞价价缺失时回退 SHM 实时价, 再缺则不过滤直接推(调仓优先)
+                pre_targets = self._csi2000_open_targets
+                self._csi2000_open_targets = None
+                if pre_targets is not None:
+                    logger.info("[csi2000_open] using precomputed targets: %d rows",
+                                len(pre_targets))
+                latest = self._auction_prices or self._snapshot_latest_prices() or {}
+                limits = dict(self._daily_limit_prices) if self._daily_limit_prices else None
+                orders = run_csi2000_open(
+                    td,
+                    targets_override=pre_targets,
+                    latest_prices=latest or None,
+                    limit_prices=limits or None,
+                )
             n = 0 if orders is None else len(orders)
             logger.info("[csi2000_open] done trading_day=%s orders=%d", td, n)
             feishu_alert("csi2000-开盘执行完成", f"{td}: 推单 {n} 笔(银河账户, 皓兴VWAP)")
@@ -3743,6 +3762,52 @@ class NativeEngine:
                              f"{limit_hits[:15]}")
             logger.info("[auction_fetch] 竞价价 %d/%d 只, 一字涨停 %d 只",
                         len(self._auction_prices), len(codes), len(limit_hits))
+
+            # ── 全指: 剔除+重分配提前到 9:26(新代码的风险前移; 9:30 幂等
+            #    重跑作兜底) ──
+            try:
+                with self._open_position_cache_lock:
+                    qz = self._open_position_cache
+                if qz is not None and not qz.empty:
+                    pctx = self._load_open_position_portfolio_context(
+                        td, "093000", "auction-preflight")
+                    if pctx is not None:
+                        filtered = self._drop_and_renormalize_targets(
+                            qz, pctx, price_source=self._auction_prices)
+                        with self._open_position_cache_lock:
+                            self._open_position_cache = filtered
+                        feishu_alert("全指-竞价预检完成",
+                                     f"{td}: targets {len(filtered)} 只已剔除涨停并重分配, "
+                                     "9:30 直接转单")
+            except Exception as exc:
+                logger.warning("[auction_fetch] 全指预检失败(9:30 兜底重跑): %s", exc)
+
+            # ── 2000: 剔除+重分配+差额+资金预检全跑, 预建订单包 ──
+            try:
+                if self._csi2000_open_targets is not None:
+                    from ..inference.csi2000_product import get_broker, run_csi2000_open
+                    broker = get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
+                    self._csi2000_open_targets = self._drop_and_renormalize_targets(
+                        self._csi2000_open_targets, broker.get_positions(td),
+                        price_source=self._auction_prices)
+                    orders = run_csi2000_open(
+                        td, broker=broker,
+                        targets_override=self._csi2000_open_targets,
+                        latest_prices=self._auction_prices or None,
+                        limit_prices=dict(self._daily_limit_prices) or None,
+                        push=False)
+                    self._csi2000_preflight_orders = orders
+                    n = 0 if orders is None else len(orders)
+                    buys = 0 if orders is None else int((orders["side"] == "buy").sum())
+                    amt = 0.0 if orders is None else float(
+                        (orders["volume"] * orders["price"]).sum()) / 1e4
+                    feishu_alert("csi2000-订单包预建完成",
+                                 f"{td}: {n} 笔(买{buys}), 总额 {amt:.0f}万 — 9:30 直接推银河")
+            except Exception as exc:
+                self._csi2000_preflight_orders = None
+                logger.error("[auction_fetch] csi2000 预建失败(9:30 走现场路径): %s",
+                             exc, exc_info=True)
+                feishu_alert("csi2000-订单包预建失败(9:30 现场算)", f"{td}: {exc}")
         except Exception as exc:
             self._auction_prices = {}
             logger.error("[auction_fetch] failed: %s", exc, exc_info=True)
