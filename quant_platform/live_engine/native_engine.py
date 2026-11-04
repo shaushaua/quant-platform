@@ -3543,8 +3543,40 @@ class NativeEngine:
                 pass
 
     # ── 10 分钟交易方案·推理测试挂钩(仅测试 Pod, env 默认关) ──────────
+    @staticmethod
+    def _minute_trade_test_points() -> frozenset:
+        """10 分钟推理测试的固定触发时间点(HH, MM)。
+
+        默认盘中 22 个点: 9:40→11:20 与 13:10→14:40 每 10 分钟一个 —
+        避开 9:30 开盘建仓(留 10 分钟稳定期)与 14:50 尾盘调仓(留 10 分钟
+        缓冲), 午休 11:30-13:00 无行情不触发。
+        env MINUTE_TRADE_TEST_TIMES="HH:MM,HH:MM,..." 可覆盖。
+        """
+        raw = os.environ.get("MINUTE_TRADE_TEST_TIMES", "")
+        if raw.strip():
+            points = set()
+            for item in raw.split(","):
+                item = item.strip()
+                parts = item.split(":")
+                try:
+                    h, m = int(parts[0]), int(parts[1])
+                except (ValueError, IndexError):
+                    logger.warning("[minute-trade-test] 忽略无效时间点: %r", item)
+                    continue
+                if 0 <= h < 24 and 0 <= m < 60:
+                    points.add((h, m))
+            return frozenset(points)
+        return frozenset(
+            [(9, m) for m in (40, 50)]
+            + [(10, m) for m in (0, 10, 20, 30, 40, 50)]
+            + [(11, m) for m in (0, 10, 20)]
+            + [(13, m) for m in (10, 20, 30, 40, 50)]
+            + [(14, m) for m in (0, 10, 20, 30, 40)]
+        )
+
     def _compute_minute_daily(self, schedule) -> None:
-        """minute_daily 计算包装: 因子算完后, 每 10 分钟节拍追加双产品推理。
+        """minute_daily 计算包装: 因子算完后, 在固定时间点(默认盘中每 10
+        分钟一个, 见 _minute_trade_test_points)用最新滚动因子追加双产品推理。
 
         MINUTE_TRADE_TEST 未开启时与 _compute_and_output 完全等价(生产
         COMPUTE_SCHEDULES 不含 minute_daily, 双保险零影响)。推理只出
@@ -3555,7 +3587,8 @@ class NativeEngine:
         self._compute_and_output(schedule)
         if os.environ.get("MINUTE_TRADE_TEST", "").lower() not in {"1", "true", "yes", "y", "on"}:
             return
-        if datetime.now().minute % 10 != 0:
+        now = datetime.now()
+        if (now.hour, now.minute) not in self._minute_trade_test_points():
             return
         try:
             self._minute_trade_test_infer()

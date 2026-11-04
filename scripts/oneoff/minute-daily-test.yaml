@@ -68,9 +68,11 @@ spec:
             # 固定 end_time=150000(与生产一致, 决定 F_*_150000 列名与调用契约)
             - name: END_TIMES
               value: "150000"
-            # 10min 交易方案推理测试: minute_daily 算完因子后每 10 分钟
-            # (HH:00/10/20/30/40/50) 用最新滚动因子分别跑全指+2000推理,
-            # 只出 targets 落 minute-trade-test/, 不构建订单不碰网关
+            # 10min 交易方案推理测试: 在固定时间点(默认 9:40→11:20 与
+            # 13:10→14:40 每 10 分钟一个共 22 点, 避开 9:30 开盘与 14:50
+            # 尾盘调仓)用最新滚动因子分别跑全指+2000推理, 只出 targets 落
+            # minute-trade-test/, 不构建订单不碰网关; 时间点可用
+            # MINUTE_TRADE_TEST_TIMES="HH:MM,..." 覆盖
             - name: MINUTE_TRADE_TEST
               value: "true"
             - name: INFERENCE_MODULE
