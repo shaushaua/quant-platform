@@ -522,9 +522,39 @@ def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str,
     return pd.DataFrame(rows)
 
 
+def resolve_recent_factor_date(trading_day: str) -> str:
+    """找最近一份已上传的 daily 因子日期(当日 15:10 才产出, 盘前必回退 T-1)。
+
+    供 9:31 实盘执行与 9:1x 预计算共用同一口径。
+    """
+    import oss2 as _oss2
+    from quant_platform.data.oss_loader import OSSDataLoader
+    from datetime import datetime as _dt, timedelta as _td
+
+    auth = _oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
+    rb = _oss2.Bucket(auth, os.environ["OSS_ENDPOINT"], "stock-mdl-data-result")
+    factor_date = trading_day
+    for _ in range(7):
+        try:
+            rb.head_object(_daily_factor_key(factor_date))
+            break
+        except Exception:
+            d = _dt.strptime(factor_date, "%Y%m%d") - _td(days=1)
+            factor_date = d.strftime("%Y%m%d")
+    return factor_date
+
+
 def run_csi2000_open(trading_day: str,
-                     broker: Optional[BrokerAdapter] = None) -> Optional[pd.DataFrame]:
-    """9:30 实盘执行入口: 与全指 open_position 同口径 — 现场推理, 不读缓存。
+                     broker: Optional[BrokerAdapter] = None,
+                     targets_override: Optional[pd.DataFrame] = None,
+                     latest_prices: Optional[dict] = None,
+                     limit_prices: Optional[dict] = None) -> Optional[pd.DataFrame]:
+    """9:30/9:31 实盘执行入口: 与全指 open_position 同口径 — 现场推理, 不读缓存。
+
+    targets_override: 预计算(open_precompute)已算好的 targets 直接传入,
+    跳过因子加载与推理(9:31 只剩过滤+差额+推单, 秒级); None 则现场算。
+    latest_prices/limit_prices: 可选的实时价/涨跌停表(code6 → (high, low)),
+    提供时在推单前剔除"未持有且已涨停"的买单(竞价价判断, 防资金冻结)。
 
     流程(对称全指):
       T-1 daily 因子 + 2000池/基准 → inference 现场算 targets →
@@ -535,45 +565,39 @@ def run_csi2000_open(trading_day: str,
     VWAP 算法执行端会用市场实时价, 折股误差在 ±10% 涨跌幅内。
     """
     from ..utils.notify import feishu_alert
-    from quant_platform.data.oss_loader import OSSDataLoader
-    import oss2 as _oss2
 
     broker = broker or get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
 
-    # 1) 找 T-1(最近一份已上传的 daily 因子, 当日 15:10 才有)
-    oss = OSSDataLoader(base_path="2026")
-    auth = _oss2.Auth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"])
-    rb = _oss2.Bucket(auth, os.environ["OSS_ENDPOINT"], "stock-mdl-data-result")
-    from datetime import datetime as _dt, timedelta as _td
-    factor_date = trading_day
-    for _ in range(7):
-        try:
-            rb.head_object(_daily_factor_key(factor_date))
-            break
-        except Exception:
-            d = _dt.strptime(factor_date, "%Y%m%d") - _td(days=1)
-            factor_date = d.strftime("%Y%m%d")
-    if factor_date == trading_day:
-        # 当日因子 9:30 不可能存在(15:10 产出), 上面循环必然回退;
-        # 仍相等说明 head 成功 — 不该发生, 防御性跳过
-        pass
-    logger.info("[csi2000-open] 现场推理: 因子=%s 执行日=%s", factor_date, trading_day)
-
-    # 2) 现场算 targets(真实账户 ctx 供优化器 invested_frac/sizing)
-    targets = run_csi2000_signal(trading_day, broker=broker, factor_date=factor_date, push=False)
+    if targets_override is not None:
+        targets = targets_override
+        logger.info("[csi2000-open] 使用预计算 targets: %d 只(9:1x 已算, 跳过现场推理)",
+                    len(targets))
+    else:
+        # 1) 找 T-1(最近一份已上传的 daily 因子, 当日 15:10 才有)
+        factor_date = resolve_recent_factor_date(trading_day)
+        logger.info("[csi2000-open] 现场推理: 因子=%s 执行日=%s", factor_date, trading_day)
+        # 2) 现场算 targets(真实账户 ctx 供优化器 invested_frac/sizing)
+        targets = run_csi2000_signal(trading_day, broker=broker,
+                                     factor_date=factor_date, push=False)
     if targets is None or targets.empty:
         raise RuntimeError("csi2000-open: inference 未产出 targets")
 
     # 3~6) 实盘差额订单 → 资金预检 → 推单(与 14:50 调仓共用同一执行链)
-    return _push_targets_live(targets, broker, trading_day, tag="open")
+    return _push_targets_live(targets, broker, trading_day, tag="open",
+                              latest_prices=latest_prices, limit_prices=limit_prices)
 
 
 def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
-                       trading_day: str, tag: str) -> pd.DataFrame:
+                       trading_day: str, tag: str,
+                       latest_prices: Optional[dict] = None,
+                       limit_prices: Optional[dict] = None) -> pd.DataFrame:
     """实盘执行共用链(9:30 open 与 14:50 调仓同一份代码): 差额订单 → 资金预检 → 推单。
 
     单一入口: 两处触发时序不同, 但预检/截断/落盘规则必须始终一致,
     分开维护会在实盘上漂移出两套行为。
+    latest_prices/limit_prices 提供时, 先剔除"未持有且已涨停"的买单 —
+    涨停买不进, VWAP 挂到过期只会冻结资金; 持仓内的票不剔(卖出/加仓
+    不受一字板影响, 由资金预检与算法端兜底)。
     """
     from ..utils.notify import feishu_alert
 
@@ -584,6 +608,29 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
     avail = float(acct["available_cash"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
     logger.info("[csi2000-%s] 账户: 总资产 %.0f, 可用 %.0f, 持仓 %d 只",
                 tag, total_asset, avail, len(getattr(ctx, "positions", pd.DataFrame())))
+
+    # 未持有 + 已涨停(实时价 ≥ 涨停价)的买单剔除
+    if latest_prices and limit_prices and targets is not None and not targets.empty:
+        pos = getattr(ctx, "positions", pd.DataFrame())
+        held = set()
+        if not pos.empty and "code" in pos.columns:
+            held = {str(c).split(".")[0].zfill(6) for c in pos["code"]}
+        code_col = "_code6" if "_code6" in targets.columns else "code"
+        drop_codes: list = []
+        keep_rows: list = []
+        for _, r in targets.iterrows():
+            code6 = str(r[code_col]).split(".")[0].zfill(6)
+            lim = limit_prices.get(code6)
+            px = float(latest_prices.get(code6, 0) or 0)
+            if (code6 not in held and lim is not None and px > 0
+                    and float(lim[0]) > 0 and px >= float(lim[0])):
+                drop_codes.append(code6)
+                continue
+            keep_rows.append(r)
+        if drop_codes:
+            targets = pd.DataFrame(keep_rows).reset_index(drop=True)
+            logger.warning("[csi2000-%s] 剔除未持有涨停买单 %d 只: %s",
+                           tag, len(drop_codes), sorted(set(drop_codes))[:10])
 
     # 差额订单(真实资金 sizing + 清仓)
     orders = _targets_to_orders(targets, ctx, trading_day, capital=total_asset)

@@ -644,6 +644,8 @@ class NativeEngine:
         self._compute_lock = threading.Lock()
         self._compute_running = False
         self._open_position_running = threading.Event()
+        # open_precompute(9:1x)预计算的 csi2000 建仓 targets, 9:31 一次性消费
+        self._csi2000_open_targets: Optional[pd.DataFrame] = None
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
         # _cached_shm_files was removed — SHM files are created lazily by the
@@ -3205,6 +3207,21 @@ class NativeEngine:
                     logger.warning("[open_position] disk cache read failed %s: %s", p, exc)
         return None
 
+    def _pop_open_position_targets_memory(self) -> Optional[pd.DataFrame]:
+        """Memory-only pop of precomputed open-position targets.
+
+        9:30 消费路径: 只信本进程 open_precompute(9:1x)写入的内存缓存;
+        磁盘缓存不消费(旧镜像/中断残留风险, 维持既有安全决策)。
+        命中后同样把磁盘缓存 rename 成 consumed, 防任何路径重放。
+        """
+        with self._open_position_cache_lock:
+            if self._open_position_cache is not None:
+                cached = self._open_position_cache
+                self._open_position_cache = None
+                self._mark_targets_consumed_locked()
+                return cached
+        return None
+
     def _calculate_open_position_targets(self, end_time: str = "093000") -> None:
         """Run target inference and publish a one-shot memory/disk cache.
 
@@ -3475,7 +3492,21 @@ class NativeEngine:
             if not td:
                 logger.error("[csi2000_open] trading_day empty, skip")
                 return
-            orders = run_csi2000_open(td)
+            # 预计算(9:1x)的 targets 一次性消费; 实时价+涨跌停表传给执行链,
+            # 剔除"未持有且已涨停"的买单(竞价价判断, 防资金冻结)
+            pre_targets = self._csi2000_open_targets
+            self._csi2000_open_targets = None
+            if pre_targets is not None:
+                logger.info("[csi2000_open] using precomputed targets: %d rows",
+                            len(pre_targets))
+            latest = self._snapshot_latest_prices() or {}
+            limits = dict(self._daily_limit_prices) if self._daily_limit_prices else None
+            orders = run_csi2000_open(
+                td,
+                targets_override=pre_targets,
+                latest_prices=latest or None,
+                limit_prices=limits or None,
+            )
             n = 0 if orders is None else len(orders)
             logger.info("[csi2000_open] done trading_day=%s orders=%d", td, n)
             feishu_alert("csi2000-开盘执行完成", f"{td}: 推单 {n} 笔(银河账户, 皓兴VWAP)")
@@ -3541,6 +3572,52 @@ class NativeEngine:
                 feishu_alert("csi2000-14:50调仓失败", f"{self.trading_day}: {exc}")
             except Exception:
                 pass
+
+    # ── 9:30 前预计算(容错窗口) ─────────────────────────────────────
+    def _run_open_precompute_safe(self) -> None:
+        """open_precompute schedule 入口: 9:30 前预计算两产品建仓 targets。
+
+        提早算的核心价值是容错: 计算失败在 9:1x 即刻飞书告警, 留出人工
+        补救窗口(重跑/手动处置), 而不是 9:30 当场 fail closed 零余量。
+        9:30 open_position / 9:31 csi2000_open 优先消费本进程内存缓存;
+        预计算失败或缺失时它们回退当场重算(与未预计算时完全一致)。
+        """
+        from ..utils.notify import feishu_alert
+        td = self.trading_day
+        if not td:
+            logger.error("[open_precompute] trading_day empty, skip")
+            return
+
+        # ── 全指: 与 9:30 完全同一条 targets 计算, 提前到 9:1x ──
+        self._open_position_running.set()
+        try:
+            with self._compute_lock:
+                self._invalidate_open_position_targets()
+                self._calculate_open_position_targets()
+            with self._open_position_cache_lock:
+                n_qz = 0 if self._open_position_cache is None else len(self._open_position_cache)
+            feishu_alert("全指-建仓预计算完成", f"{td}: {n_qz} 只 targets(9:30 直接推单)")
+        except Exception as exc:
+            logger.error("[open_precompute] 全指预计算失败: %s", exc, exc_info=True)
+            feishu_alert("全指-建仓预计算失败(9:30 回退当场计算)",
+                         f"{td}: {exc}")
+        finally:
+            self._open_position_running.clear()
+
+        # ── 2000: T-1 因子现场推理 targets, 内存缓存供 9:31 消费 ──
+        try:
+            from ..inference.csi2000_product import (
+                run_csi2000_signal, resolve_recent_factor_date)
+            factor_date = resolve_recent_factor_date(td)
+            targets = run_csi2000_signal(td, factor_date=factor_date, push=False)
+            self._csi2000_open_targets = targets
+            feishu_alert("csi2000-建仓预计算完成",
+                         f"{td}: {len(targets)} 只 targets(因子={factor_date}, 9:31 直接推单)")
+        except Exception as exc:
+            self._csi2000_open_targets = None
+            logger.error("[open_precompute] csi2000 预计算失败: %s", exc, exc_info=True)
+            feishu_alert("csi2000-建仓预计算失败(9:31 回退当场计算)",
+                         f"{td}: {exc}")
 
     # ── 10 分钟交易方案·推理测试挂钩(仅测试 Pod, env 默认关) ──────────
     @staticmethod
@@ -3760,15 +3837,22 @@ class NativeEngine:
             date_str = self.trading_day
             end_time_label = schedule.result_label or "093000"
 
-            # Always calculate from the 9:30 market snapshot. Never consume a
-            # target cache left by an older image or an interrupted earlier run;
-            # limit-up filtering must happen immediately before model inference.
-            self._invalidate_open_position_targets()
-            logger.info(
-                "[open_position] calculating targets from 9:30 market data at %s",
-                end_time_label)
-            self._calculate_open_position_targets(end_time_label)
-            cached_targets = self._pop_open_position_targets()
+            # 预计算优先: open_precompute(9:1x)已算好则直接消费本进程内存
+            # 缓存 — 9:30 只剩竞价价过滤+转单, 秒级, 且预计算失败在 9:1x
+            # 就已告警留出补救窗口。内存无缓存(预计算失败/未跑/pod 重启)
+            # → 当场重算(与原行为完全一致); 磁盘缓存始终不信任(防旧镜像/
+            # 中断残留, 原安全决策保留)。
+            cached_targets = self._pop_open_position_targets_memory()
+            if cached_targets is not None and not cached_targets.empty:
+                logger.info("[open_position] using precomputed targets: %d rows "
+                            "(computed at 9:1x by open_precompute)", len(cached_targets))
+            else:
+                self._invalidate_open_position_targets()
+                logger.info(
+                    "[open_position] no precomputed targets; calculating from 9:30 market data at %s",
+                    end_time_label)
+                self._calculate_open_position_targets(end_time_label)
+                cached_targets = self._pop_open_position_targets()
             if cached_targets is None or cached_targets.empty:
                 logger.error(
                     "[open_position] 9:30 target calculation produced no targets; fail closed")
@@ -4690,6 +4774,13 @@ class NativeEngine:
                         if schedule.name == "daily_basic_refresh":
                             t = threading.Thread(
                                 target=self._refresh_daily_basic_upload,
+                                daemon=True,
+                            )
+                        # 9:30 前预计算两产品建仓 targets(提早发现计算问题留
+                        # 补救窗口), 独立线程 + 成功/失败均飞书告警
+                        elif schedule.name == "open_precompute":
+                            t = threading.Thread(
+                                target=self._run_open_precompute_safe,
                                 daemon=True,
                             )
                         # 中证2000独立信号: 复用当天 daily 因子, 独立线程产出 targets,

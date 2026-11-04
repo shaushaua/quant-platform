@@ -235,6 +235,33 @@ class TestCsi2000Position(unittest.TestCase):
         m_load.assert_called_once()
         self.assertTrue((self.tmp / f"csi2000_open_orders_{self.td}.csv").is_file())
 
+    def test_open_override_skips_inference_and_drops_limitup(self, m_px, m_comp, m_load, m_inf, m_feishu):
+        """预计算 targets 直传: 跳过现场推理; 未持有已涨停的买单被剔除。"""
+        m_px.return_value = {"000001": 10.0, "000002": 9.5}
+        override = pd.DataFrame({
+            "code": ["000001.XSHE", "000002.XSHE"],
+            "position": [0.50, 0.10],   # 000001 实时价 10.0 ≥ 涨停 10.0 → 剔除
+        })
+        broker = _CountingBroker(_Ctx(_account(10_000_000, 1_000_000), _positions({})))
+
+        orders = cp.run_csi2000_open(
+            self.td, broker=broker, targets_override=override,
+            latest_prices={"000001": 10.0, "000002": 9.5},
+            limit_prices={"000001": (10.0, 9.0), "000002": (10.5, 9.5)})
+
+        m_inf.assert_not_called()       # 预计算已算, 未做现场推理
+        m_load.assert_not_called()      # 未加载 OSS 因子
+        self.assertEqual(len(broker.pushed), 1)
+        got = {(r.code, r.side, int(r.volume)) for r in broker.pushed[0].itertuples()}
+        self.assertEqual(got, {("000002", "buy", 105_200)})
+
+    def test_resolve_factor_date_falls_back(self, *mocks):
+        """OSS 全部 404 时回退 7 天(stub 桶 head 必抛)。"""
+        from datetime import datetime as dt, timedelta
+        fd = cp.resolve_recent_factor_date(self.td)
+        expect = (dt.strptime(self.td, "%Y%m%d") - timedelta(days=7)).strftime("%Y%m%d")
+        self.assertEqual(fd, expect)
+
     def test_schedule_registered(self, *mocks):
         """COMPUTE_SCHEDULES 含 csi2000_position 时按 14:50/15:00 注册。"""
         from quant_platform.live_engine.schedule import build_schedules_from_env

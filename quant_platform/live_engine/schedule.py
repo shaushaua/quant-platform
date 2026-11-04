@@ -255,6 +255,21 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             skip_factor_compute=True,
         ))
 
+    if "open_precompute" in enabled:
+        # 9:30 前预计算两产品建仓 targets(全指 _calculate_open_position_targets
+        # + csi2000 T-1 因子推理): 提早算, 失败即刻飞书告警留出人工补救窗口;
+        # 9:30/9:31 优先消费本进程内存缓存, 缺失回退当场重算(原行为)。
+        t = _parse_trigger_time(
+            os.environ.get("OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME", "09:10"),
+            (9, 10), "OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="open_precompute",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            run_inference=False,
+            is_daily_result=False,
+        ))
+
     if "daily_basic_refresh" in enabled:
         # Post-close trigger to upload T-0 daily_basic + composition to OSS.
         # MySQL mkt_equd is written at ~15:07 (A-share close + clearing),

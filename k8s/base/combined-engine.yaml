@@ -136,7 +136,11 @@ spec:
             - name: MINUTE_SKIP_TIMES
               value: "09:30"
             - name: COMPUTE_SCHEDULES
-              value: "minute,minute_daily,daily,daily_position,open_position,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
+              value: "minute,minute_daily,daily,daily_position,open_position,open_precompute,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
+            # 9:30 前预计算两产品建仓 targets: 失败即刻告警留补救窗口,
+            # 9:30/9:31 只做竞价价过滤+推单; 缺失时回退当场重算(原行为)
+            - name: OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME
+              value: "09:10"
             # 中证2000独立信号: 15:12 产出 targets 到 /data/factors/csi2000/
             # 与全指信号共用因子/模型, 池/基准(932000)/资金独立, 虚拟盘不下单
             - name: CSI2000_SIGNAL_TRIGGER_TIME
