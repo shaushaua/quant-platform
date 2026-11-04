@@ -3508,7 +3508,10 @@ class NativeEngine:
             else:
                 logger.error("[csi2000_signal] 等待 daily 因子超时(10min), skip")
                 return
-            run_csi2000_signal(td)
+            # push=False: 15:12 是盘后信号(产出 targets), 实盘执行在次日
+            # 9:30 csi2000_open 现场推理 — 盘后推真单只会收获拒绝或被客户端
+            # 排队到次日开盘(与 9:30 现场单双倍成交, 20261104 发现的隐患)。
+            run_csi2000_signal(td, push=False)
             logger.info("[csi2000_signal] done trading_day=%s", td)
         except Exception as exc:
             logger.error("[csi2000_signal] failed: %s", exc, exc_info=True)
