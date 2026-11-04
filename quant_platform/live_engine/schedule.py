@@ -270,6 +270,22 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             is_daily_result=False,
         ))
 
+    if "auction_fetch" in enabled:
+        # 9:26 取集合竞价价(9:25 撮合已发布, 留 1 分钟确保第三方行情
+        # 刷新为今日时间戳): 对两产品 targets 判定"未持有且一字涨停",
+        # 供 9:30 推单前过滤。尽力而为: 取价失败只告警不阻断,
+        # 9:30 不过滤直接推(调仓优先于过滤)。
+        t = _parse_trigger_time(
+            os.environ.get("AUCTION_FETCH_TRIGGER_TIME", "09:26"),
+            (9, 26), "AUCTION_FETCH_TRIGGER_TIME")
+        schedules.append(ComputationSchedule(
+            name="auction_fetch",
+            schedule_type="time_trigger",
+            trigger_times=[t],
+            run_inference=False,
+            is_daily_result=False,
+        ))
+
     if "daily_basic_refresh" in enabled:
         # Post-close trigger to upload T-0 daily_basic + composition to OSS.
         # MySQL mkt_equd is written at ~15:07 (A-share close + clearing),
@@ -303,12 +319,13 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
         ))
 
     if "csi2000_open" in enabled:
-        # 中证2000实盘执行: 09:31 在银河账户建仓/调仓(真实持仓/资金 sizing
-        # → 皓兴 VWAP 205)。与全指 open_position(09:30)错峰 1 分钟, 避免两
-        # 个产品同时刻重算/推理互相拖累(20261104 9:30 并发事故教训)。
+        # 中证2000实盘执行: 09:30 与全指同时推单 — targets 已由
+        # open_precompute(09:10)提前算好, 涨停已由 auction_fetch(09:26)
+        # 提前过滤, 09:30 只剩差额+推送(秒级), 不再需要错峰。
+        # (真实持仓/资金 sizing → 皓兴 VWAP 205)。
         t = _parse_trigger_time(
-            os.environ.get("CSI2000_OPEN_TRIGGER_TIME", "09:31"),
-            (9, 31), "CSI2000_OPEN_TRIGGER_TIME")
+            os.environ.get("CSI2000_OPEN_TRIGGER_TIME", "09:30"),
+            (9, 30), "CSI2000_OPEN_TRIGGER_TIME")
         deadline = _parse_trigger_time(
             os.environ.get("CSI2000_OPEN_DEADLINE", "09:45"),
             (9, 45), "CSI2000_OPEN_DEADLINE")

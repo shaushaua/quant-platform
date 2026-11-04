@@ -646,6 +646,9 @@ class NativeEngine:
         self._open_position_running = threading.Event()
         # open_precompute(9:1x)预计算的 csi2000 建仓 targets, 9:31 一次性消费
         self._csi2000_open_targets: Optional[pd.DataFrame] = None
+        # auction_fetch(9:26)取的集合竞价价(code6 → price), 9:30 推单前
+        # 涨停过滤用; 为空 = 过滤降级, 直接推(调仓优先于过滤)
+        self._auction_prices: dict = {}
         self._state_offsets: Dict[Tuple[str, int], int] = {}
         self._main_readers: Dict[str, NativeShmReader] = {}
         # _cached_shm_files was removed — SHM files are created lazily by the
@@ -3492,14 +3495,15 @@ class NativeEngine:
             if not td:
                 logger.error("[csi2000_open] trading_day empty, skip")
                 return
-            # 预计算(9:1x)的 targets 一次性消费; 实时价+涨跌停表传给执行链,
-            # 剔除"未持有且已涨停"的买单(竞价价判断, 防资金冻结)
+            # 预计算(9:1x)的 targets 一次性消费; 竞价价(auction_fetch 9:26
+            # 已取)+涨跌停表传给执行链, 剔除"未持有且一字涨停"的买单;
+            # 竞价价缺失时回退 SHM 实时价, 再缺则不过滤直接推(调仓优先)
             pre_targets = self._csi2000_open_targets
             self._csi2000_open_targets = None
             if pre_targets is not None:
                 logger.info("[csi2000_open] using precomputed targets: %d rows",
                             len(pre_targets))
-            latest = self._snapshot_latest_prices() or {}
+            latest = self._auction_prices or self._snapshot_latest_prices() or {}
             limits = dict(self._daily_limit_prices) if self._daily_limit_prices else None
             orders = run_csi2000_open(
                 td,
@@ -3650,6 +3654,57 @@ class NativeEngine:
             + [(13, m) for m in (10, 20, 30, 40, 50)]
             + [(14, m) for m in (0, 10, 20, 30, 40)]
         )
+
+    def _run_auction_fetch_safe(self) -> None:
+        """auction_fetch schedule 入口: 9:26 取集合竞价价并判定一字涨停。
+
+        竞价 9:25 撮合发布开盘价 → 9:26 第三方行情已刷新今日时间戳。
+        对两产品预计算 targets 的全部票取竞价价, 与涨跌停表比对标记
+        "未持有且一字涨停"的票, 存 self._auction_prices 供 9:30 推单过滤。
+        尽力而为: 任何失败只飞书告警降级(9:30 不过滤直接推), 绝不阻断调仓。
+        """
+        from ..utils.notify import feishu_alert
+        td = self.trading_day
+        if not td:
+            logger.error("[auction_fetch] trading_day empty, skip")
+            return
+        try:
+            codes: set = set()
+            # 两产品预计算 targets 的票(peek 不消费)
+            with self._open_position_cache_lock:
+                qz = self._open_position_cache
+            if qz is not None and not qz.empty:
+                col = "_code6" if "_code6" in qz.columns else "code"
+                codes |= {str(c).split(".")[0].zfill(6) for c in qz[col]}
+            c2k = self._csi2000_open_targets
+            if c2k is not None and not c2k.empty:
+                col = "_code6" if "_code6" in c2k.columns else "code"
+                codes |= {str(c).split(".")[0].zfill(6) for c in c2k[col]}
+            if not codes:
+                feishu_alert("竞价取价-无预计算targets", f"{td}: 9:10 预计算缺失, "
+                             "9:30 按原逻辑当场计算, 本步跳过")
+                return
+            prices = self._snapshot_target_prices_from_external(codes) or {}
+            self._auction_prices = {str(k).split(".")[0].zfill(6): float(v)
+                                    for k, v in prices.items() if float(v or 0) > 0}
+            limit_hits = sorted(
+                c for c, px in self._auction_prices.items()
+                if c in self._daily_limit_prices
+                and float(self._daily_limit_prices[c][0]) > 0
+                and px >= float(self._daily_limit_prices[c][0]))
+            if len(self._auction_prices) < len(codes):
+                feishu_alert("竞价取价-部分缺失", (
+                    f"{td}: 取到 {len(self._auction_prices)}/{len(codes)} 只"
+                    f"(缺失部分 9:30 不过滤直接推)"))
+            if limit_hits:
+                feishu_alert("竞价一字涨停", f"{td}: {len(limit_hits)} 只开盘涨停将剔除买单: "
+                             f"{limit_hits[:15]}")
+            logger.info("[auction_fetch] 竞价价 %d/%d 只, 一字涨停 %d 只",
+                        len(self._auction_prices), len(codes), len(limit_hits))
+        except Exception as exc:
+            self._auction_prices = {}
+            logger.error("[auction_fetch] failed: %s", exc, exc_info=True)
+            feishu_alert("竞价取价失败-降级不过滤", f"{td}: {exc} (9:30 直接推单)")
 
     def _compute_minute_daily(self, schedule) -> None:
         """minute_daily 计算包装: 因子算完后, 在固定时间点(默认盘中每 10
@@ -4774,6 +4829,13 @@ class NativeEngine:
                         if schedule.name == "daily_basic_refresh":
                             t = threading.Thread(
                                 target=self._refresh_daily_basic_upload,
+                                daemon=True,
+                            )
+                        # 9:26 取集合竞价价+判定一字涨停(尽力而为, 失败降级
+                        # 不过滤), 独立线程 + 飞书告警
+                        elif schedule.name == "auction_fetch":
+                            t = threading.Thread(
+                                target=self._run_auction_fetch_safe,
                                 daemon=True,
                             )
                         # 9:30 前预计算两产品建仓 targets(提早发现计算问题留

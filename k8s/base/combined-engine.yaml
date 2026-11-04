@@ -136,11 +136,15 @@ spec:
             - name: MINUTE_SKIP_TIMES
               value: "09:30"
             - name: COMPUTE_SCHEDULES
-              value: "minute,minute_daily,daily,daily_position,open_position,open_precompute,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
+              value: "minute,minute_daily,daily,daily_position,open_position,open_precompute,auction_fetch,daily_basic_refresh,csi2000_signal,csi2000_open,csi2000_position"
             # 9:30 前预计算两产品建仓 targets: 失败即刻告警留补救窗口,
             # 9:30/9:31 只做竞价价过滤+推单; 缺失时回退当场重算(原行为)
             - name: OPEN_POSITION_PRECOMPUTE_TRIGGER_TIME
               value: "09:10"
+            # 9:26 取集合竞价价(9:25 撮合已发布)判定一字涨停, 9:30 推单前
+            # 过滤; 尽力而为, 取价失败只告警不阻断调仓
+            - name: AUCTION_FETCH_TRIGGER_TIME
+              value: "09:26"
             # 中证2000独立信号: 15:12 产出 targets 到 /data/factors/csi2000/
             # 与全指信号共用因子/模型, 池/基准(932000)/资金独立, 虚拟盘不下单
             - name: CSI2000_SIGNAL_TRIGGER_TIME
@@ -149,7 +153,7 @@ spec:
             # 错峰 1 分钟, 避免同时刻重算/推理互相拖累)
             # (真实持仓/资金 sizing → 皓兴 VWAP 205), CSI2000_BROKER 控制通道
             - name: CSI2000_OPEN_TRIGGER_TIME
-              value: "09:31"
+              value: "09:30"
             - name: CSI2000_OPEN_DEADLINE
               value: "09:45"
             # 中证2000 14:51 盘中调仓: 与全指 daily_position(14:50)错峰 1 分钟,
