@@ -997,7 +997,14 @@ def _validate_target_risk(out, risk_frame, benchmark_weight, style_tol, industry
     if not np.isfinite(exposure.to_numpy(dtype=float)).all() or not np.isfinite(benchmark.to_numpy(dtype=float)).all():
         raise RuntimeError("risk validation: target or full benchmark has missing Barra values")
     active = exposure.mul(weights, axis=0).sum(axis=0) - benchmark.mul(benchmark_weight, axis=0).sum(axis=0)
-    limit = benchmark.std(axis=0) * float(style_tol)
+    # 口径对齐(20261104 14:50 事故): .so 优化器的风格约束是绝对单位(|active|<=tol,
+    # 信号强时解恰好贴边 tol), 此前独立校验用 std*scale 缩水了边界(std<1 的因子
+    # 差 0.5%~16%), 贴边解永远过不了 — 6 档阶梯全灭、fail closed。
+    # 修正: 与 .so 同单位(绝对 tol)并保留 std 放大(std>1 时更宽), 加 5% 浮点余量。
+    # 拦截语义不变: 超出 .so 自身约束 5% 以上的解仍然拒绝。
+    _std = benchmark.std(axis=0)
+    limit = pd.Series(np.maximum(_std.to_numpy(dtype=float), 1.0),
+                      index=_std.index) * float(style_tol) * 1.05
     if not np.isfinite(limit.to_numpy(dtype=float)).all() or (limit <= 0).any():
         raise RuntimeError("risk validation: invalid benchmark style dispersion")
     breaches = active.index[active.abs() > limit + 1e-6]
