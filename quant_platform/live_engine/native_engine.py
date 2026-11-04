@@ -3506,7 +3506,8 @@ class NativeEngine:
                 from ..inference.csi2000_product import get_broker, OUT_DIR
                 broker = get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
                 logger.info("[csi2000_open] pushing prebuilt orders: %d rows", len(pre_orders))
-                broker.push_orders(pre_orders, td)
+                if not broker.push_orders(pre_orders, td):
+                    raise RuntimeError("csi2000_open: prebuilt order push rejected")
                 try:
                     pre_orders.to_csv(OUT_DIR / f"csi2000_open_orders_{td}.csv",
                                       index=False)
@@ -4040,8 +4041,10 @@ class NativeEngine:
                 try:
                     cached_targets = self._drop_and_renormalize_targets(
                         cached_targets, portfolio_context,
-                        price_source=self._snapshot_latest_prices()
-                        or self._auction_prices or {})
+                        price_source={
+                            **(self._auction_prices or {}),
+                            **(self._snapshot_latest_prices() or {}),
+                        })
                 except Exception as exc:
                     logger.warning("[open_position] 竞价涨停剔除失败(跳过, 直接转单): %s", exc)
 

@@ -605,7 +605,13 @@ def test_open_position_calculates_targets_at_trigger(monkeypatch):
     assert (date_str, end_time) == ("20260807", "093000")
 
 
-def test_open_position_recalculates_instead_of_consuming_stale_targets(monkeypatch):
+def test_open_position_consumes_precomputed_memory_targets(monkeypatch):
+    """9:30 优先消费本进程 open_precompute(9:1x)写入的内存缓存, 不重算。
+
+    旧设计(永远重算)防的是旧镜像/中断残留缓存; 新设计下内存槽只能由本
+    进程预计算写入(预计算自身先失效再算), 残留向量已消除, 磁盘缓存仍不
+    消费(_pop_open_position_targets_memory 只看内存)。
+    """
     module_name = "tests.fake_cached_target_inference"
 
     def targets_to_orders(*args, diagnostics=None, **kwargs):
@@ -630,9 +636,68 @@ def test_open_position_recalculates_instead_of_consuming_stale_targets(monkeypat
     engine._open_position_cache_lock = native_engine_module.threading.Lock()
     engine._open_position_cache_generation = 0
     engine.output_path = None
+    engine._auction_prices = {}
+    engine._daily_limit_prices = {}
     calculated = []
 
-    def calculate_targets(end_time):
+    def calculate_targets(end_time="093000"):
+        calculated.append(end_time)
+        engine._open_position_cache = pd.DataFrame([{
+            "code": "600000",
+            "position": 0.2,
+        }])
+
+    engine._calculate_open_position_targets = calculate_targets
+    engine.portfolio_context_fn = lambda *_: SimpleNamespace(
+        positions=pd.DataFrame(), meta={"positions_usable": True})
+    engine._snapshot_latest_prices = lambda: {"000001.XSHE": 10.0}
+    engine._snapshot_limit_prices = lambda: {}
+    engine._snapshot_target_prices_from_shm = lambda *_args, **_kwargs: {}
+    engine._daily_basic_df = pd.DataFrame()
+    engine._order_queue = queue.Queue()
+
+    schedule = SimpleNamespace(
+        name="open_position",
+        result_label="093000",
+        skip_factor_compute=True,
+        is_daily_result=False,
+    )
+    engine._compute_and_output_locked(schedule)
+
+    orders, _, _ = engine._order_queue.get_nowait()
+    assert calculated == []                        # 未重算: 直接消费预计算缓存
+    assert orders["code"].tolist() == ["000001"]   # 订单来自缓存的 targets
+    assert engine._open_position_cache is None     # 一次性消费
+
+
+def test_open_position_recalculates_when_no_precomputed_targets(monkeypatch):
+    """内存无缓存(预计算失败/未跑/pod 重启) → 9:30 当场重算(原行为兜底)。"""
+    module_name = "tests.fake_cached_target_inference"
+
+    def targets_to_orders(*args, diagnostics=None, **kwargs):
+        diagnostics["missing_price_codes"] = []
+        targets = args[0]
+        return pd.DataFrame([{
+            "code": targets.iloc[0]["code"],
+            "side": "buy",
+            "volume": 100,
+        }])
+
+    monkeypatch.setitem(
+        sys.modules, module_name, SimpleNamespace(targets_to_orders=targets_to_orders)
+    )
+    monkeypatch.setenv("INFERENCE_MODULE", module_name)
+    engine = NativeEngine.__new__(NativeEngine)
+    engine.trading_day = "20260807"
+    engine._open_position_cache = None
+    engine._open_position_cache_lock = native_engine_module.threading.Lock()
+    engine._open_position_cache_generation = 0
+    engine.output_path = None
+    engine._auction_prices = {}
+    engine._daily_limit_prices = {}
+    calculated = []
+
+    def calculate_targets(end_time="093000"):
         calculated.append(end_time)
         engine._open_position_cache = pd.DataFrame([{
             "code": "600000",
@@ -657,7 +722,7 @@ def test_open_position_recalculates_instead_of_consuming_stale_targets(monkeypat
     engine._compute_and_output_locked(schedule)
 
     orders, _, _ = engine._order_queue.get_nowait()
-    assert calculated == ["093000"]
+    assert calculated == ["093000"]                # 无缓存 → 当场重算
     assert orders["code"].tolist() == ["600000"]
 
 

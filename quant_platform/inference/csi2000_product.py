@@ -681,12 +681,12 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
         logger.info("[csi2000-%s] 预检完成(未推单): %d 笔订单就绪, 9:30 直接推",
                     tag, len(orders))
         return orders
-    ok = broker.push_orders(orders, trading_day)
-    if ok:
-        logger.info("[csi2000-%s] 已推 %d 笔(买 %d/卖 %d, 买额 %.0f万)",
-                    tag, len(orders), len(buys), len(sells), buy_amt / 1e4)
-        od_path = OUT_DIR / f"csi2000_{tag}_orders_{trading_day}.csv"
-        orders.to_csv(od_path, index=False)
+    if not broker.push_orders(orders, trading_day):
+        raise RuntimeError(f"csi2000-{tag}: order push rejected")
+    logger.info("[csi2000-%s] 已推 %d 笔(买 %d/卖 %d, 买额 %.0f万)",
+                tag, len(orders), len(buys), len(sells), buy_amt / 1e4)
+    od_path = OUT_DIR / f"csi2000_{tag}_orders_{trading_day}.csv"
+    orders.to_csv(od_path, index=False)
     return orders
 
 
