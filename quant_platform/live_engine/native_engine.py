@@ -4086,6 +4086,9 @@ class NativeEngine:
         rt_end_time = label if (
             schedule is not None and getattr(schedule, 'result_label', '')) else end_time
         output_path = self.output_path
+        # minute_daily(v2 滚动): 独立子目录, 避免与 minute 的 HHMMSS.csv 同名互踩
+        if schedule is not None and schedule.name == "minute_daily" and output_path:
+            output_path = Path(str(output_path)) / "daily-rolling"
         outfun = self.outfun
         inference_fn = self.inference_fn
         portfolio_context_fn = self.portfolio_context_fn
@@ -4148,6 +4151,7 @@ class NativeEngine:
                 idx_cons_df=idx_cons_df,
                 trading_universe_df=trading_universe_df,
                 pre_fork_latest_prices=pre_fork_latest_prices,
+                upload_category=("minutes_daily" if (schedule is not None and schedule.name == "minute_daily") else ""),
                 filter_unheld_limit_up_before_inference=(
                     schedule is not None and schedule.name == "daily_position"),
                 # daily_position 算全市场，内存压力大，推理前 gc 释放因子计算阶段内存
@@ -4199,6 +4203,7 @@ class NativeEngine:
         filter_unheld_limit_up_before_inference: bool,
         gc_before_inference: bool,
         log_tag: str,
+        upload_category: str = "",
     ) -> Optional[pd.DataFrame]:
         """Shared factor-output + inference pipeline called inline (in a
         thread) by _write_results for every schedule.
@@ -4246,7 +4251,7 @@ class NativeEngine:
             logger.info("[%s] wrote %s", log_tag, out_file)
         _upload_to_oss(
             compact_df, date_str, label,
-            category="daily" if is_daily else "minutes",
+            category=upload_category or ("daily" if is_daily else "minutes"),
         )
 
         # 2. 推理

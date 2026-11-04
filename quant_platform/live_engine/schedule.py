@@ -154,6 +154,25 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
     interval = int(fi.get("compute_interval", 0)) or int(os.environ.get("COMPUTE_INTERVAL", "60"))
     schedules: List[ComputationSchedule] = []
 
+    # MINUTE_SKIP_TIMES 由 minute 与 minute_daily 共用(同一批跳过分钟)
+    excluded_minutes: Set[Tuple[int, int]] = set()
+    for raw in os.environ.get("MINUTE_SKIP_TIMES", "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split(":")
+        try:
+            h, m = int(parts[0]), int(parts[1])
+        except (ValueError, IndexError):
+            logger.warning(
+                "[schedule] ignoring malformed MINUTE_SKIP_TIMES value: %r", raw)
+            continue
+        if not (0 <= h < 24 and 0 <= m < 60):
+            logger.warning(
+                "[schedule] ignoring out-of-range MINUTE_SKIP_TIMES value: %r", raw)
+            continue
+        excluded_minutes.add((h, m))
+
     if "minute" in enabled:
         # MINUTE_RUN_INFERENCE=false: keep computing factors (and syncing tick
         # state) but skip inference → no order push. Used when only daily
@@ -161,23 +180,6 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
         minute_run_inference = os.environ.get("MINUTE_RUN_INFERENCE", "true").lower() in {
             "1", "true", "yes", "y", "on"
         }
-        excluded_minutes: Set[Tuple[int, int]] = set()
-        for raw in os.environ.get("MINUTE_SKIP_TIMES", "").split(","):
-            raw = raw.strip()
-            if not raw:
-                continue
-            parts = raw.split(":")
-            try:
-                h, m = int(parts[0]), int(parts[1])
-            except (ValueError, IndexError):
-                logger.warning(
-                    "[schedule] ignoring malformed MINUTE_SKIP_TIMES value: %r", raw)
-                continue
-            if not (0 <= h < 24 and 0 <= m < 60):
-                logger.warning(
-                    "[schedule] ignoring out-of-range MINUTE_SKIP_TIMES value: %r", raw)
-                continue
-            excluded_minutes.add((h, m))
         schedules.append(ComputationSchedule(
             name="minute",
             schedule_type="interval",
@@ -187,6 +189,25 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             excluded_minutes=excluded_minutes,
             run_inference=minute_run_inference,
             is_daily_result=False,
+        ))
+
+    if "minute_daily" in enabled:
+        # 第二套分钟级: 日频模块(DAILY_FACTOR_MODULE, v2)的分钟频率滚动计算。
+        # 与 "minute"(老 min 模块) 每分钟各算一轮, 经 _compute_lock 自动串行。
+        # 产出与 15:10 正式日频同 schema 的 F_ 特征(截至当分钟的滚动近似),
+        # 落盘 daily-rolling/ 子目录 + OSS minutes-daily-feature/。
+        # run_inference=False: 本阶段只算因子(先测试正确性与耗时), 交易后续接。
+        interval_daily = int(os.environ.get(
+            "MINUTE_DAILY_INTERVAL", str(interval)))
+        schedules.append(ComputationSchedule(
+            name="minute_daily",
+            schedule_type="interval",
+            interval_seconds=interval_daily,
+            active_sessions=[((9, 15), (11, 30)), ((13, 0), (15, 0))],
+            excluded_minutes=set(excluded_minutes),
+            run_inference=False,
+            is_daily_result=False,
+            use_daily_factor_module=True,
         ))
 
     if "daily" in enabled:

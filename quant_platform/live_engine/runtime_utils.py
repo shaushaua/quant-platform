@@ -60,6 +60,7 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str,
         "daily"   -> {prefix}/{year}/{year_month}/{date}/daily-feature/{end_time}.parquet
         "minutes" -> {prefix}/{year}/{year_month}/{date}/minutes-feature/{end_time}.parquet
         "positions" -> {prefix}/{year}/{year_month}/{date}/positions/{end_time}.parquet
+        "minutes_daily" -> {prefix}/{year}/{year_month}/{date}/minutes-daily-feature/{end_time}.parquet
 
     Caller should pass a compacted copy (round + float32) if storage reduction
     is desired; this function serializes df as-is.
@@ -85,7 +86,8 @@ def _upload_to_oss(df: pd.DataFrame, date_str: str, end_time: str,
         year = date_str[:4]
         month = date_str[4:6]
         _sub_map = {"daily": "daily-feature", "minutes": "minutes-feature",
-                    "positions": "positions"}
+                    "positions": "positions",
+                    "minutes_daily": "minutes-daily-feature"}
         sub_dir = _sub_map.get(category, category)
         key = f"{prefix}/{year}/{year}{month}/{date_str}/{sub_dir}/{end_time}.parquet"
 
