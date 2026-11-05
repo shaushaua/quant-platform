@@ -386,3 +386,33 @@ class UnifiedOrderConversionTest(unittest.TestCase):
         self.assertEqual(int(buy["volume"].iloc[0]), 53400)
 
         self.assertIn("price_type", orders.columns)  # 全指核的列结构
+
+
+class SingleLotLiquidationTest(unittest.TestCase):
+    """单手小仓位清仓: 浮点往返 floor(99.999)=0 漏单 — 必须按可卖量直出。"""
+
+    def test_single_lot_exit_generates_sell(self):
+        from quant_platform.inference.interface import PortfolioContext, positions_to_orders
+        import pandas as pd
+        # 2026-11-05 实盘数字: 100 股工行 @8.35, 总资产 3,054,391 — 权重往返
+        # 后 834.999.../8.35 = 99.9999 股, floor//100 抹 0
+        pos = pd.DataFrame({
+            "code": ["601398"],
+            "qty": [100],
+            "available_qty": [100],
+            "last_price": [8.35],
+        })
+        acct = pd.DataFrame([{"total_asset": 3_054_391.0, "available_cash": 100_000.0,
+                              "market_value": 835.0}])
+        ctx = PortfolioContext(account_id="t", broker="yinhe",
+                               positions=pos, account=acct,
+                               meta={"latest_prices": {"601398": 8.35}})
+        targets = pd.DataFrame({"code": ["600000"], "position": [0.9]})
+        orders = positions_to_orders(
+            targets, ctx, None, price_type="latest", strategy="t",
+            note="t", total_capital_override=3_054_391.0,
+            delta_mode="delta", diagnostics={})
+        probe = orders[(orders["side"] == "sell")
+                       & (orders["code"].astype(str).str.zfill(6) == "601398")]
+        self.assertEqual(len(probe), 1, "单手清仓卖单被浮点边界吞掉")
+        self.assertEqual(int(probe["volume"].iloc[0]), 100)

@@ -693,6 +693,11 @@ def positions_to_orders(
         df.loc[sell_mask, "volume"] = df.loc[sell_mask, "volume"].clip(
             upper=held_lot.loc[sell_mask]
         )
+        # 整仓清仓单(目标权重=0)按可卖量直接出单, 不走 权重×资金÷价格 的
+        # 浮点往返 — 单手小仓位(如 100 股探针/835 元)往返后 floor(99.999)
+        # 被抹成 0 而漏单(2026-11-05 601398 实锤)。
+        exit_mask = sell_mask & (df["_weight"] <= 0)
+        df.loc[exit_mask, "volume"] = held_lot.loc[exit_mask].clip(lower=0)
 
     df = df[df["volume"] > 0]
     if df.empty:
