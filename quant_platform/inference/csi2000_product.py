@@ -514,63 +514,34 @@ def _resolve_order_prices(pos, trading_day: str,
 def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str,
                        capital: Optional[float] = None,
                        latest_prices: Optional[dict] = None) -> pd.DataFrame:
-    """targets(目标权重) vs 当前持仓 → 订单(code/side/volume/price)。
+    """targets → 订单: 与全指同一转换核 interface.positions_to_orders。
 
-    capital: sizing 基准资金。None → 取 ctx.account.total_asset(实盘真实
-    资金); 虚拟账本 account 也是 1000 万, 行为不变。
-    latest_prices: 竞价价/实时快照(code6 → price), 定价最高优先级。
+    2000 是真实产品, 不再维护独立实现 — 两套"targets→订单"会在实盘上
+    漂移出两套行为(2026-11-05 两处实锤: 银河持仓缺价崩溃 + 折股用 T-1
+    收盘)。这里只做接线: 把三级价格(SHM盘口/竞价 > 持仓实时 > 收盘兜底)
+    合并进 ctx.meta['latest_prices'], 转换逻辑全部复用全指核(差额模式、
+    available_qty 清仓、科创板手数、涨跌停过滤)。
     """
+    from .interface import positions_to_orders
+
     pos = getattr(ctx, "positions", pd.DataFrame())
-    px = _resolve_order_prices(pos, trading_day, latest_prices)
-    tgt = targets[["_code6", "position"]].copy() if "_code6" in targets.columns \
-        else targets[["code", "position"]].rename(columns={"code": "_code6"})
-    tgt["_code6"] = tgt["_code6"].astype(str).str.split(".").str[0].str.zfill(6)
-    cur_qty: pd.Series = pd.Series(dtype=float)
-    if not pos.empty and "qty" in pos.columns:
-        cur_qty = pos.set_index(pos["code"].astype(str).str.zfill(6))["qty"].astype(float)
+    ctx.meta = dict(getattr(ctx, "meta", {}) or {})
+    ctx.meta["latest_prices"] = _resolve_order_prices(pos, trading_day, latest_prices)
 
-    if capital is None:
-        acct = getattr(ctx, "account", None)
-        capital = float(acct["total_asset"].iloc[0]) if acct is not None and len(acct) else VIRTUAL_CAPITAL
-
-    rows = []
-    target_codes = set(tgt["_code6"])
-
-    # 1) 调仓: 目标内每只票 计算 目标量-持仓量 的差额单
-    for _, r in tgt.iterrows():
-        code6, w = r["_code6"], float(r["position"])
-        price = float(px.get(code6, 0.0))
-        if price <= 0:
-            continue
-        want = int(w * capital / price / 100) * 100
-        have = float(cur_qty.get(code6, 0.0))
-        delta = want - have
-        if abs(delta) < 100:
-            continue
-        rows.append({
-            "code": code6, "side": "buy" if delta > 0 else "sell",
-            "volume": abs(delta), "price": round(price, 2),
-        })
-
-    # 2) 清仓: 持有但不在新目标中的票 → 全量卖单(否则虚拟持仓静默删票、
-    #    回放与订单不一致; 实盘适配器接入后同样依赖这里生成清仓委托)
-    for code6, have in cur_qty.items():
-        if code6 in target_codes or have < 100:
-            continue
-        price = float(px.get(code6, 0.0))
-        if price <= 0:
-            # 无价格无法卖: 持仓保留在 _write_virtual_positions 中,
-            # 待次日有价格再生成清仓单(不静默删除)
-            logger.warning("[csi2000] %s 已移出目标但无收盘价, 本轮不生成卖单(保留持仓)",
-                           code6)
-            continue
-        rows.append({
-            "code": code6, "side": "sell",
-            "volume": int(have // 100) * 100, "price": round(price, 2),
-        })
-    return pd.DataFrame(rows)
-
-
+    tgt = targets if "code" in targets.columns \
+        else targets.rename(columns={"_code6": "code"})
+    diagnostics: dict = {}
+    return positions_to_orders(
+        tgt[["code", "position"]],
+        ctx,
+        None,
+        price_type="latest",
+        strategy="csi2000",
+        note=f"csi2000_{trading_day}",
+        total_capital_override=capital,
+        delta_mode="delta",
+        diagnostics=diagnostics,
+    )
 def resolve_recent_factor_date(trading_day: str) -> str:
     """找最近一份已上传的 daily 因子日期(当日 15:10 才产出, 盘前必回退 T-1)。
 

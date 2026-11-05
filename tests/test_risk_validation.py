@@ -348,3 +348,41 @@ class OrderPricePriorityTest(unittest.TestCase):
             self.assertEqual(px2["600000"], 9.1)   # 非持仓票拿快照价
             self.assertEqual(px2["601398"], 8.35)  # 无快照 → 持仓实时
             self.assertEqual(px2["300999"], 10.0)  # 双缺 → 收盘兜底
+
+
+class UnifiedOrderConversionTest(unittest.TestCase):
+    """2000 与全指同一转换核(interface.positions_to_orders): 差额+清仓+三级定价。"""
+
+    def test_delta_buy_and_liquidation_sell(self):
+        from quant_platform.inference import csi2000_product as cp
+        from quant_platform.inference.interface import PortfolioContext
+        import pandas as pd
+        pos = pd.DataFrame({
+            "code": ["002446", "601398"],
+            "qty": [4400, 100],
+            "available_qty": [4400, 100],
+            "last_price": [6.91, 8.35],
+        })
+        acct = pd.DataFrame([{"total_asset": 1_000_000.0, "available_cash": 500_000.0,
+                              "market_value": 500_000.0}])
+        ctx = PortfolioContext(account_id="t", broker="yinhe",
+                               positions=pos, account=acct, meta={})
+        targets = pd.DataFrame({"code": ["002446", "600000"], "position": [0.4, 0.4]})
+        closes = pd.Series({"002446": 7.71, "601398": 8.35, "600000": 9.0})
+        with patch.object(cp, "_load_close_prices", return_value=closes):
+            orders = cp._targets_to_orders(targets, ctx, "20261106")
+
+        probe = orders[(orders["side"] == "sell")
+                       & (orders["code"].astype(str).str.zfill(6) == "601398")]
+        self.assertEqual(len(probe), 1, "池外持仓必须生成清仓卖单")
+        self.assertEqual(int(probe["volume"].iloc[0]), 100)
+        self.assertEqual(float(probe["price"].iloc[0]), 8.35)
+
+        buy = orders[(orders["side"] == "buy")
+                     & (orders["code"].astype(str).str.zfill(6) == "002446")]
+        self.assertEqual(len(buy), 1)
+        # 定价走第二级(持仓实时价 6.91, 不是收盘 7.71); 差额 = 目标40万-持仓3.04万
+        self.assertEqual(float(buy["price"].iloc[0]), 6.91)
+        self.assertEqual(int(buy["volume"].iloc[0]), 53400)
+
+        self.assertIn("price_type", orders.columns)  # 全指核的列结构
