@@ -3523,7 +3523,11 @@ class NativeEngine:
                 if pre_targets is not None:
                     logger.info("[csi2000_open] using precomputed targets: %d rows",
                                 len(pre_targets))
-                latest = self._auction_prices or self._snapshot_latest_prices() or {}
+                # 定价优先级: 竞价价(9:26 第三方)逐票优先, SHM 盘口价补缺,
+                # 再缺则订单链内部回退持仓实时价/收盘价 — 合并而非二选一,
+                # 竞价取价部分缺失的票也能拿到 9:30 前最后一笔实时价。
+                latest = {**self._snapshot_latest_prices(),
+                          **(self._auction_prices or {})}
                 limits = dict(self._daily_limit_prices) if self._daily_limit_prices else None
                 orders = run_csi2000_open(
                     td,
@@ -3584,7 +3588,8 @@ class NativeEngine:
             if not td:
                 logger.error("[csi2000_position] trading_day empty, skip")
                 return
-            orders = run_csi2000_position(td)
+            orders = run_csi2000_position(
+                td, latest_prices=self._snapshot_latest_prices())
             n = 0 if orders is None else len(orders)
             logger.info("[csi2000_position] done trading_day=%s orders=%d", td, n)
             from ..utils.notify import feishu_alert

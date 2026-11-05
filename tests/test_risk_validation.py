@@ -322,3 +322,29 @@ class YinhePositionPriceBackfillTest(unittest.TestCase):
             out = cp._ensure_position_prices(empty, "20261106")
         self.assertTrue(out.empty)
         self.assertFalse(loader.called)
+
+
+class OrderPricePriorityTest(unittest.TestCase):
+    """订单定价三级优先级: SHM/竞价实时价 > 持仓实时价 > 收盘价。"""
+
+    def test_priority_chain(self):
+        from quant_platform.inference import csi2000_product as cp
+        import pandas as pd
+        pos = pd.DataFrame({
+            "code": ["002446", "601398", "300999"],
+            "qty": [4400, 100, 200],
+            "last_price": [6.91, 8.35, 0.0],  # 300999 网关无行情
+        })
+        closes = pd.Series({"002446": 7.71, "601398": 8.35, "300999": 10.0, "600000": 9.0})
+        with patch.object(cp, "_load_close_prices", return_value=closes):
+            # 无 SHM/竞价: 持仓实时价覆盖收盘价, 无价票回落收盘价
+            px = cp._resolve_order_prices(pos, "20261106")
+            self.assertEqual(px["002446"], 6.91)   # 持仓实时 6.91 > 收盘 7.71
+            self.assertEqual(px["300999"], 10.0)   # 持仓无价 → 收盘
+            # SHM/竞价价最高优先级: 压过持仓实时价, 并覆盖非持仓票
+            px2 = cp._resolve_order_prices(
+                pos, "20261106", latest_prices={"002446": 6.95, "600000": 9.1})
+            self.assertEqual(px2["002446"], 6.95)  # 实时快照 > 持仓实时
+            self.assertEqual(px2["600000"], 9.1)   # 非持仓票拿快照价
+            self.assertEqual(px2["601398"], 8.35)  # 无快照 → 持仓实时
+            self.assertEqual(px2["300999"], 10.0)  # 双缺 → 收盘兜底

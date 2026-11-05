@@ -486,15 +486,42 @@ def _ensure_position_prices(positions: pd.DataFrame, trading_day: str) -> pd.Dat
     return positions
 
 
+def _resolve_order_prices(pos, trading_day: str,
+                          latest_prices: Optional[dict] = None) -> dict:
+    """订单定价三级优先级: 实时快照 > 持仓实时价 > 收盘价。
+
+    盘中调仓(14:51)与未来的 10min 交易必须用实时价折股 — T-1 收盘在
+    ±10% 涨跌幅内引入同级误差, 高频路径不可接受。收盘价只是行情断流时
+    的保命兜底(单据仍要生成, VWAP 执行端会用市场价)。
+      1) latest_prices: 引擎传入的竞价价(9:26)/SHM 实时快照, 覆盖全部目标票
+      2) 持仓 last_price: 网关行情富化的实时价(卖出/减仓单)
+      3) _load_close_prices: 最近可得收盘价
+    """
+    price_map: dict = {}
+    for k, v in _load_close_prices(trading_day).items():
+        price_map[str(k).split(".")[0].zfill(6)] = float(v)
+    if not pos.empty and "last_price" in pos.columns:
+        live = pd.to_numeric(pos["last_price"], errors="coerce")
+        for c, p in zip(pos["code"], live):
+            if pd.notna(p) and float(p) > 0:
+                price_map[str(c).split(".")[0].zfill(6)] = float(p)
+    for k, v in (latest_prices or {}).items():
+        if float(v or 0) > 0:
+            price_map[str(k).split(".")[0].zfill(6)] = float(v)
+    return price_map
+
+
 def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str,
-                       capital: Optional[float] = None) -> pd.DataFrame:
+                       capital: Optional[float] = None,
+                       latest_prices: Optional[dict] = None) -> pd.DataFrame:
     """targets(目标权重) vs 当前持仓 → 订单(code/side/volume/price)。
 
     capital: sizing 基准资金。None → 取 ctx.account.total_asset(实盘真实
     资金); 虚拟账本 account 也是 1000 万, 行为不变。
+    latest_prices: 竞价价/实时快照(code6 → price), 定价最高优先级。
     """
     pos = getattr(ctx, "positions", pd.DataFrame())
-    px = _load_close_prices(trading_day)
+    px = _resolve_order_prices(pos, trading_day, latest_prices)
     tgt = targets[["_code6", "position"]].copy() if "_code6" in targets.columns \
         else targets[["code", "position"]].rename(columns={"code": "_code6"})
     tgt["_code6"] = tgt["_code6"].astype(str).str.split(".").str[0].str.zfill(6)
@@ -670,8 +697,9 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
                            tag, len(drop_codes), sorted(set(drop_codes))[:10],
                            (pre_sum - post_sum) * 100)
 
-    # 差额订单(真实资金 sizing + 清仓)
-    orders = _targets_to_orders(targets, ctx, trading_day, capital=total_asset)
+    # 差额订单(真实资金 sizing + 清仓; 定价: 竞价/实时快照 > 持仓实时价 > 收盘)
+    orders = _targets_to_orders(targets, ctx, trading_day, capital=total_asset,
+                                latest_prices=latest_prices)
     if orders.empty:
         logger.info("[csi2000-%s] 无差额订单(已到位)", tag)
         return orders
@@ -715,7 +743,8 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
 def run_csi2000_position(trading_day: str,
                          broker: Optional[BrokerAdapter] = None,
                          factor_file: Optional[str] = None,
-                         wait_seconds: int = 600) -> Optional[pd.DataFrame]:
+                         wait_seconds: int = 600,
+                         latest_prices: Optional[dict] = None) -> Optional[pd.DataFrame]:
     """14:50 盘中调仓: 与全指 daily_position 同频同口径, 推银河实盘。
 
     因子来源 = 引擎 daily_position 14:50 现算的本地 {td}_145000.csv
@@ -724,6 +753,8 @@ def run_csi2000_position(trading_day: str,
     全指 14:50 没产出因子时 2000 同步不交易(fail 一致)。
     执行与 run_csi2000_open 完全同一实盘链(真实持仓/资金 sizing →
     资金预检 → 银河 gateway)。
+    latest_prices: 引擎 SHM 盘口最新价(code → price), 订单定价最高优先级 —
+    盘中调仓必须按实时价折股, T-1 收盘只在行情断流时兜底。
     """
     from ..utils.notify import feishu_alert
     from datetime import datetime as _dt
@@ -759,7 +790,8 @@ def run_csi2000_position(trading_day: str,
     targets = run_csi2000_signal(trading_day, broker=broker, factor_df=factor_df, push=False)
     if targets is None or targets.empty:
         raise RuntimeError("csi2000-position: inference 未产出 targets")
-    return _push_targets_live(targets, broker, trading_day, tag="position")
+    return _push_targets_live(targets, broker, trading_day, tag="position",
+                              latest_prices=latest_prices)
 
 
 def _write_virtual_positions(trading_day: str, targets: pd.DataFrame,
