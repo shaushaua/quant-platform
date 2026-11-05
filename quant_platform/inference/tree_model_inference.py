@@ -965,7 +965,16 @@ def select_validated_risk_snapshot(daily_basic, date_str, index_composition_df, 
 
 
 def _validate_prediction_holdings(daily_basic, signal_date, factors, universe, held_codes):
-    """Do not allow existing positions to disappear before the compiled optimizer."""
+    """Keep existing positions visible to the optimizer — with a liquidation path.
+
+    Held stocks genuinely outside the model universe (probe positions, index
+    exits) no longer hard-fail: both order builders (interface
+    positions_to_orders and csi2000 _targets_to_orders) emit full sell orders
+    for holdings absent from the target list, so the rebalance itself
+    liquidates them. Hard failure is kept for coverage collapse — when most
+    holdings vanish from the model inputs it is a data problem, not a
+    universe exit, and trading must stop.
+    """
     signal_codes = set(daily_basic.loc[daily_basic["trade_date"].astype(str) == signal_date, "ID_QI"])
     factor_codes = set()
     if factors is not None and not factors.empty:
@@ -976,8 +985,17 @@ def _validate_prediction_holdings(daily_basic, signal_date, factors, universe, h
     if universe is not None:
         eligible &= set(universe)
     missing = held_codes - eligible
-    if missing:
-        raise RuntimeError(f"risk validation: {len(missing)} held stocks missing from model inputs; examples={sorted(missing)[:8]}")
+    if not missing:
+        return
+    limit = max(3, int(0.2 * len(held_codes)))
+    if len(missing) > limit:
+        raise RuntimeError(
+            f"risk validation: {len(missing)} held stocks missing from model inputs "
+            f"(> {limit}, suspect data coverage failure); examples={sorted(missing)[:8]}")
+    _emit_risk_warning(
+        f"held stocks outside model universe will be liquidated by the rebalance: "
+        f"{sorted(missing)[:8]}"
+    )
 
 
 def _validate_target_risk(out, risk_frame, benchmark_weight, style_tol, industry_tol):

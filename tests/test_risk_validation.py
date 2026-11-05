@@ -253,3 +253,37 @@ class RiskValidationTests(unittest.TestCase):
         self.assertFalse(m._is_optimizer_retryable_error(RuntimeError('bad model columns')))
 
 if __name__=='__main__': unittest.main(verbosity=2)
+
+
+class ValidatePredictionHoldingsLiquidationTest(unittest.TestCase):
+    """池外持仓不再硬失败: 少量缺失 → 放行走清仓卖单; 大量缺失(数据崩塌)仍硬败。"""
+
+    def _run(self, held, universe):
+        from quant_platform.inference.tree_model_inference import \
+            _validate_prediction_holdings
+        daily_basic = pd.DataFrame({
+            "trade_date": ["20261106"] * 10,
+            "ID_QI": [f"{i:06d}" for i in range(10)],
+        })
+        factors = pd.DataFrame({"ID_QI": [f"{i:06d}" for i in range(10)]})
+        return _validate_prediction_holdings(
+            daily_basic, "20261106", factors, set(universe), set(held))
+
+    def test_out_of_universe_holding_is_tolerated(self):
+        # 601398 探针股场景: 116 只持仓中 1 只不在 2000 池内 → 放行(清仓卖出)
+        with patch("quant_platform.inference.tree_model_inference._emit_risk_warning") as warn:
+            self._run([f"{i:06d}" for i in range(9)] + ["601398"],
+                      [f"{i:06d}" for i in range(9)])
+        self.assertTrue(warn.called)
+        self.assertIn("601398", warn.call_args[0][0])
+
+    def test_all_holdings_missing_still_fails_closed(self):
+        # 数据崩塌: 持仓全部不在模型输入 → 必须硬失败
+        with self.assertRaises(RuntimeError):
+            self._run(["601398", "600000", "000001", "600519"], [])
+
+    def test_in_universe_holdings_pass_silently(self):
+        with patch("quant_platform.inference.tree_model_inference._emit_risk_warning") as warn:
+            self._run([f"{i:06d}" for i in range(5)],
+                      [f"{i:06d}" for i in range(5)])
+        self.assertFalse(warn.called)
