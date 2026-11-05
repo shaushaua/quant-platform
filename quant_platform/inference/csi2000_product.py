@@ -162,7 +162,7 @@ class YinHeBrokerAdapter(BrokerAdapter):
 
         if self.gateway_url:
             try:
-                ctx = self._fetch_gateway_context()
+                ctx = self._fetch_gateway_context(trading_day)
                 logger.info("[csi2000:yinhe] gateway 账户: 持仓 %d 只, 总资产 %.0f, 可用 %.0f",
                             len(ctx.positions),
                             float(ctx.account["total_asset"].iloc[0]),
@@ -178,7 +178,7 @@ class YinHeBrokerAdapter(BrokerAdapter):
             return self._virtual.get_positions(trading_day)
         raise RuntimeError("yinhe 账户不可用且未开虚拟回退")
 
-    def _fetch_gateway_context(self) -> "PortfolioContext":
+    def _fetch_gateway_context(self, trading_day: str = "") -> "PortfolioContext":
         import json as _json
         import urllib.request as _rq
         from quant_platform.inference.interface import PortfolioContext
@@ -221,6 +221,7 @@ class YinHeBrokerAdapter(BrokerAdapter):
             for col in ("code",):
                 if col in positions.columns:
                     positions[col] = positions[col].astype(str).str.split(".").str[0].str.zfill(6)
+            positions = _ensure_position_prices(positions, trading_day)
         bal = bal_payload.get("balance") or {}
         account = pd.DataFrame([{
             "total_asset": float(bal.get("total_asset", 0) or 0),
@@ -462,6 +463,27 @@ def run_csi2000_signal(trading_day: str,
     if broker.name == "virtual":
         _write_virtual_positions(trading_day, targets, getattr(ctx, "positions", pd.DataFrame()))
     return targets
+
+
+def _ensure_position_prices(positions: pd.DataFrame, trading_day: str) -> pd.DataFrame:
+    """qiming ReportPosition dbf 没有任何价格列(只有数量/可用/代码), 网关
+    last_price 带 omitempty 直接省略; 而 .so 的 extract_current_position_weights
+    算当前权重需要 last_price — 非空持仓缺列时直接 AttributeError。用收盘价
+    回填(T-1 近似; 权重归一化只吃相对比例, 9:26 后竞价价/实时价另行覆盖)。
+    """
+    if positions is None or positions.empty:
+        return positions
+    lp = positions["last_price"] if "last_price" in positions.columns else None
+    if lp is not None and not pd.to_numeric(lp, errors="coerce").fillna(0).eq(0).all():
+        return positions
+    px = _load_close_prices(trading_day)
+    positions = positions.copy()
+    positions["last_price"] = (
+        positions["code"].astype(str).str.zfill(6).map(px).fillna(0.0))
+    logger.info("[csi2000:yinhe] 网关持仓无最新价(qiming dbf 无价格列), "
+                "收盘价回填 last_price: %d/%d 只",
+                int((positions["last_price"] > 0).sum()), len(positions))
+    return positions
 
 
 def _targets_to_orders(targets: pd.DataFrame, ctx, trading_day: str,

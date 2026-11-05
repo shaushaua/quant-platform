@@ -287,3 +287,38 @@ class ValidatePredictionHoldingsLiquidationTest(unittest.TestCase):
             self._run([f"{i:06d}" for i in range(5)],
                       [f"{i:06d}" for i in range(5)])
         self.assertFalse(warn.called)
+
+
+class YinhePositionPriceBackfillTest(unittest.TestCase):
+    """银河 dbf 无价格列: adapter 必须用收盘价回填 last_price, 否则 .so 崩。"""
+
+    def test_backfills_missing_last_price(self):
+        from quant_platform.inference import csi2000_product as cp
+        import pandas as pd
+        positions = pd.DataFrame({
+            "code": ["002446", "601398"], "qty": [4400, 100],
+            "available_qty": [0, 0]})
+        closes = pd.Series({"002446": 7.71, "601398": 8.35})
+        with patch.object(cp, "_load_close_prices", return_value=closes):
+            out = cp._ensure_position_prices(positions, "20261106")
+        self.assertEqual(list(out["last_price"]), [7.71, 8.35])
+
+    def test_keeps_gateway_prices_when_present(self):
+        from quant_platform.inference import csi2000_product as cp
+        import pandas as pd
+        positions = pd.DataFrame({
+            "code": ["002446"], "qty": [4400],
+            "available_qty": [0], "last_price": [9.99]})
+        with patch.object(cp, "_load_close_prices") as loader:
+            out = cp._ensure_position_prices(positions, "20261106")
+        self.assertEqual(list(out["last_price"]), [9.99])
+        self.assertFalse(loader.called)
+
+    def test_empty_positions_passthrough(self):
+        from quant_platform.inference import csi2000_product as cp
+        import pandas as pd
+        empty = pd.DataFrame()
+        with patch.object(cp, "_load_close_prices") as loader:
+            out = cp._ensure_position_prices(empty, "20261106")
+        self.assertTrue(out.empty)
+        self.assertFalse(loader.called)
