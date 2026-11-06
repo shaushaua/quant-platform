@@ -95,6 +95,34 @@ _hist_compat_log_count = 0
 _hist_compat_log_lock = threading.Lock()
 
 
+def _drop_limit_up_buy_orders(orders: pd.DataFrame, held_codes: set,
+                              latest_prices: dict, limit_prices: dict):
+    """推送前剔除"未持有且现价≥涨停价"的买单, 返回 (过滤后订单, 剔除code列表)。
+
+    与全指转换核(positions_to_orders)内置的高涨停闸同口径: 只挡新开仓的
+    涨停买入(挂到 expiry 只会打不进), 已持有票的卖出/加仓不挡。
+    """
+    if orders is None or orders.empty:
+        return orders, []
+    code_col = "code" if "code" in orders.columns else "_code6"
+    drop_mask = []
+    dropped = []
+    for _, r in orders.iterrows():
+        code6 = str(r[code_col]).split(".")[0].zfill(6)
+        if str(r.get("side")) != "buy" or code6 in held_codes:
+            drop_mask.append(False)
+            continue
+        lim = limit_prices.get(code6)
+        px = float(latest_prices.get(code6, 0) or 0)
+        drop_mask.append(bool(lim is not None and float(lim[0]) > 0
+                              and px > 0 and px >= float(lim[0])))
+        if drop_mask[-1]:
+            dropped.append(code6)
+    if dropped:
+        orders = orders[~pd.Series(drop_mask, index=orders.index)]
+    return orders, dropped
+
+
 def _compact_output_copy(df: pd.DataFrame, decimal_places: int = 6) -> pd.DataFrame:
     """Return an output-only copy with float columns rounded and downcast to float32.
 
@@ -3504,8 +3532,36 @@ class NativeEngine:
             self._csi2000_preflight_orders = None
             if pre_orders is not None and not pre_orders.empty:
                 from ..inference.csi2000_product import get_broker, OUT_DIR
+                from ..utils.notify import feishu_alert
                 broker = get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
                 logger.info("[csi2000_open] pushing prebuilt orders: %d rows", len(pre_orders))
+                # 与全指 9:30 同口径的最后一道涨停闸: 9:26 预建后新封板
+                # (9:26→9:30 间)的"未持有且涨停"买单在推送前剔除 — 全指的
+                # 转换核(positions_to_orders)内置同款, 预建包路径必须对齐
+                # (2026-11-06 实例: 603381/603657 封板买单推出去打不进,
+                # VWAP 过期终态, 权重缺口留到 14:51)。已持有的票不剔 —
+                # 卖出/加仓不受一字板影响。剔除后剩余买单不放大(权重缺口
+                # 由尾盘调仓补), 与全指 9:30 行为一致。
+                try:
+                    held = set()
+                    pos_df = getattr(broker.get_positions(td), "positions", None)
+                    if pos_df is not None and not pos_df.empty and "code" in pos_df.columns:
+                        held = {str(c).split(".")[0].zfill(6)
+                                for c in pos_df["code"]}
+                    latest2 = self._snapshot_latest_prices() or self._auction_prices or {}
+                    limits2 = dict(self._daily_limit_prices) if self._daily_limit_prices else {}
+                    if held and latest2 and limits2:
+                        pre_orders, dropped_buys = _drop_limit_up_buy_orders(
+                            pre_orders, held, latest2, limits2)
+                        if dropped_buys:
+                            logger.warning("[csi2000_open] 推送前剔除 9:26 后新封板"
+                                           "的未持有涨停买单 %d 只: %s",
+                                           len(dropped_buys), sorted(dropped_buys)[:10])
+                            feishu_alert("csi2000-推送前剔涨停",
+                                         f"{td}: 剔除 {len(dropped_buys)} 只 9:26 后"
+                                         f"新封板的未持有买单: {sorted(dropped_buys)[:10]}")
+                except Exception as exc:
+                    logger.warning("[csi2000_open] 推送前涨停闸失败(继续推单): %s", exc)
                 if not broker.push_orders(pre_orders, td):
                     raise RuntimeError("csi2000_open: prebuilt order push rejected")
                 try:

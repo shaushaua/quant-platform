@@ -416,3 +416,34 @@ class SingleLotLiquidationTest(unittest.TestCase):
                        & (orders["code"].astype(str).str.zfill(6) == "601398")]
         self.assertEqual(len(probe), 1, "单手清仓卖单被浮点边界吞掉")
         self.assertEqual(int(probe["volume"].iloc[0]), 100)
+
+
+class PrePushLimitUpGateTest(unittest.TestCase):
+    """2000 预建包推送前的高涨停闸: 与全指 9:30 同口径。"""
+
+    def test_drops_unheld_limit_up_buys_only(self):
+        import pandas as pd
+        from quant_platform.live_engine.native_engine import _drop_limit_up_buy_orders
+        orders = pd.DataFrame([
+            {"code": "603381", "side": "buy", "volume": 1400},   # 未持有+封板 → 剔
+            {"code": "603657", "side": "buy", "volume": 800},    # 未持有+封板 → 剔
+            {"code": "002446", "side": "buy", "volume": 1000},   # 未持有未封板 → 留
+            {"code": "603381", "side": "sell", "volume": 100},   # 卖单 → 留
+            {"code": "688779", "side": "buy", "volume": 200},    # 持有中的封板加仓 → 留
+        ])
+        out, dropped = _drop_limit_up_buy_orders(
+            orders, held_codes={"688779"},
+            latest_prices={"603381": 20.74, "603657": 33.88, "002446": 6.91, "688779": 51.0},
+            limit_prices={"603381": (20.74, 18.7), "603657": (33.88, 30.6),
+                          "002446": (7.6, 6.24), "688779": (51.0, 46.4)})
+        self.assertEqual(sorted(dropped), ["603381", "603657"])
+        self.assertEqual(len(out), 3)
+        self.assertEqual(set(out["side"]), {"buy", "sell"})
+
+    def test_no_prices_passthrough(self):
+        import pandas as pd
+        from quant_platform.live_engine.native_engine import _drop_limit_up_buy_orders
+        orders = pd.DataFrame([{"code": "603381", "side": "buy", "volume": 100}])
+        out, dropped = _drop_limit_up_buy_orders(orders, set(), {}, {})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(dropped, [])
