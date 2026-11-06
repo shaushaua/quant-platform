@@ -675,26 +675,21 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
         logger.info("[csi2000-%s] 无差额订单(已到位)", tag)
         return orders
 
-    # 可用资金预检: 买单额 ≤ 可用现金 + 卖单估值×0.9(T+1 卖出回笼按折价计)
+    # 资金预检: 只告警, 不截断 — 全部订单交给算法端(VWAP 在窗口内均衡
+    # 买卖, 卖出回笼自动供给买单), 客户端砍单反而造成目标权重缺口
+    # (2026-11-06 14:51 实例: 预算 27 万截掉 28 万买单, 资金利用率受损)。
     buys = orders[orders["side"] == "buy"]
     sells = orders[orders["side"] == "sell"]
     buy_amt = float((buys["volume"] * buys["price"]).sum()) if len(buys) else 0.0
     sell_amt = float((sells["volume"] * sells["price"]).sum()) if len(sells) else 0.0
     budget = avail + sell_amt * 0.9
     if buy_amt > budget:
-        over = buy_amt - budget
-        feishu_alert("csi2000-资金预检不足", (
-            f"{trading_day}: 买单 {buy_amt/1e4:.0f}万 > 预算 {budget/1e4:.0f}万"
-            f"(可用 {avail/1e4:.0f} + 卖出×0.9 {sell_amt*0.9/1e4:.0f}万), 超 {over/1e4:.0f}万。"
-            f"按预算比例截断买单。"))
-        ratio = budget / buy_amt if buy_amt > 0 else 0.0
-        keep_n = int(len(buys) * ratio)
-        # 截断: 保留买单中金额大的(按金额降序), 其余丢弃
-        buys = buys.assign(_amt=buys["volume"] * buys["price"]).sort_values("_amt", ascending=False)
-        buys = buys.head(keep_n).drop(columns="_amt")
-        orders = pd.concat([buys, sells], ignore_index=True)
-        logger.warning("[csi2000-%s] 买单按预算 %.0f%% 截断: 保留 %d 笔",
-                       tag, ratio * 100, len(buys))
+        feishu_alert("csi2000-资金预检超额(全推,算法端均衡)", (
+            f"{trading_day}: 买单 {buy_amt/1e4:.0f}万 > 静态预算 {budget/1e4:.0f}万"
+            f"(可用 {avail/1e4:.0f} + 卖出×0.9 {sell_amt*0.9/1e4:.0f}万), "
+            f"超 {(buy_amt-budget)/1e4:.0f}万。全额推送, 由 VWAP 窗口内买卖均衡消化。"))
+        logger.warning("[csi2000-%s] 买单超静态预算 %.0f万 → 不截断全推(算法端均衡)",
+                       tag, (buy_amt - budget) / 1e4)
 
     # 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205);
     # push=False 预检模式到此为止, 订单包直接返回
