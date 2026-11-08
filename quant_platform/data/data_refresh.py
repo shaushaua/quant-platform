@@ -247,7 +247,11 @@ def _fill_missing_with_prev_day(
 
     df_prev = pd.DataFrame(prev_rows, columns=columns)
     if "TS" in df_prev.columns:
-        df_prev["TS"] = pd.to_datetime(df_prev["TS"]).dt.strftime("%Y%m%d")
+        # 兼容两种上游格式: 'YYYY-MM-DD 00:00:00 +0800 CST' 与裸 'YYYYMMDD'
+        df_prev["TS"] = pd.to_datetime(
+            df_prev["TS"].astype(str).str.replace(" CST", "", regex=False),
+            errors="coerce",
+        ).dt.strftime("%Y%m%d")
     if "ID_QI" in df_prev.columns:
         df_prev["ID_QI"] = df_prev["ID_QI"].astype(str).str.zfill(6)
 
@@ -271,7 +275,9 @@ def _fill_missing_with_prev_day(
     # 注意: parquet 保持 96 列不变(不添加标记列,严格消费者不受影响);
     # 回填明细写入 sidecar JSON({date}_stale_fill.json, 同目录)供审计。
     if "TS" in filled.columns:
-        filled["TS"] = trade_date
+        # 与主写入路径同格式(Go dataconv 历史格式),保持整列一致
+        d = trade_date.replace("-", "")
+        filled["TS"] = f"{d[:4]}-{d[4:6]}-{d[6:8]} 00:00:00 +0800 CST"
     out = pd.concat([df, filled], ignore_index=True)
 
     _write_stale_fill_sidecar(trade_date, prev_td, missing)
@@ -346,12 +352,23 @@ def _query_daily_basic(
 
     df = pd.DataFrame(rows, columns=columns)
     df = _fill_missing_with_prev_day(mysql, df, trade_date)
-    # TS 标准化为 YYYYMMDD
+    # TS 统一为 Go dataconv 历史格式 'YYYY-MM-DD 00:00:00 +0800 CST'。
+    # 受保护策略身份校验要求 TS[:10]=='YYYY-MM-DD'（紧凑 YYYYMMDD 会被整批拒绝）;
+    # 读取侧兼容 MySQL datetime / 裸 YYYYMMDD / 旧 '+0800 CST' 三种输入。
     if "TS" in df.columns:
-        df["TS"] = pd.to_datetime(df["TS"]).dt.strftime("%Y%m%d")
+        df["TS"] = pd.to_datetime(
+            df["TS"].astype(str).str.replace(" CST", "", regex=False),
+            errors="coerce",
+        ).dt.strftime("%Y-%m-%d 00:00:00 +0800 CST")
     # ID_QI 补零
     if "ID_QI" in df.columns:
         df["ID_QI"] = df["ID_QI"].astype(str).str.zfill(6)
+    # SECURITY_ID 统一 int64（与 Go dataconv 历史文件一致）。MySQL Decimal 会被
+    # 下方数值转强制成 float64，而 float 会让引擎 fork 批量切分(_split)落入
+    # 字符串归一化分支（130.0→'130'→'000130'），与 ID_QI 永远失配 → 整批空表。
+    if "SECURITY_ID" in df.columns:
+        sid = pd.to_numeric(df["SECURITY_ID"], errors="coerce")
+        df["SECURITY_ID"] = sid.astype("int64") if sid.notna().all() else sid.astype("Int64")
     # MySQL Decimal → float64。否则 object dtype 列(如 mkt_cap, amount, volume)
     # 进 polars/pyarrow 时会 ArrowInvalid,tree model .so 也会因列偏移读到错位数据。
     # 文本列 (SEC_SHORT_NAME 等) 保留 object,只转 numeric-like 列。

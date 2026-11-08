@@ -1506,7 +1506,10 @@ def _filter_codes_from_bundle(
         if col is None:
             return {code: df.reset_index(drop=True) for code in codes}
 
-        if pd.api.types.is_integer_dtype(df[col]) and code_by_security_id:
+        # SECURITY_ID 可能是 float64（data_refresh 增量文件历史遗留），
+        # 数值比较对 int/float 都成立；只有整数列才允许走 Code 整数快路径
+        is_sid_numeric = col == "SECURITY_ID" and pd.api.types.is_numeric_dtype(df[col])
+        if (pd.api.types.is_integer_dtype(df[col]) or is_sid_numeric) and code_by_security_id:
             wanted_ids = set(code_by_security_id.keys())
             subset = df[df[col].isin(wanted_ids)]
             groups = {
