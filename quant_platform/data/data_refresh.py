@@ -673,7 +673,7 @@ def _previous_trading_day(mysql: MySQLLoader, trade_date: str) -> str:
             return _norm_date(str(val))
     except Exception as e:
         logger.error(f"查询前一交易日失败: {e}")
-    return td
+    return trade_date
 
 
 def refresh_pod_startup(
