@@ -80,4 +80,4 @@ ENV MALLOC_ARENA_MAX=1
 # MDL client log directory
 RUN mkdir -p /data/quant/mdl_logs/client
 
-ENTRYPOINT ["/app/entrypoint-combined.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
