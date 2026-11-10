@@ -74,21 +74,36 @@ class MySQLLoader:
         self._conn = None
         self._lock = threading.Lock()
 
-    def connect(self) -> bool:
-        """建立数据库连接"""
+    def connect(self, retries: int = 3, retry_delay: float = 2.0) -> bool:
+        """建立数据库连接(带重试 — MySQL 服务商有间歇故障, 单次连接不可靠)"""
+        import time as _time
+        for attempt in range(retries):
+            try:
+                import pymysql
+                self._conn = pymysql.connect(
+                    host=self.host,
+                    port=self.port,
+                    user=self.user,
+                    password=self.password,
+                    database=self.database,
+                    charset='utf8mb4',
+                    connect_timeout=10,
+                )
+                logger.info(f"MySQL连接成功: {self.host}:{self.port}/{self.database}"
+                            f" (attempt {attempt + 1}/{retries})")
+                return True
+            except Exception as e:
+                if attempt < retries - 1:
+                    wait = retry_delay * (attempt + 1)
+                    logger.warning(f"MySQL连接失败(attempt {attempt + 1}/{retries}): {e}, "
+                                   f"{wait}s 后重试")
+                    _time.sleep(wait)
+                    continue
+                logger.error(f"MySQL连接失败(重试 {retries} 次后放弃): {e}")
+                return False
+        # ImportError 路径
         try:
             import pymysql
-            self._conn = pymysql.connect(
-                host=self.host,
-                port=self.port,
-                user=self.user,
-                password=self.password,
-                database=self.database,
-                charset='utf8mb4',
-                connect_timeout=10,
-            )
-            logger.info(f"MySQL连接成功: {self.host}:{self.port}/{self.database}")
-            return True
         except ImportError:
             logger.error("pymysql未安装，请运行: pip install pymysql")
             return False
