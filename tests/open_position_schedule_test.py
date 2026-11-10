@@ -50,3 +50,13 @@ def test_minute_schedule_skips_930_and_is_eligible_at_931(monkeypatch):
         120.0, datetime(2026, 8, 11, 9, 30, 0), "20260811") is True
     assert minute.should_run(
         180.0, datetime(2026, 8, 11, 9, 31, 0), "20260811") is True
+
+
+def test_daily_position_label_daily_suffix(monkeypatch):
+    monkeypatch.setenv("COMPUTE_SCHEDULES", "daily_position")
+    monkeypatch.setenv("DAILY_POSITION_TRIGGER_TIME", "14:50")
+    """日频独占 _145000_daily.csv: minute 每分钟写 {td}_HHMMSS.csv,
+    同名互写在 2026-11-10 造成亚秒竞态, 2000 尾盘调仓失败。"""
+    schedules = {s.name: s for s in build_schedules_from_env()}
+    dp = schedules["daily_position"]
+    assert dp.result_label == "145000_daily", dp.result_label

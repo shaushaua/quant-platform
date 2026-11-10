@@ -107,7 +107,7 @@ def main() -> int:
             f"refusing before {args.not_before}; wait for the original VWAP window")
 
     factor_path = Path(args.factor_file)
-    expected_name = f"{args.date}_145000.csv"
+    expected_name = f"{args.date}_145000_daily.csv"
     if factor_path.name != expected_name or not factor_path.is_file():
         raise RuntimeError(f"expected live factor file named {expected_name}")
     if factor_path.stat().st_mtime < now.replace(hour=14, minute=50, second=0).timestamp():

@@ -233,7 +233,11 @@ def build_schedules_from_env(factor_info: Optional[Dict] = None) -> List[Computa
             run_inference=True,
             is_daily_result=False,
             use_daily_factor_module=True,
-            result_label=f"{t[0]:02d}{t[1]:02d}00",
+            # _daily 后缀: minute 调度每分钟写 {td}_HHMMSS.csv, 14:50 槽位会
+            # 与本调度同名互写(2026-11-10 亚秒竞态实锤)。日频独占
+            # {td}_145000_daily.csv, 2000 的 csi2000_position 优先内存直传、
+            # 落盘只认本名字。
+            result_label=f"{t[0]:02d}{t[1]:02d}00_daily",
         ))
 
     if "open_position" in enabled:

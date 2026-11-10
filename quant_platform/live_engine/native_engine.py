@@ -643,6 +643,10 @@ class NativeEngine:
         self._order_process: Optional[multiprocessing.Process] = None
         self._prev_day_factors: Optional[pd.DataFrame] = None
         self._prev_valid_rate: Optional[float] = None
+        # daily_position(14:50) 现算的日频因子, 内存直传给 14:51 的
+        # csi2000_position —— 不再走落盘回读(2026-11-10 实锤: minute 调度
+        # 亚秒级重写同名 csv 的竞态让 2000 尾盘调仓硬失败)。
+        self._daily_position_factors: Optional[pd.DataFrame] = None
         # open_position target cache, normally calculated after the 9:25 call
         # auction and consumed by the 9:30 order trigger.
         self._open_position_cache: Optional[pd.DataFrame] = None
@@ -3635,7 +3639,7 @@ class NativeEngine:
         """csi2000_position schedule 入口: 14:50 实盘调仓(当天现算因子 → 银河账户),
         异常全吞 + 飞书告警, 不影响全指主链路。
 
-        内部等待全指 daily_position 产出 {td}_145000.csv(最多 10 分钟) —
+        内部优先用引擎内存直传的 14:50 因子; 缺失则等待 {td}_145000_daily.csv(最多 10 分钟) —
         全指 14:50 因子没出来时 2000 同步不交易(fail 一致), 超时飞书告警。
         """
         try:
@@ -3645,7 +3649,8 @@ class NativeEngine:
                 logger.error("[csi2000_position] trading_day empty, skip")
                 return
             orders = run_csi2000_position(
-                td, latest_prices=self._snapshot_latest_prices())
+                td, latest_prices=self._snapshot_latest_prices(),
+                factor_df=getattr(self, "_daily_position_factors", None))
             n = 0 if orders is None else len(orders)
             logger.info("[csi2000_position] done trading_day=%s orders=%d", td, n)
             from ..utils.notify import feishu_alert
@@ -4709,6 +4714,10 @@ class NativeEngine:
 
         # 1. 写因子 CSV + 上传 OSS
         compact_df = _compact_output_copy(result_df)
+        if log_tag == "daily_position":
+            # 14:50 日频因子内存直传(见 __init__ 注释): 14:51 csi2000_position
+            # 优先取本成员, 落盘文件只是引擎重启时的兜底。
+            self._daily_position_factors = compact_df
         if output_path:
             output_path.mkdir(parents=True, exist_ok=True)
             out_file = output_path / f"{date_str}_{label}.csv"

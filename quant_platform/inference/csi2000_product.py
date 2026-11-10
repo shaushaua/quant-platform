@@ -710,10 +710,14 @@ def run_csi2000_position(trading_day: str,
                          broker: Optional[BrokerAdapter] = None,
                          factor_file: Optional[str] = None,
                          wait_seconds: int = 600,
-                         latest_prices: Optional[dict] = None) -> Optional[pd.DataFrame]:
+                         latest_prices: Optional[dict] = None,
+                         factor_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
     """14:50 盘中调仓: 与全指 daily_position 同频同口径, 推银河实盘。
 
-    因子来源 = 引擎 daily_position 14:50 现算的本地 {td}_145000.csv
+    因子来源 = 引擎 daily_position 14:50 现算的因子: 优先 factor_df 内存直传
+    (引擎成员 _daily_position_factors, 不落盘); 缺失回退本地 {td}_145000_daily.csv
+    (_daily 后缀独占命名 — minute 调度写 {td}_HHMMSS.csv, 2026-11-10 曾因同名
+    互写的亚秒竞态让 14:51 调仓失败, 已根治)。
     (正式 daily 因子 15:10 才上传 OSS, 盘中拿不到; 这也是全指 14:50
     下单用的同一份因子)。等待文件出现且为当日产出, 超时飞书告警并放弃 —
     全指 14:50 没产出因子时 2000 同步不交易(fail 一致)。
@@ -727,9 +731,20 @@ def run_csi2000_position(trading_day: str,
 
     broker = broker or get_broker(os.environ.get("CSI2000_BROKER", "virtual"))
 
+    if factor_df is not None and not factor_df.empty:
+        logger.info("[csi2000-position] 使用引擎内存直传因子: %d 行 %d 列"
+                    "(daily_position 14:50 现算, 免落盘免等待)",
+                    len(factor_df), len(factor_df.columns))
+        targets = run_csi2000_signal(trading_day, broker=broker,
+                                     factor_df=factor_df, push=False)
+        if targets is None or targets.empty:
+            raise RuntimeError("csi2000-position: inference 未产出 targets")
+        return _push_targets_live(targets, broker, trading_day, tag="position",
+                                  latest_prices=latest_prices)
+
     path = Path(factor_file) if factor_file else (
         Path(os.environ.get("FACTOR_OUTPUT_PATH", "/data/factors"))
-        / f"{trading_day}_145000.csv")
+        / f"{trading_day}_145000_daily.csv")
     # 新鲜度按"当日产出"判定(mtime ≥ 当日 00:00): 该文件只有 daily_position
     # 会写, 同日文件必为当天 14:50 计算, 不必卡到具体时分(跨时区/回补更稳)。
     cutoff = _dt.strptime(trading_day, "%Y%m%d").timestamp()
