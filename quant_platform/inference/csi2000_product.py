@@ -242,13 +242,21 @@ class YinHeBrokerAdapter(BrokerAdapter):
         for _, r in orders.iterrows():
             code6 = str(r["code"]).split(".")[0].zfill(6)
             exchange = "SH" if code6.startswith(("60", "68", "9")) else "SZ"
+            # 外部编号必须每笔订单唯一: 银河客户端按编号唯一性去重, 同编号
+            # 视为重复推送拒收(2026-11-09/11 各 25/26 笔 14:51 调仓单被拒,
+            # 错误码 5200130)。原格式 csi2k_{td}_{code6} 同日同码两批(9:30
+            # 建仓 + 14:51 调仓)编号相同必撞。加批次后缀(open/posi/sign)后:
+            # 同批次同码重试编号不变(幂等去重安全), 跨批次编号唯一。
+            # 长度 21+5=26 ≤ 网关 atxExternalIDMaxLen=30。
+            batch = str(r.get("batch_tag") or "").strip()[:4]
+            order_id = f"csi2k_{trading_day}_{code6}" + (f"_{batch}" if batch else "")
             payload.append({
                 "symbol": f"{code6}.{exchange}",
                 "side": r["side"],
                 "volume": int(r["volume"]),
                 "algo_strategy": "vwap",        # 皓兴VWAP(205); T0增强单用 "t0"(601)
                 "strategy": "csi2000",
-                "order_id": f"csi2k_{trading_day}_{code6}",
+                "order_id": order_id,
             })
         req = _rq.Request(
             f"{self.gateway_url}/v1/orders",
@@ -457,6 +465,7 @@ def run_csi2000_signal(trading_day: str,
     # 否则会先推一版未经预检的订单 + open 再推一版 = 双重下单)。
     orders = _targets_to_orders(targets, ctx, trading_day)
     if push and not orders.empty:
+        orders["batch_tag"] = "signal"
         broker.push_orders(orders, trading_day)
 
     # 虚盘: 更新模拟持仓文件(次日 get_positions 用)
@@ -693,6 +702,7 @@ def _push_targets_live(targets: pd.DataFrame, broker: BrokerAdapter,
 
     # 下单(虚盘落盘 / 实盘走 gateway broker=yinhe → 皓兴205);
     # push=False 预检模式到此为止, 订单包直接返回
+    orders["batch_tag"] = tag  # 外部编号按批次区分(见 push_orders 注释)
     if not push:
         logger.info("[csi2000-%s] 预检完成(未推单): %d 笔订单就绪, 9:30 直接推",
                     tag, len(orders))
